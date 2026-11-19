@@ -13,12 +13,13 @@
 #   scripts/crew/dev-zgx [main|gallery|onboarding|intro]   (default: main)
 #
 # Needs Zig 0.16 for zgx's terminals (Ghostty): ZIG=/path/to/zig, or
-# ~/.crew-zgx-dev/zig/zig.
+# ~/.crew-zgx-dev/zig/zig. Builds in this worktree's own target dir
+# (CREW_ZGX_TARGET_DIR, default <worktree>/target), as build-engine does.
 set -euo pipefail
 root="$(cd "$(dirname "$0")/../.." && pwd)"
 zig="${ZIG:-$HOME/.crew-zgx-dev/zig/zig}"
 engine="${CREW_ZGX_ENGINE_BIN:-$HOME/.crew-zgx-dev/bin/zeron-engine}"
-target="$(python3 "$root/scripts/local-cargo.py" --print-target-dir)/zgx"
+target="${CREW_ZGX_TARGET_DIR:-$root/target}/zgx"
 
 [[ -x "$zig" ]] || { echo "no Zig 0.16 at $zig (set ZIG)" >&2; exit 1; }
 [[ -x "$engine" ]] || { echo "no engine at $engine: run scripts/crew/build-engine" >&2; exit 1; }

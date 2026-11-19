@@ -36,6 +36,13 @@ pub const DATA_DIR_NAME: &str = if CANARY { ".crew-zgx-canary" } else { ".crew-z
 /// The engine's IPC port when nothing names one.
 pub const DEFAULT_IPC_PORT: u16 = if CANARY { 27959 } else { 27960 };
 
+/// What the packaged canary is called: its bundle (scripts/crew/package-zgx-app),
+/// its windows and Settings → About.
+pub const CANARY_PRODUCT: &str = "Crew zgx Canary";
+
+/// What this build is called where it says.
+pub const PRODUCT: &str = if CANARY { CANARY_PRODUCT } else { "Crew (zgx dev)" };
+
 /// No Edge until Crew's sign-in lands: a loopback port nothing serves
 /// (discard), so an engine of this build stays signed out and local and
 /// never reaches Zeron's servers. `ZERON_EDGE_URL` names a real one (a local
@@ -183,6 +190,14 @@ mod tests {
         for port in [DEFAULT_IPC_PORT, 27959, 27960, 27961] {
             assert!(port_refusal(port).is_none(), "{port}");
         }
+    }
+
+    /// The packaged canary's bundle is named, and built, as this flavour.
+    #[test]
+    fn the_packaged_canary_is_the_canary_flavour() {
+        let script = include_str!("../../../scripts/crew/package-zgx-app");
+        assert!(script.contains(&format!("APP_NAME=\"{CANARY_PRODUCT}\"")), "the bundle's name");
+        assert!(script.contains("FLAVOR=zgx-canary"), "built as the canary");
     }
 
     #[test]

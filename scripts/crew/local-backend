@@ -1,0 +1,50 @@
+#!/usr/bin/env bash
+# What a Crew zgx build is tested against (docs/crew/zgx-thin-port.md):
+# sign-in, and later Agent Auth, from a real Scaffold authority, with every
+# room on a local Edge built from this branch. Never a shared Crew Edge: a
+# v0.3 engine there would be a second writer in rooms that 0.2.x Crews use
+# (isolation rule 5).
+#
+#   scripts/crew/local-backend [staging] [canary|dev]
+#     staging   Crew Staging's authority (scaffold-staging, ashler-staging)
+#     canary    the packaged app's data dir (~/.crew-zgx-canary); dev is
+#               scripts/crew/dev-zgx's (~/.crew-zgx-dev)
+#
+# Writes two files, then serves the Edge (http://127.0.0.1:27961) in the
+# foreground until stopped:
+#   ~/.crew-zgx-<flavour>/crew-runtime.json   the engine's Edge and authority
+#   edge/.dev.vars.crew-zgx-local              the Edge's authority (git-ignored)
+# Start it before the app, or sign-in can't verify the Edge's half.
+set -euo pipefail
+root="$(cd "$(dirname "$0")/../.." && pwd)"
+die() { echo "$*" >&2; exit 1; }
+
+authority="${1:-staging}"
+flavour="${2:-canary}"
+case "$authority" in
+  staging)
+    scaffold="https://scaffold-staging.internal.ashler.com"
+    project="ashler-staging"
+    deployment="ashler-staging"
+    ;;
+  *) die "unknown authority '$authority' (staging)" ;;
+esac
+case "$flavour" in
+  canary|dev) data="$HOME/.crew-zgx-$flavour" ;;
+  *) die "unknown flavour '$flavour' (canary or dev)" ;;
+esac
+edge="http://127.0.0.1:27961"
+
+mkdir -p "$data"
+cat >"$data/crew-runtime.json" <<JSON
+{ "edgeUrl": "$edge", "scaffoldUrl": "$scaffold", "projectScope": "$project", "deploymentId": "$deployment" }
+JSON
+cat >"$root/edge/.dev.vars.crew-zgx-local" <<VARS
+SCAFFOLD_CONTROL_PLANE_URL=$scaffold
+SCAFFOLD_PROJECT_SCOPE=$project
+SCAFFOLD_DEPLOYMENT_ID=$deployment
+VARS
+echo "engine: $data/crew-runtime.json -> Edge $edge, authority $scaffold ($project)"
+echo "edge:   $root/edge/.dev.vars.crew-zgx-local"
+
+exec "$root/scripts/crew/clean-env" npm --prefix "$root/edge" run dev:crew-zgx

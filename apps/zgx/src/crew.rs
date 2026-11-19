@@ -49,8 +49,9 @@ pub const ENV: &str = "crew";
 /// Who the account signs in with (`account.provider`).
 pub const PROVIDER: &str = "scaffold";
 
-/// What the app is called: its windows' title, Settings → About's.
-pub const TITLE: &str = if MODE { "Crew (zgx dev)" } else { "Zeron" };
+/// What the app is called: its windows' title, Settings → About's (its
+/// flavour's, `zeron_cli::crew::PRODUCT`).
+pub const TITLE: &str = if MODE { zeron_cli::crew::PRODUCT } else { "Zeron" };
 
 /// The engine's Scaffold session, in its data dir beside upstream's
 /// `session.json`.
@@ -285,6 +286,7 @@ pub fn install(host: &ScriptHost) {
     if !MODE {
         return;
     }
+    host.shared("crew_product", TITLE);
     answer(
         host,
         Rc::new(Answers {
@@ -315,6 +317,18 @@ fn answer(host: &ScriptHost, answers: Rc<Answers>) {
             Answer::Err(NO_EDGE.to_string())
         });
     }
+    // Keeping chats local while signed in is a WorkOS profile's choice: a
+    // Crew engine opens the synced workspace whenever Scaffold has signed it
+    // in (crates/engine/src/lib.rs `initial_workspace_scope`), so the file
+    // the switch writes would change nothing. Settings → General hides it.
+    host.async_action("account.keeps_chats_local", move |_| async move {
+        refuse("account.keeps_chats_local")?;
+        Answer::Ok(Value::Bool(false))
+    });
+    host.async_action("account.keep_chats_local", move |_| async move {
+        refuse("account.keep_chats_local")?;
+        Answer::Err(NO_EDGE.to_string())
+    });
     let a = answers.clone();
     host.async_action("account.orgs", move |_| {
         let a = a.clone();

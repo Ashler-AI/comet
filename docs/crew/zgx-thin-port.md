@@ -6,12 +6,17 @@ the daily-driver Crew Staging install, its profile, or the shared staging backen
 
 ## Pins
 
-- Upstream: `zeronsh/zeron` `94ae5b10812abb854704bc014c2bcebdec64eac9` (v0.3.4, 2026-11-13).
-- Crew: `Ashler-AI/comet` `3fc058ae23522b6eb09d7b5aac460593b5e6b3c6` (0.2.149, 2026-11-13).
+- Upstream: `zeronsh/zeron` `e393c4a84` (main, 2026-11-19), merged in as `a3dad815f`.
+  The port started from `94ae5b10812abb854704bc014c2bcebdec64eac9` (v0.3.4, 2026-11-13);
+  the 241 commits since (v0.3.8, the GPUI app's removal in #1499) merged with 19
+  conflicts, 18 hunks of them content.
+- Crew: `Ashler-AI/comet` `1932df84d` (0.2.151, 2026-11-17).
 - Branch: `crew/zgx-thin-port`, local, tracking no remote.
-- Crew's last upstream import was about v0.2.130 (squash, PR #152), not v0.2.113.
-  Compare each Crew file with its nearest upstream version, and audit dropped Crew
-  lines with `scripts/audit-upstream-port.py` from the Crew repository.
+- Crew's last upstream import is `a0468502a` (v0.2.129+1, squashed by PR #152),
+  not the git merge base v0.2.113. Compare each Crew file with that version, and
+  audit dropped Crew lines with `scripts/audit-upstream-port.py` from the Crew
+  repository. The evaluation behind continuing this port, rather than merging
+  upstream into Crew main, is [zgx-migration-evaluation.md](zgx-migration-evaluation.md).
 
 ## Principles
 
@@ -325,20 +330,46 @@ Deferred:
 ## Development loop
 
 ```sh
-scripts/crew/build-engine        # zeron-engine without gpui -> ~/.crew-zgx-dev/bin
+scripts/crew/build-engine        # zeron-engine -> ~/.crew-zgx-dev/bin
 scripts/crew/dev-zgx             # zgx main window, own engine, signed out, local
 scripts/crew/dev-zgx gallery     # zgx's component gallery: no engine at all
+scripts/crew/local-backend       # Crew Staging's authority + a local Edge, served
+scripts/crew/package-zgx-app     # Crew zgx Canary.app, to install by hand
 ```
 
 - **Zig:** zgx's terminals (Ghostty) need Zig 0.16. Use the official
   aarch64-macos tarball, checksum-verified, in `~/.crew-zgx-dev/zig`, not
   Homebrew's, which pulls in LLVM.
-- **Build directories:** builds go through `scripts/local-cargo.py` and the shared
-  target dir. zgx is its own cargo workspace and builds under `<target>/zgx`.
-- **Engine binary:** it is copied out of the shared target, because another
-  worktree's build can replace `target/debug/zeron-engine` there.
+- **Build directories:** builds go through `scripts/local-cargo.py`, in this
+  worktree's own `target/` (`CREW_ZGX_TARGET_DIR` names another), not the shared
+  one: other worktrees build other trees' crates of the same names there, and a
+  path crate built from another tree can look fresh. zgx is its own cargo
+  workspace and builds under `<target>/zgx`. A sibling worktree of this branch
+  starts warm from an APFS clone (`cp -c -R <this>/target <sibling>/target`,
+  then touch what it changed).
+- **Engine binary:** build-engine copies it out to `~/.crew-zgx-dev/bin`.
 - **Disk:** only debug builds fit on the development Mac. Release packaging goes
   to CI, once approved.
+
+### Testing an installed build
+
+A packaged build installs beside every other Crew and Zeron and touches none of
+them: its own bundle id (`ai.ashler.crew.zgx-canary`), URL scheme
+(`crew-zgx-canary`), data dir (`~/.crew-zgx-canary`) and IPC port (27959).
+
+1. `scripts/crew/package-zgx-app`, then `ditto` the bundle it names into
+   `/Applications/Crew zgx Canary.app`.
+2. `scripts/crew/local-backend staging canary` in a terminal of its own. It writes
+   `~/.crew-zgx-canary/crew-runtime.json` (Edge `http://127.0.0.1:27961`, authority
+   `https://scaffold-staging.internal.ashler.com`, project `ashler-staging`) and the
+   Edge's git-ignored vars, then serves the Edge until stopped.
+3. Open the app and sign in: the browser signs in to Crew Staging's Scaffold.
+   Rooms, sessions and their transcripts live only in the local Edge
+   (`edge/.wrangler/state`) and `~/.crew-zgx-canary`.
+4. Run a session. Until slice 5 lands, agents need logins of their own in the
+   engine's home (`~/.crew-zgx-canary/home`). For the engine's mock agent instead,
+   launch the app from a terminal with `ZERON_ZGX_MOCK=1
+   "/Applications/Crew zgx Canary.app/Contents/MacOS/zeron"`.
 
 ## Decisions for the owner
 
@@ -374,6 +405,14 @@ scripts/crew/dev-zgx gallery     # zgx's component gallery: no engine at all
       That is slice 6.
 - [ ] 3. Edge: built, and tested locally with unit, workerd and `wrangler dev`
   smoke runs. Its exit gate waits for slice 2's signed-in engine to join.
+  - After the 2026-11-19 merge: unit 447/447, Crew's workerd 23/23, upstream's
+    workerd 423/425. The two failures are throughput tests (6,100 relay frames,
+    300 queued wakes) that time out only under heavy machine load; both pass
+    alone (53/53). Upstream main and the pre-merge port pass the relay test in
+    the same way.
+  - Merged Edge served by `scripts/crew/local-backend`: `/auth/session` with no
+    bearer or a bogus `sc_rc_` bearer, WorkOS's callback and `/install.sh` all
+    answer 401 unauthenticated.
 - [ ] 4. zgx Crew mode: implemented and unit-tested on 2026-11-13.
   - `cargo test --bin zeron-zgx` in `apps/zgx`: 693 passed, 0 failed, 33 ignored.
     That includes the `crew::`, `auth::` and `engine::manager` tests. The one new
@@ -381,6 +420,9 @@ scripts/crew/dev-zgx gallery     # zgx's component gallery: no engine at all
   - Not run: the integration tests (`design_lint`, `leftovers`, `reload`,
     `onboarding_continue_ink`), stopped for disk space.
   - Open: the headed exit gate (above), which needs slices 2 and 3.
+  - Since the merge: "Keep chats on this device" (upstream #1432) is refused in
+    Crew mode and left out of Settings → General, since a Crew engine's scope
+    comes from its Scaffold session.
 - [ ] 5. Agent Auth: code in place (see "As built" under Seam notes), not yet built.
   Branch `crew/zgx-thin-port-agent-auth`.
   - Tests written, not yet run:
@@ -394,3 +436,6 @@ scripts/crew/dev-zgx gallery     # zgx's component gallery: no engine at all
     (decision 1).
 - [ ] 6. Scaffold
 - [ ] 7. Packaging
+  - Local half: `scripts/crew/package-zgx-app` (ad-hoc signed, no updater) and
+    `scripts/crew/local-backend`; see "Testing an installed build". The signed
+    build from CI still needs approval.
