@@ -15,8 +15,8 @@ the daily-driver Crew Staging install, its profile, or the shared staging backen
 - Crew's last upstream import is `a0468502a` (v0.2.129+1, squashed by PR #152),
   not the git merge base v0.2.113. Compare each Crew file with that version, and
   audit dropped Crew lines with `scripts/audit-upstream-port.py` from the Crew
-  repository. The evaluation behind this plan is `docs/ZGX-MIGRATION-EVALUATION.md`
-  (Crew branch `fix/crew-product-identity`'s worktree, not committed).
+  repository. The evaluation behind continuing this port, rather than merging
+  upstream into Crew main, is [zgx-migration-evaluation.md](zgx-migration-evaluation.md).
 
 ## Principles
 
