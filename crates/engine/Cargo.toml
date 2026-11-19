@@ -51,6 +51,11 @@ sha2.workspace = true
 reqwest.workspace = true
 # A large chat2 checkpoint sent in parts, sliced from one buffer.
 bytes = "1"
+# Crew: the loopback Agent Auth relay (crew_inference_relay.rs); the same
+# versions and features zeron-mcp already builds.
+hyper = { version = "1", features = ["server", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+http-body-util = "0.1"
 # The rules plugins are held to (paths, programs, network), shared with apps/zgx.
 zeron-plugin-guard.workspace = true
 ignore.workspace = true

@@ -495,6 +495,8 @@ pub use zeron_proto::redact;
 pub use catalog_failure::{CatalogFailure, CatalogFailureCode};
 pub mod claude;
 pub mod codex;
+/// Crew: a managed (Agent Auth) run's launch contract.
+pub mod crew_inference;
 pub mod agent_ports;
 pub mod cursor;
 pub(crate) mod executable;
@@ -569,6 +571,8 @@ pub fn compose_child_path_ahead(
 /// broker output on a Cloud device) to an agent child. Call it after the
 /// driver's own env setup so the host's values win. Values are never logged.
 pub fn apply_run_env(cmd: &mut process::Command, env: &std::collections::BTreeMap<String, String>) {
+    // Crew: a managed run's child inherits no provider credential.
+    crew_inference::strip_inherited(cmd, env);
     for (key, value) in env {
         cmd.env(key, value);
     }

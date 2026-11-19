@@ -47,6 +47,8 @@ pub mod cloud_disk;
 pub mod commands;
 pub mod commit_credit;
 pub mod credentials;
+/// Crew: managed inference on Agent Auth (slice 5).
+pub mod crew_inference;
 pub mod deferred;
 pub mod desktop_notify;
 pub mod device_stats;
@@ -793,6 +795,8 @@ impl EngineCore {
             self.sessions.forgo_revival();
         }
         self.sessions.shutdown().await;
+        // Crew: managed inference's routes end with the runs.
+        crew_inference::shutdown(&self.registry);
         self.terminals.shutdown();
         self.commands.shutdown().await;
         self.sessions.stop_activity_projection().await;
@@ -1198,6 +1202,9 @@ impl Engine {
         let preview_org = profile.org_id().to_string();
         let device_root = profile.device_root().to_path_buf();
         let registry = Arc::new(default_registry());
+        // Crew: a Scaffold engine's agents run on Agent Auth only, from the
+        // first spawn on (boot recovery's too).
+        let crew = crew_inference::install(config, &auth, tokens.clone(), &registry);
         // Assembly's boot recovery may start a killed turn before the broker
         // below is attached: it waits for it.
         if auth.runner_identity().is_some() {
@@ -1219,6 +1226,9 @@ impl Engine {
             )?,
         };
         core.set_auth(auth.clone());
+        if let Some(crew) = &crew {
+            crew.follow_workspace(core.workspace.clone());
+        }
         // Agents' commits credit Zeron (always on Cloud, else per the
         // device's setting).
         core.registry

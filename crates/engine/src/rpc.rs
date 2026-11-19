@@ -2128,6 +2128,10 @@ impl EngineRpc {
         zeron_proto::voice::VoiceRejection,
     > {
         use zeron_proto::voice::VoiceRejection;
+        // Crew: voice would use Codex's own login, never Agent Auth.
+        if self.registry.crew_inference().is_some() {
+            return Err(VoiceRejection::Unsupported);
+        }
         // Without Codex here a retry can never connect: ask for an install.
         if !self
             .registry
@@ -3674,6 +3678,10 @@ impl RpcService for EngineRpc {
             }
             methods::LIST_MODELS => {
                 let p: ListModelsParams = parse_params(params)?;
+                // Crew: the managed catalog, with the account choice; no CLI probe.
+                if let Some(crew) = self.registry.crew_inference() {
+                    return RpcReply::value(&crew.models(p.harness).await.map_err(RpcError::Failed)?);
+                }
                 let lease = std::sync::Arc::new(self.registry.execution_lease(p.harness).await);
                 let harness = self
                     .registry
@@ -5989,6 +5997,8 @@ impl RpcService for EngineRpc {
                 RpcReply::value(&snapshot)
             }
             methods::ACTIVATE_AGENT_ACCOUNT => {
+                // Crew: managed runs never use this device's own logins.
+                self.registry.refuse_own_logins().map_err(RpcError::Failed)?;
                 self.voice.retire();
                 let p: AgentAccountParams = parse_params(params)?;
                 let snapshot = self
