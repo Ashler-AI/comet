@@ -366,10 +366,12 @@ them: its own bundle id (`ai.ashler.crew.zgx-canary`), URL scheme
 3. Open the app and sign in: the browser signs in to Crew Staging's Scaffold.
    Rooms, sessions and their transcripts live only in the local Edge
    (`edge/.wrangler/state`) and `~/.crew-zgx-canary`.
-4. Run a session. Until slice 5 lands, agents need logins of their own in the
-   engine's home (`~/.crew-zgx-canary/home`). For the engine's mock agent instead,
-   launch the app from a terminal with `ZERON_ZGX_MOCK=1
-   "/Applications/Crew zgx Canary.app/Contents/MacOS/zeron"`.
+4. Run a session with Claude Code or Codex. Signed in, every turn goes through
+   Crew Staging's Agent Auth (slice 5): the shared pool unless the chat's Account
+   option names one. No login on this Mac is used. Other agents refuse, by design,
+   until they're ported.
+   - For the engine's mock agent instead, launch the app from a terminal with
+     `ZERON_ZGX_MOCK=1 "/Applications/Crew zgx Canary.app/Contents/MacOS/zeron"`.
 
 ## Decisions for the owner
 
@@ -385,15 +387,17 @@ them: its own bundle id (`ai.ashler.crew.zgx-canary`), URL scheme
 
 - [x] 0. Baseline
 - [ ] 1. Isolation and flavour
-- [ ] 2. Crew sign-in: code in place (see "As built" under Seam notes), not yet verified.
-  - Passing: Crew's 15 `scaffold_auth` unit tests in `zeron-sync`
-    (`cargo test -p zeron-sync --lib scaffold_auth`).
-  - Not yet built (builds paused for disk space):
-    - `cargo check -p zeron-engine` and `cargo check -p zeron --bin zeron-engine --no-default-features`;
-    - `crates/engine/tests/scaffold_auth.rs`, which includes the exit gate
-      `the_engine_signs_in_with_scaffold_and_reports_the_project_as_its_organization`;
-    - the changed tests in `crates/engine/tests/{auth,local_first}.rs`;
-    - `apps/zeron` (`crew_runtime::tests`).
+- [x] 2. Crew sign-in: verified on upstream main, 2026-11-19, with slice 5 merged:
+  - `cargo test -p zeron-engine --test scaffold_auth --test auth --test local_first`:
+    24, 23 and 12 passed. `scaffold_auth` includes the exit gate
+    `the_engine_signs_in_with_scaffold_and_reports_the_project_as_its_organization`.
+    `local_first`'s two headless tests give an engine 5 s to serve IPC, so they can
+    time out when the Mac is loaded and other tests run beside them; alone they pass.
+  - `cargo test --lib -p zeron-sync -p zeron-cli -p zeron-launch -p zeron -- scaffold_auth crew`:
+    15, 7, 2 and 5 passed. `crew_runtime`'s child test needed its output parsed
+    wherever libtest prints it.
+  - The headed sign-in, which needs a person, is the installed build's step 3
+    (Development loop, "Testing an installed build").
   - Deferred:
     - Crew's rejection fence, `AccessToken { generation }` through `TokenSource::invalidate`.
       Until it lands, an Edge 401 doesn't send the engine back to Scaffold, and a revoked
@@ -423,15 +427,15 @@ them: its own bundle id (`ai.ashler.crew.zgx-canary`), URL scheme
   - Since the merge: "Keep chats on this device" (upstream #1432) is refused in
     Crew mode and left out of Settings → General, since a Crew engine's scope
     comes from its Scaffold session.
-- [ ] 5. Agent Auth: code in place (see "As built" under Seam notes), not yet built.
-  Branch `crew/zgx-thin-port-agent-auth`.
-  - Tests written, not yet run:
-    - `cargo test -p zeron-harness --lib crew_inference`: the route env, the strip (a
-      real `env` child too), the Claude and Codex overrides, the offline catalogs.
-    - `cargo test -p zeron-engine --lib crew_inference`: Crew's relay tests that still
-      apply, route reuse and retirement, and the managed environment. They cover a
-      spawn getting the relay env only; no route meaning an error; the other paths
-      refusing; and an engine without a Scaffold authority unchanged.
+- [ ] 5. Agent Auth: built and unit-tested on 2026-11-19; merged from
+  `crew/zgx-thin-port-agent-auth`.
+  - `cargo test -p zeron-harness --lib crew_inference`: 7 passed. These cover the
+    route env, the strip (a real `env` child too), the Claude and Codex overrides and
+    the offline catalogs.
+  - `cargo test -p zeron-engine --lib crew_inference`: 36 passed. These cover Crew's
+    relay tests that still apply, route reuse and retirement, and the managed
+    environment: a spawn getting the relay env only; no route meaning an error; the
+    other paths refusing; and an engine without a Scaffold authority unchanged.
   - Open: the exit gate, real turns from zgx through staging Platform's Agent Auth
     (decision 1).
 - [ ] 6. Scaffold
