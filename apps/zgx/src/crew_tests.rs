@@ -182,6 +182,8 @@ ui.command {
 		ask("account.orgs")
 		ask("account.me")
 		ask("account.onboarding")
+		ask("account.keeps_chats_local")
+		ask("account.keep_chats_local", true)
 		for _, name in { "account.check_username", "account.claim_username", "account.create_org", "account.invite", "account.rename", "account.set_title" } do
 			ask(name, "x")
 		end
@@ -224,6 +226,9 @@ fn the_account_s_calls_are_answered_here() {
     assert_eq!(got["account.me"], json!({ "ok": true, "value": { "first_name": "Ada", "name": "Ada", "email": "ada@example.net" } }));
     assert_eq!(got["account.onboarding"]["ok"], json!(true));
     assert!(strings(&got["account.onboarding"]["value"]).is_empty());
+    // Signed in is synced: no keeping chats on this device.
+    assert_eq!(got["account.keeps_chats_local"], json!({ "ok": true, "value": false }));
+    assert_eq!(got["account.keep_chats_local"], json!({ "ok": false, "word": "refused" }));
     // What only Zeron's Edge could do.
     for name in ["account.check_username", "account.claim_username", "account.create_org", "account.invite", "account.rename", "account.set_title"] {
         assert_eq!(got[name], json!({ "ok": false, "word": "refused" }), "{name}");
@@ -360,6 +365,12 @@ fn settings_have_no_members_and_no_profile_edits() {
     app.type_text("#settings-nav >> #settings-search", "members");
     app.frames(10);
     assert!(!shows(&mut app, "#settings-search-results >> \"Members\""), "{}", app.tree());
+    // General has no "Keep chats on this device": signed in is synced.
+    app.click("#settings-nav >> role:tab \"General\"");
+    app.frames(30);
+    assert_eq!(app.error(), None);
+    assert!(shows(&mut app, "#settings-page >> \"Hide email addresses\""), "{}", app.tree());
+    assert!(!shows(&mut app, "#settings-page >> \"Keep chats on this device\""), "{}", app.tree());
 }
 
 /// Without the flag, Settings are Zeron's as they were.

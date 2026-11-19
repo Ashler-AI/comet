@@ -16,13 +16,16 @@ local search = require("@app/screens/settings/search")
 local visits = require("@app/screens/settings/visits")
 local chat = require("@app/screens/chat/store")
 local language = require("@app/screens/language")
+-- Crew: signed in is synced, so no keeping chats on this device
+-- (ui/account/crew.luau; src/crew.rs refuses the switch's calls too).
+local crew = require("@account/crew")
 
 local M = {}
 
 M.ID = "general"
 M.TITLE = "General"
 
-search.index(M.ID, ui.t("settings.general.title"), ui.t("settings.general.terms"), {
+local rows: { search.Row } = {
 	{ key = "language", title = ui.t("settings.general.language.label"), terms = ui.t("settings.general.language.terms") },
 	{ key = "send_with", title = ui.t("settings.general.send_with.label"), terms = ui.t("settings.general.send_with.terms") },
 	{ key = "compact_mode", title = ui.t("settings.general.compact_mode.label"), terms = ui.t("settings.general.compact_mode.terms") },
@@ -34,7 +37,16 @@ search.index(M.ID, ui.t("settings.general.title"), ui.t("settings.general.terms"
 	{ key = "thread_naming", title = ui.t("settings.general.thread_naming.label"), terms = ui.t("settings.general.thread_naming.terms") },
 	{ key = "worktrees", title = ui.t("settings.general.worktrees.label"), section = ui.t("settings.general.git"), terms = ui.t("settings.general.worktrees.terms") },
 	{ key = "commit_credit", title = ui.t("settings.general.commit_credit.label"), section = ui.t("settings.general.git"), terms = ui.t("settings.general.commit_credit.terms") },
-})
+}
+if crew.on then
+	for i, row in rows do
+		if row.key == "keep_chats_local" then
+			table.remove(rows, i)
+			break
+		end
+	end
+end
+search.index(M.ID, ui.t("settings.general.title"), ui.t("settings.general.terms"), rows)
 
 -- The engine's settings for this Mac, as last heard: nil until asked.
 type Credit = { enabled: boolean, cloud: boolean? }
@@ -307,13 +319,16 @@ function M.view(): Node
 					description = ui.t("settings.general.hide_emails.description"),
 					control = ds.Switch { value = prefs.hide_emails, label = ui.t("settings.general.hide_emails.label") },
 				}),
-				row("keep_chats_local", {
-					label = ui.t("settings.general.keep_chats_local.label"),
-					description = ui.t("settings.general.keep_chats_local.description"),
-					control = engine_switch(ui.t("settings.general.keep_chats_local.label"), function(): boolean?
-						return keep_local:get()
-					end, set_keep_local),
-				}),
+				-- (Last in its group, so Crew's nil leaves no hole.)
+				if crew.on
+					then nil
+					else row("keep_chats_local", {
+						label = ui.t("settings.general.keep_chats_local.label"),
+						description = ui.t("settings.general.keep_chats_local.description"),
+						control = engine_switch(ui.t("settings.general.keep_chats_local.label"), function(): boolean?
+							return keep_local:get()
+						end, set_keep_local),
+					}),
 			},
 		},
 		ds.Settings.Section {
