@@ -373,6 +373,47 @@ them: its own bundle id (`ai.ashler.crew.zgx-canary`), URL scheme
    - For the engine's mock agent instead, launch the app from a terminal with
      `ZERON_ZGX_MOCK=1 "/Applications/Crew zgx Canary.app/Contents/MacOS/zeron"`.
 
+**Driving it from an agent.** Launch it in the background with devtools on, so
+it neither takes the person's keys nor opens a browser over their work:
+
+```sh
+open -g -n --env ZGX_INSPECT_SOCKET=1 --env ZGX_RENDER_WHEN_COVERED=1 --env ZGX_CLIPBOARD=memory \
+  --env ZERON_ZGX_NO_BROWSER=/tmp/signin-url.txt "/Applications/Crew zgx Canary.app" --args onboarding
+```
+
+- Drive it through its devtools socket: `$TMPDIR/zgx-inspect-<uid>/<pid>.sock`, one JSON
+  request a line (zgx's `docs/agents/inspect.md`).
+- Devtools serve one window a process. Setup's window goes when setup finishes, so
+  relaunch with `main` to drive the main window.
+- Sign-in writes its page to the `ZERON_ZGX_NO_BROWSER` file. Open it in a background
+  browser tab: with a live Crew Staging session, Scaffold approves at once and redirects
+  to the engine's loopback.
+
+**Run on 2026-11-19, from `0bda58b98`.** This is the headed exit gate of slices 2–5.
+
+- Installed beside Crew Staging. The engine ran from the bundle with only its own
+  environment: `~/.crew-zgx-canary`, port 27959, callback port 0, its own home.
+- Signed in to Crew Staging's Scaffold as the owner, in `ashler-staging`. The engine
+  restarted once, read its Edge from `crew-runtime.json`, and joined the registry room
+  on the local Edge.
+- Setup took Crew's path: look, agents, "ashler-staging is ready".
+- Added a scratch project, then ran two Claude Code turns (Opus 5.5):
+  - a `Read README.md` tool call, answered with the file's first line;
+  - "PONG".
+- The chat was titled by the managed model, and its chat2 room joined.
+- During a turn, `claude` had `ANTHROPIC_BASE_URL` set to the engine's relay, an
+  opaque run token, and no OAuth token or API key. Its only TCP connections were
+  local. The engine's only outbound connections were to scaffold-staging's address
+  (Agent Auth).
+- Found and fixed: the canary shared `crew-zgx-dev`'s app data (`0bda58b98`).
+- Found, not fixed (slice 4 and 5 follow-ups):
+  - Setup's first screen, the member cards, "Star on GitHub", Settings' "Zeron" heading,
+    Parallax scenes' copy and `zeron/` worktree branches are still Zeron's.
+  - Setup's agents step and Settings → Providers still offer to connect this Mac's own
+    agent logins and to install other agents. Managed runs refuse all of these.
+  - The managed Claude catalog is upstream's list (Fable 5.1 and 5, Opus 5.5, 4.8 and
+    4.7, Sonnet 5.5), without Crew's Fable 5.2.
+
 ## Decisions for the owner
 
 1. **Scaffold authority for test sign-in.**
