@@ -244,6 +244,73 @@ Deferred:
   - `POST /api/agent-auth/v2/{messages,responses}`;
   - `GET /api/agent-auth/routes/{session}`;
   - `/api/agent-accounts`.
+- **As built (slice 5), Claude Code and Codex only:**
+  - Engine code is in `crates/engine/src/crew_inference.rs`, with `crew_agent_auth.rs`
+    (the Agent Auth client, from Crew's `ScaffoldClient`) and `crew_inference_relay.rs`
+    (Crew's `inference_relay.rs`) as its child modules. The harness side is
+    `crates/harness/src/crew_inference.rs`.
+  - Managed means a Scaffold engine: `auth.scaffold_enabled()`, signed in or not. It is
+    installed in `Engine::assemble_runtime` before the core is assembled, so boot
+    recovery's runs are managed too. It is then the registry's only run environment:
+    `PinRunEnvironment`, Muse's and plugins' `run.preparing` pins never run. An engine
+    without a Scaffold authority is unchanged.
+  - The authority is the profile's `ProfileTokens` only. The client talks to
+    `crew-runtime.json`'s `scaffoldUrl` and nothing else, and never follows redirects.
+  - Each spawn of Claude Code or Codex gets a route for its chat, the chat's
+    `crewAccountId` model option (else Agent Auth's choice) and its provider.
+    `RunRequest::env` gets only `ZERON_CREW_INFERENCE` (the provider),
+    `ZERON_CREW_INFERENCE_URL` (the relay), `COMET_INFERENCE_TOKEN`, and the CLI's own:
+    `ANTHROPIC_BASE_URL` and `ANTHROPIC_AUTH_TOKEN` with Bedrock, Vertex, Foundry and
+    nonessential traffic off, or `OPENAI_BASE_URL` and `OPENAI_API_KEY`. The token is a
+    loopback token; Agent Auth's authority stays in the engine.
+  - A chat with no model gets the managed default (`claude-opus-5-5`, `gpt-6-sol`),
+    which `prepare` writes into the request.
+  - Titles (no chat) run in a titling session of their own per harness, on Agent
+    Auth's choice of account.
+  - The same chat and account keep one route and token, so a warm start and its run,
+    or a parked session, launch alike. Another account or provider retires the chat's
+    earlier routes. A retired token answers 410, or follows the chat's current route
+    for the same provider, as in Crew. Shutdown retires every route and stops the relay.
+  - `credential()` is a fingerprint of the chat's account (from its workspace row, else
+    its current route) and the route's serial. Choosing another account replaces a
+    parked session before its next turn.
+  - Harness seams: `apply_run_env` strips Crew's list of inherited provider credentials
+    (`STRIPPED`) when the env carries a route. Claude Code also gets `apiKeyHelper: ""`
+    and `forceLoginMethod: "console"`, and a route that isn't Anthropic's stops its
+    launch. Codex gets the `crew` model provider (`-c` overrides; the token never on
+    argv), `modelProvider: "crew"` on `thread/start` and `thread/resume`, and no
+    realtime voice. A route for another provider stops the launch.
+  - Upstream seams: `registry.rs` (one `crew` field; `environments()`;
+    `discover_models_with_lease`), `lib.rs` (install, follow the workspace, shutdown),
+    `rpc.rs` (`ListModels`, `ActivateAgentAccount`, `prepare_voice_bridge`) and
+    `plugin_agents.rs` (`activate`, `models`, `pin_mechanism`, `set_pin`). The engine
+    gains `hyper`, `hyper-util` and `http-body-util`, which `zeron-mcp` already builds.
+- **Fails closed**, in managed mode:
+  - Harnesses other than Claude Code and Codex: every spawn and `ListModels` refuse.
+  - Signed out, Agent Auth refusing or unreachable, a stopped engine, or no authority:
+    the spawn errors, titles included, and nothing is put in its environment.
+  - `ActivateAgentAccount`, plugins' `accounts.switch` and pins refuse.
+    `pin_mechanism` reports nothing pinnable.
+  - Codex voice: `prepare_voice_bridge` answers `Unsupported`, and a managed Codex run
+    never attaches realtime.
+  - Model lists (`ListModels`, plugins' `models`, titling's model choice) are the
+    managed catalog: Claude Code's curated rows, and Crew's OpenAI rows for Codex. Each
+    has an Account option: "Automatic · shared pool", then each healthy login from
+    `/api/agent-accounts` (cached a minute, 5 s at most, deduplicated as Crew's settings
+    do). No CLI is probed.
+- **Checked, left as upstream:** Auto's reviewer runs inside the agent's process
+  (Claude Code's classifier, Codex's `auto_review`), so it uses the route. Command and
+  skill discovery start the CLI's `initialize` handshake, with no model turn. Local
+  logins, API keys and usage reads remain; managed runs never see them.
+- **Deferred:**
+  - OMP, Antigravity, Crew's Boat admission gate, and sandbox (device) hosts. A device
+    host is managed, but its grant is untested against Agent Auth.
+  - `GET /api/agent-auth/routes/{session}` (route receipts): no surface shows them yet.
+  - `warm_signed_out` still reads the CLI's own login, so a managed chat may skip a
+    warm start.
+  - Codex features that call OpenAI's backend with a ChatGPT login outside the model
+    provider, if any, aren't blocked; the isolated home has no such login unless one is
+    made there.
 
 ### Scaffold sandboxes
 
@@ -279,6 +346,7 @@ scripts/crew/dev-zgx gallery     # zgx's component gallery: no engine at all
    - Option one: staging Platform, for identity and Agent Auth only, with rooms on the local Edge.
    - Option two: the old canary Scaffold. It answers, but nobody has checked whether its authority is still valid.
 2. Agent Auth through upstream's `RunEnvironment` hook rather than `RunControls` route context.
+   Slice 5 is built this way.
 3. **Codex resume failure.** Upstream silently starts a fresh conversation; Crew treats it as an error.
 4. Approval to push this branch, run build-only CI and deploy any Edge.
 
@@ -313,6 +381,16 @@ scripts/crew/dev-zgx gallery     # zgx's component gallery: no engine at all
   - Not run: the integration tests (`design_lint`, `leftovers`, `reload`,
     `onboarding_continue_ink`), stopped for disk space.
   - Open: the headed exit gate (above), which needs slices 2 and 3.
-- [ ] 5. Agent Auth
+- [ ] 5. Agent Auth: code in place (see "As built" under Seam notes), not yet built.
+  Branch `crew/zgx-thin-port-agent-auth`.
+  - Tests written, not yet run:
+    - `cargo test -p zeron-harness --lib crew_inference`: the route env, the strip (a
+      real `env` child too), the Claude and Codex overrides, the offline catalogs.
+    - `cargo test -p zeron-engine --lib crew_inference`: Crew's relay tests that still
+      apply, route reuse and retirement, and the managed environment. They cover a
+      spawn getting the relay env only; no route meaning an error; the other paths
+      refusing; and an engine without a Scaffold authority unchanged.
+  - Open: the exit gate, real turns from zgx through staging Platform's Agent Auth
+    (decision 1).
 - [ ] 6. Scaffold
 - [ ] 7. Packaging
