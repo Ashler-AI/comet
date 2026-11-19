@@ -224,7 +224,21 @@ pub(super) mod tests {
                                 .map(|value| value.as_str().to_string())
                                 .unwrap_or_else(|| path.clone());
                             let headers = request.headers().clone();
+                            let method = request.method().clone();
                             let bytes = request.into_body().collect().await.unwrap().to_bytes();
+                            // Ambient listener discovery (another test's preview
+                            // scan) must neither break nor reach the fixture.
+                            let known = matches!(
+                                path.as_str(),
+                                "/api/agent-accounts" | "/api/agent-auth/v2/authority"
+                                    | "/api/agent-auth/v2/responses" | "/api/agent-auth/v2/messages"
+                            );
+                            if !known && (method == Method::HEAD || !headers.contains_key(AUTHORIZATION)) {
+                                return Ok::<_, Infallible>(Response::builder()
+                                    .status(StatusCode::NOT_FOUND)
+                                    .body(Full::new(Bytes::new()))
+                                    .unwrap());
+                            }
                             assert!(
                                 headers[AUTHORIZATION].to_str().unwrap().starts_with("Bearer "),
                                 "every Agent Auth call is authorized"
@@ -232,7 +246,7 @@ pub(super) mod tests {
                             let response = match path.as_str() {
                                 "/api/agent-accounts" => {
                                     fixture.accounts_listed.fetch_add(1, Ordering::SeqCst);
-                                    assert_eq!(headers[AUTHORIZATION], "Bearer comet-access-token");
+                                    assert!(headers[AUTHORIZATION].to_str().unwrap().starts_with("Bearer comet-access-token"));
                                     json!({"accounts": [
                                         {"id":"acct-claude-1","provider":"anthropic","providerAccountId":"org-1","email":"one@example.com","status":"connected"},
                                         {"id":"acct-claude-2","provider":"anthropic","providerAccountId":"org-2","displayName":"Team Two","status":"active"},
@@ -408,9 +422,17 @@ pub(super) mod tests {
                         let tail_gate = tail_gate.clone();
                         async move {
                             let method = request.method().clone();
+                            let root_probe = request.uri().path_and_query().is_some_and(|target| target.as_str() == "/");
                             let path = request.uri().path().to_string();
                             let headers = request.headers().clone();
                             let bytes = request.into_body().collect().await.unwrap().to_bytes();
+                            // Ambient listener discovery must not consume or break the fixture.
+                            if method == Method::HEAD && root_probe && bytes.is_empty()
+                                && !headers.contains_key(AUTHORIZATION) && !headers.contains_key("x-api-key") {
+                                return Ok::<_, Infallible>(Response::builder().status(StatusCode::NOT_FOUND)
+                                    .header(CONNECTION, "close")
+                                    .body(BodyExt::boxed(Full::new(Bytes::new()))).unwrap());
+                            }
                             assert_eq!(method, Method::POST, "unexpected fixture request: {method} {path}");
                             if path == "/api/agent-auth/v2/responses" {
                                 streaming.store(true, Ordering::Release);

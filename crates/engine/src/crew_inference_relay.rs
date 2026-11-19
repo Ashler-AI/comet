@@ -596,7 +596,9 @@ impl InferenceRelay {
     }
 
     /// Retire the route `local_token` belongs to (all its tokens), ending its
-    /// streams.
+    /// streams. (Crew retired a run's route as it ended; upstream has no such
+    /// moment, so only tests retire one by hand.)
+    #[cfg(test)]
     pub(crate) fn remove(&self, local_token: &str) {
         let ended = {
             let mut state = lock(&self.inner.route_state);
