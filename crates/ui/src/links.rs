@@ -14,9 +14,14 @@ pub struct HarnessConversationLink {
     pub label: &'static str,
     pub url: String,
 }
+/// The schemes Crew's desktop bundles register: production, Staging and
+/// Canary (`scripts/package-macos.sh`). A link any of them copied stays
+/// readable in every build; the OS hands each build only its own scheme.
+pub const CREW_SCHEMES: [&str; 3] = ["comet", "comet-staging", "crew-upstream-canary"];
+
 /// Legacy routes remain readable; registering the canary must not take over their handlers.
 pub fn crew_link_scope(url: &str) -> Option<zeron_proto::CollaborationScope> {
-    for scheme in ["comet", "comet-staging", "crew-upstream-canary"] {
+    for scheme in CREW_SCHEMES {
         if let Some(link) = zeron_proto::CrewSessionLink::parse_deep_link(url, scheme) {
             return Some(zeron_proto::CollaborationScope {
                 project_id: link.project_id,
@@ -62,10 +67,15 @@ pub fn crew_session_link(chat: &Chat) -> Option<String> {
     crew_scope_link(&chat.crew.as_ref()?.scope)
 }
 
+/// A session link in this build's own scheme, so it opens in this build.
 pub fn crew_scope_link(scope: &zeron_proto::CollaborationScope) -> Option<String> {
+    scope_link(crate::product::current().url_scheme, scope)
+}
+
+fn scope_link(scheme: &str, scope: &zeron_proto::CollaborationScope) -> Option<String> {
     let id = uuid::Uuid::parse_str(scope.session_id.as_deref()?).ok()?;
     let mut link = format!(
-        "crew-upstream-canary://session/{}/{}",
+        "{scheme}://session/{}/{}",
         encode_component(&scope.project_id),
         id
     );
@@ -76,18 +86,24 @@ pub fn crew_scope_link(scope: &zeron_proto::CollaborationScope) -> Option<String
     Some(link)
 }
 
+/// A conversation link in this build's own scheme, so it opens in this build.
 pub fn zeron_conversation_link(chat_id: &str, workspace: &str) -> String {
+    conversation_link(crate::product::current().url_scheme, chat_id, workspace)
+}
+
+fn conversation_link(scheme: &str, chat_id: &str, workspace: &str) -> String {
     format!(
-        "crew-upstream-canary://open/chat/{}?workspace={}",
+        "{scheme}://open/chat/{}?workspace={}",
         encode_component(chat_id),
         encode_component(workspace)
     )
 }
 
 pub fn parse_zeron_conversation_link(url: &str) -> Result<ConversationDeepLink, &'static str> {
-    let rest = url
-        .strip_prefix("crew-upstream-canary://open/chat/")
-        .or_else(|| url.strip_prefix("zeron://open/chat/"))
+    let rest = CREW_SCHEMES
+        .into_iter()
+        .chain(["zeron"])
+        .find_map(|scheme| url.strip_prefix(scheme)?.strip_prefix("://open/chat/"))
         .ok_or("not a Crew conversation link")?;
     let (chat_id, query) = rest.split_once('?').ok_or("missing workspace locator")?;
     if chat_id.is_empty() || chat_id.contains('/') {
@@ -287,7 +303,46 @@ mod tests {
             );
         }
         let link = zeron_conversation_link("same-session", "scope");
-        assert!(link.starts_with("crew-upstream-canary://"));
+        assert!(link.starts_with("comet-staging://"), "{link}");
         assert!(parse_zeron_conversation_link(&format!("{link}&token=secret")).is_err());
+    }
+
+    /// Every build copies links in its own scheme (every build once wrote
+    /// `crew-upstream-canary://`, which only Canary opens), and every Crew
+    /// scheme's links read back.
+    #[test]
+    fn copied_links_use_the_builds_scheme_and_read_back() {
+        let session = "011664b5-3660-4fe6-83a2-3647fa6a2f65";
+        let scope = zeron_proto::CollaborationScope {
+            project_id: "ashler-staging".into(),
+            deployment_id: Some("ashler-staging".into()),
+            session_id: Some(session.into()),
+            unknown: Default::default(),
+        };
+        for scheme in CREW_SCHEMES {
+            let link = scope_link(scheme, &scope).unwrap();
+            assert_eq!(
+                link,
+                format!("{scheme}://session/ashler-staging/{session}?deploymentId=ashler-staging")
+            );
+            assert_eq!(crew_link_scope(&link), Some(scope.clone()));
+
+            let link = conversation_link(scheme, "chat/one", "workspace:one");
+            assert!(link.starts_with(&format!("{scheme}://open/chat/")), "{link}");
+            assert_eq!(
+                parse_zeron_conversation_link(&link).unwrap(),
+                ConversationDeepLink {
+                    chat_id: "chat/one".into(),
+                    workspace: "workspace:one".into(),
+                }
+            );
+        }
+        // The app's own helpers follow the installed product (tests: Staging).
+        assert_eq!(
+            crew_scope_link(&scope),
+            scope_link(crate::product::TEST.url_scheme, &scope)
+        );
+        assert!(zeron_conversation_link("c", "w").starts_with("comet-staging://open/chat/"));
+        assert!(parse_zeron_conversation_link("comet-stagingx://open/chat/c?workspace=w").is_err());
     }
 }

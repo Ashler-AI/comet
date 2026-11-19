@@ -54,6 +54,8 @@ pub mod orb;
 pub mod overscroll;
 pub mod pickers;
 pub mod popover;
+pub mod product;
+pub use product::Product;
 pub mod project_actions;
 pub mod pull_request_detail;
 mod pull_request_media;
@@ -117,6 +119,8 @@ pub struct UiConfig {
     pub default_harness: HarnessId,
     /// Conversation URL passed by the OS on a cold launch.
     pub initial_url: Option<String>,
+    /// Which Crew this is: its name and URL scheme ([`product`]).
+    pub product: Product,
 }
 
 impl UiConfig {
@@ -148,6 +152,8 @@ impl gpui::Global for ReopenState {}
 /// connect-or-embed), 1320×880 window (min 900×600) with [`shell::Shell`] as the
 /// root view, boot splash overlaid until the engine reports ready.
 pub fn run_app(config: UiConfig) {
+    // Before any menu, window or link reads it.
+    product::install(config.product);
     // Retain ownership for the whole application lifetime. The bridge's
     // default runtime has only two workers, insufficient for a desktop engine.
     let runtime = tokio::runtime::Runtime::new().expect("desktop Tokio runtime");
@@ -311,7 +317,7 @@ pub fn run_app(config: UiConfig) {
         // `open_main_window` because `Shell::new` ran `apply_keymap`
         // synchronously, so `set_menus` reads the final bindings for the ⌘-key
         // equivalents (gpui snapshots the keymap at set time).
-        cx.set_menus(app_menus::app_menus());
+        cx.set_menus(app_menus::app_menus(product::current().name));
         // Switching keyboard layout moves the keys behind ⌘-shortcuts (AZERTY
         // reaches ⌘1 as ⌘&): rebind against the new layout, then refresh the
         // menu bar's snapshot of the keymap and redraw the hints that name
@@ -319,7 +325,7 @@ pub fn run_app(config: UiConfig) {
         cx.on_keyboard_layout_change(|cx| {
             let settings = settings::current(cx);
             shell::apply_keymap(cx, &settings.keymap, settings.composer_send_behavior);
-            cx.set_menus(app_menus::app_menus());
+            cx.set_menus(app_menus::app_menus(product::current().name));
             cx.refresh_windows();
         })
         .detach();
@@ -460,7 +466,7 @@ fn open_main_window(
                 // Linux/Windows `appears_transparent` hides the system titlebar
                 // for our custom-drawn chrome; harmless where unsupported.
                 titlebar: Some(TitlebarOptions {
-                    title: cfg!(target_os = "windows").then(|| "Crew Canary".into()),
+                    title: cfg!(target_os = "windows").then(|| product::current().name.into()),
                     appears_transparent: true,
                     // Native lights are 14px tall: top 14 → center 21, matching
                     // the 38px titlebar row with 4px top-only content padding.

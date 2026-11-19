@@ -1,6 +1,12 @@
 //! Build-selected defaults only; explicit runtime coordinates retain precedence.
 
 pub struct Defaults {
+    /// The name people see (menus, About, update prompts); the bundle's
+    /// `CFBundleName` in `scripts/package-macos.sh`.
+    pub product_name: &'static str,
+    /// The scheme the bundle registers (`CFBundleURLSchemes`): links this
+    /// build copies use it, so they open in this build.
+    pub url_scheme: &'static str,
     pub data_dir: &'static str,
     #[cfg(windows)]
     pub windows_data_dir: &'static str,
@@ -15,6 +21,8 @@ pub struct Defaults {
 
 #[cfg(any(comet_default_environment = "canary", test))]
 const CANARY: Defaults = Defaults {
+    product_name: "Crew Canary",
+    url_scheme: "crew-upstream-canary",
     data_dir: ".crew-upstream-canary",
     #[cfg(windows)]
     windows_data_dir: "Crew Canary",
@@ -29,6 +37,8 @@ const CANARY: Defaults = Defaults {
 
 #[cfg(any(comet_default_environment = "staging", test))]
 const STAGING: Defaults = Defaults {
+    product_name: "Crew Staging",
+    url_scheme: "comet-staging",
     data_dir: ".crew-staging",
     #[cfg(windows)]
     windows_data_dir: "Crew Staging",
@@ -43,6 +53,8 @@ const STAGING: Defaults = Defaults {
 
 #[cfg(any(comet_default_environment = "production", test))]
 const PRODUCTION: Defaults = Defaults {
+    product_name: "Crew",
+    url_scheme: "comet",
     data_dir: ".crew",
     #[cfg(windows)]
     windows_data_dir: "Crew",
@@ -77,6 +89,8 @@ mod tests {
             assert!(![27955, 27956].contains(&flavor.ipc_port));
             assert!(![".comet-native", ".comet-native-staging", ".zeron"].contains(&flavor.data_dir));
             for other in &flavors[index + 1..] {
+                assert_ne!(flavor.product_name, other.product_name);
+                assert_ne!(flavor.url_scheme, other.url_scheme);
                 assert_ne!(flavor.data_dir, other.data_dir);
                 #[cfg(windows)]
                 assert_ne!(flavor.windows_data_dir, other.windows_data_dir);
@@ -84,6 +98,46 @@ mod tests {
                 assert_ne!(flavor.launchd_label, other.launchd_label);
                 assert_ne!(flavor.systemd_unit, other.systemd_unit);
             }
+        }
+    }
+
+    /// The bundle `scripts/package-macos.sh` makes for each environment is
+    /// named and registers the scheme this table gives the app, so the name
+    /// the app shows and the links it copies match the install they're in.
+    #[test]
+    fn packaging_names_and_registers_each_flavors_product() {
+        let script = include_str!("../../../scripts/package-macos.sh");
+        let arm = |environment: &str| {
+            let start = script
+                .find(&format!("\n  {environment})\n"))
+                .unwrap_or_else(|| panic!("package-macos.sh has no {environment} arm"));
+            let rest = &script[start..];
+            &rest[..rest.find(";;").expect("case arm ends")]
+        };
+        // The scheme is set in an `if staging / elif canary / else` block.
+        let block = &script[script
+            .find("if [[ \"$PACKAGE_ENVIRONMENT\" == staging ]]")
+            .expect("staging's scheme branch")..];
+        let block = &block[..block.find("\nfi\n").expect("scheme block ends")];
+        let (staging, rest) = block
+            .split_once("\nelif [[ \"$PACKAGE_ENVIRONMENT\" == canary ]]")
+            .expect("canary's scheme branch");
+        let (canary, production) = rest.split_once("\nelse\n").expect("production's branch");
+        for (environment, flavor, registers) in [
+            ("canary", &CANARY, canary),
+            ("staging", &STAGING, staging),
+            ("production", &PRODUCTION, production),
+        ] {
+            assert!(
+                arm(environment).contains(&format!("APP_NAME=\"{}\"", flavor.product_name)),
+                "{environment} bundle is not named {:?}",
+                flavor.product_name
+            );
+            assert!(
+                registers.contains(&format!("CFBundleURLSchemes:0 {}\"", flavor.url_scheme)),
+                "{environment} bundle does not register {:?}",
+                flavor.url_scheme
+            );
         }
     }
 
