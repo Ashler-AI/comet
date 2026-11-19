@@ -417,13 +417,15 @@ them: its own bundle id (`ai.ashler.crew.zgx-canary`), URL scheme
   - Merged Edge served by `scripts/crew/local-backend`: `/auth/session` with no
     bearer or a bogus `sc_rc_` bearer, WorkOS's callback and `/install.sh` all
     answer 401 unauthenticated.
-- [ ] 4. zgx Crew mode: implemented and unit-tested on 2026-11-13.
-  - `cargo test --bin zeron-zgx` in `apps/zgx`: 693 passed, 0 failed, 33 ignored.
-    That includes the `crew::`, `auth::` and `engine::manager` tests. The one new
-    ignore is upstream's staging-default test, which is unreachable here.
-  - Not run: the integration tests (`design_lint`, `leftovers`, `reload`,
-    `onboarding_continue_ink`), stopped for disk space.
-  - Open: the headed exit gate (above), which needs slices 2 and 3.
+- [ ] 4. zgx Crew mode: tested on upstream main, 2026-11-19.
+  - `cargo test --bin zeron-zgx` in `apps/zgx`: 760 passed, 0 failed, 33 ignored.
+    That is every upstream test running in Crew mode, plus the `crew::`, `auth::`
+    and `engine::manager` tests. The one Crew ignore is upstream's staging-default
+    test, which is unreachable here.
+  - The integration tests: `design_lint` 1, `leftovers` 3, `onboarding_continue_ink` 1
+    and `reload` 16, all passing.
+  - Open: the headed exit gate (above), which needs a person to sign in. It is the
+    installed build's steps 3 and 4.
   - Since the merge: "Keep chats on this device" (upstream #1432) is refused in
     Crew mode and left out of Settings → General, since a Crew engine's scope
     comes from its Scaffold session.
@@ -443,3 +445,8 @@ them: its own bundle id (`ai.ashler.crew.zgx-canary`), URL scheme
   - Local half: `scripts/crew/package-zgx-app` (ad-hoc signed, no updater) and
     `scripts/crew/local-backend`; see "Testing an installed build". The signed
     build from CI still needs approval.
+  - Packaged 2026-11-19 from `9bca77d5c`: 361 MB debug bundle, `zeron` and
+    `zeron-engine` 0.3.9, both the canary flavour.
+  - Its engine, started headless in a scratch data dir, served IPC within 2 s.
+    It answered `EngineInfo` with `zgx-interface-v1` among its capabilities, and
+    `AuthStatus` as `signedOut`.
