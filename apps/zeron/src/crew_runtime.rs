@@ -246,9 +246,11 @@ mod tests {
                 .output()
                 .unwrap();
             let stdout = String::from_utf8_lossy(&output.stdout);
+            // With --nocapture, libtest prints the child's line after its own
+            // "test crew_runtime::tests::child ... " on the same line.
             let line = stdout
                 .lines()
-                .find_map(|line| line.strip_prefix("resolved: "))
+                .find_map(|line| line.split_once("resolved: ").map(|(_, json)| json))
                 .unwrap_or_else(|| panic!("child: {output:?}"));
             serde_json::from_str::<serde_json::Value>(line).unwrap()
         };
