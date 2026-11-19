@@ -49,8 +49,9 @@ pub const ENV: &str = "crew";
 /// Who the account signs in with (`account.provider`).
 pub const PROVIDER: &str = "scaffold";
 
-/// What the app is called: its windows' title, Settings → About's.
-pub const TITLE: &str = if MODE { "Crew (zgx dev)" } else { "Zeron" };
+/// What the app is called: its windows' title, Settings → About's (its
+/// flavour's, `zeron_cli::crew::PRODUCT`).
+pub const TITLE: &str = if MODE { zeron_cli::crew::PRODUCT } else { "Zeron" };
 
 /// The engine's Scaffold session, in its data dir beside upstream's
 /// `session.json`.
@@ -285,6 +286,7 @@ pub fn install(host: &ScriptHost) {
     if !MODE {
         return;
     }
+    host.shared("crew_product", TITLE);
     answer(
         host,
         Rc::new(Answers {

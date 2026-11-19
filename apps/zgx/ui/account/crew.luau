@@ -6,11 +6,12 @@
 -- Crew difference in the scripts asks here, not the account's provider.
 --
 --   crew.on        whether this is a Crew build
---   crew.PRODUCT   what the app is called in one
+--   crew.PRODUCT   what the app is called in one (its flavour's: the
+--                  host's `crew_product`, crates/cli `crew::PRODUCT`)
 
 local M = {}
 
 M.on = ui.shared("crew", false):peek() == true
-M.PRODUCT = "Crew (zgx dev)"
+M.PRODUCT = ui.shared("crew_product", "Crew (zgx dev)"):peek()
 
 return M

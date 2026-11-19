@@ -171,7 +171,7 @@ impl Config {
         if BETA {
             Self::zeron_app(var, home, exe, edge, client, callback_port)
         } else {
-            Self::staging(var, home, edge, client, callback_port)
+            Self::staging(var, home, exe, edge, client, callback_port)
         }
     }
 
@@ -219,6 +219,7 @@ impl Config {
     fn staging(
         var: impl Fn(&str) -> Option<String>,
         home: &Path,
+        exe: Option<&Path>,
         edge: &str,
         client: &str,
         callback_port: u16,
@@ -245,11 +246,16 @@ impl Config {
                 return Err(format!("{} is the production engine's (ZERON_ZGX_ENGINE_PRODUCTION=1 to use it anyway)", dir.display()));
             }
         }
-        let bin = var("ZERON_ZGX_ENGINE_BIN").map(|p| expand(&p, home)).or_else(|| {
-            // This checkout's: apps/zgx is two below the repository's root.
-            let built = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/debug/zeron-engine");
-            built.exists().then_some(built)
-        });
+        let bin = var("ZERON_ZGX_ENGINE_BIN")
+            .map(|p| expand(&p, home))
+            // Crew: an installed build's engine, packaged beside it
+            // (scripts/crew/package-zgx-app), before any checkout's.
+            .or_else(|| exe.and_then(zeron_launch::engine_executable))
+            .or_else(|| {
+                // This checkout's: apps/zgx is two below the repository's root.
+                let built = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/debug/zeron-engine");
+                built.exists().then_some(built)
+            });
         // Crew: the agents' logins, worktrees and caches are the engine's own
         // unless a home is named, never this Mac's or another Crew's.
         let engine_home = var("ZERON_ZGX_ENGINE_HOME")
@@ -543,6 +549,25 @@ mod tests {
         // Somewhere of its own is fine, and its home can be named.
         let elsewhere = config_of(&[("ZERON_ZGX_ENGINE_DATA", "/tmp/crew-zgx-test"), ("ZERON_ZGX_ENGINE_PORT", "27961"), ("ZERON_ZGX_ENGINE_HOME", "/tmp/crew-zgx-home")], home, None, edge).unwrap();
         assert_eq!((elsewhere.port, elsewhere.home.clone()), (27961, Some(PathBuf::from("/tmp/crew-zgx-home"))));
+    }
+
+    /// Crew: an installed build (scripts/crew/package-zgx-app) starts the
+    /// engine packaged beside it, not a checkout's; a named one still wins.
+    #[cfg(all(target_os = "macos", not(feature = "beta")))]
+    #[test]
+    fn an_installed_crew_build_starts_its_own_engine() {
+        let bundle = tempfile::tempdir().unwrap();
+        let macos = bundle.path().join("Crew zgx Canary.app/Contents/MacOS");
+        std::fs::create_dir_all(&macos).unwrap();
+        let exe = macos.join("zeron");
+        std::fs::write(&exe, "").unwrap();
+        std::fs::write(macos.join("zeron-engine"), "").unwrap();
+        let home = Path::new("/Users/someone");
+        let edge = "https://staging.zeron.sh";
+        let installed = config_of(&[], home, Some(&exe), edge).unwrap();
+        assert_eq!(installed.bin, Some(macos.join("zeron-engine")));
+        let named = config_of(&[("ZERON_ZGX_ENGINE_BIN", "/opt/engine")], home, Some(&exe), edge).unwrap();
+        assert_eq!(named.bin, Some(PathBuf::from("/opt/engine")));
     }
 
     /// The beta manages Zeron.app's own engine: its port and data, the

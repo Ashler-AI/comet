@@ -1,0 +1,101 @@
+#!/usr/bin/env bash
+# Crew zgx Canary.app: this branch's zgx interface and engine, both built as
+# the packaged canary flavour (crates/cli/src/crew.rs: ~/.crew-zgx-canary, IPC
+# port 27959), in a bundle of its own that installs beside every other Crew
+# and Zeron (docs/crew/zgx-thin-port.md, slice 7's local half):
+#
+#   <target>/package-crew-zgx/Crew zgx Canary.app
+#     Contents/MacOS/zeron          the zgx interface, in Crew mode
+#     Contents/MacOS/zeron-engine   its engine: the app starts the one beside
+#                                   it (apps/zgx/src/engine/manager.rs)
+#     Contents/Resources/ui, plugins-builtin, licenses, the icon
+#
+# Ad-hoc signed, never notarized, no updater and no dmg: built here to be
+# installed here, by hand. Its engine signs in with, and syncs through, what
+# ~/.crew-zgx-canary/crew-runtime.json names (signed out and local without it).
+#
+#   scripts/crew/package-zgx-app
+#   CREW_ZGX_PROFILE=release scripts/crew/package-zgx-app   # much slower to build
+#   CREW_ZGX_TARGET_DIR=/path                               # default: <worktree>/target
+#
+# Needs Zig 0.16 for zgx's terminals (Ghostty): ZIG, or ~/.crew-zgx-dev/zig/zig.
+set -euo pipefail
+
+root="$(cd "$(dirname "$0")/../.." && pwd)"
+die() { echo "$*" >&2; exit 1; }
+
+FLAVOR=zgx-canary
+APP_NAME="Crew zgx Canary"
+BUNDLE_ID="ai.ashler.crew.zgx-canary"
+# Its own scheme: no link meant for another Crew, or for Zeron, opens here.
+URL_SCHEME="crew-zgx-canary"
+
+profile="${CREW_ZGX_PROFILE:-debug}"
+case "$profile" in
+  debug) release=() ;;
+  release) release=(--release) ;;
+  *) die "CREW_ZGX_PROFILE is debug or release, not '$profile'" ;;
+esac
+target="${CREW_ZGX_TARGET_DIR:-$root/target}"
+zig="${ZIG:-$HOME/.crew-zgx-dev/zig/zig}"
+[[ -x "$zig" ]] || die "no Zig 0.16 at $zig (set ZIG)"
+out="$target/package-crew-zgx"
+app="$out/$APP_NAME.app"
+
+cargo_build() {
+  "$root/scripts/crew/clean-env" CREW_FLAVOR="$FLAVOR" ZIG="$zig" \
+    python3 "$root/scripts/local-cargo.py" build "$@"
+}
+# The engine (the root workspace), then the interface: apps/zgx is a
+# workspace of its own, and cargo reads its .cargo/config.toml (Luau without
+# its asserts, mimalloc's page sizes) only where it runs, so it's named here.
+cargo_build -p zeron --bin zeron-engine ${release[@]+"${release[@]}"} --target-dir "$target"
+cargo_build --manifest-path "$root/apps/zgx/Cargo.toml" --config "$root/apps/zgx/.cargo/config.toml" \
+  ${release[@]+"${release[@]}"} --target-dir "$target/zgx"
+engine="$target/$profile/zeron-engine"
+interface="$target/zgx/$profile/zeron-zgx"
+[[ -x "$engine" && -x "$interface" ]] || die "the build left no $engine or $interface"
+
+version="$(grep -m1 '^version' "$root/Cargo.toml" | sed 's/.*"\(.*\)".*/\1/')"
+rm -rf "$app"
+mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
+install -m 755 "$interface" "$app/Contents/MacOS/zeron"
+install -m 755 "$engine" "$app/Contents/MacOS/zeron-engine"
+
+plist="$app/Contents/Info.plist"
+sed "s/__VERSION__/$version/" "$root/dist/macos/Info.plist" >"$plist"
+plutil -replace CFBundleIdentifier -string "$BUNDLE_ID" "$plist"
+plutil -replace CFBundleName -string "$APP_NAME" "$plist"
+plutil -replace CFBundleDisplayName -string "$APP_NAME" "$plist"
+plutil -replace CFBundleURLTypes -json \
+  "[{\"CFBundleURLName\":\"$BUNDLE_ID.conversation\",\"CFBundleURLSchemes\":[\"$URL_SCHEME\"]}]" "$plist"
+plutil -replace NSMicrophoneUsageDescription -string \
+  "$APP_NAME uses your microphone for on-device dictation and for voice sessions you start." "$plist"
+# Ghostty's floor, as upstream's bundle.
+plutil -replace LSMinimumSystemVersion -string "13.0" "$plist"
+plutil -convert xml1 "$plist"
+plutil -lint "$plist" >/dev/null
+
+# The scripts and the built-in plugins, as upstream's bundle carries them
+# (scripts/package-zgx-macos.sh): not zgx's generated types or the tests.
+rsync -a --exclude '.zgx/' --exclude '/tests/' --exclude '.lock' --exclude '.DS_Store' \
+  "$root/apps/zgx/ui/" "$app/Contents/Resources/ui/"
+rsync -a --exclude '.zgx/' --exclude '.DS_Store' \
+  "$root/apps/zgx/plugins-builtin/" "$app/Contents/Resources/plugins-builtin/"
+for dir in "$app/Contents/Resources/plugins-builtin/"*/; do
+  cp "$root/apps/zgx/plugins-sdk/zeron.luau" "$dir/zeron.luau"
+done
+mkdir -p "$app/Contents/Resources/licenses/fonts"
+cp "$root/assets/fonts/licenses/"* "$root/apps/zgx/fonts/"*-OFL.txt "$app/Contents/Resources/licenses/fonts/"
+cp "$root/THIRD_PARTY_NOTICES.md" "$root/LICENSE" "$app/Contents/Resources/licenses/"
+"$root/scripts/macos-app-icon.sh" "$app/Contents/Resources"
+
+# Ad hoc, inside out: the engine (its own identifier), then the bundle.
+entitlements="$root/dist/macos/Zeron.entitlements"
+codesign --force --entitlements "$entitlements" --sign - --identifier "$BUNDLE_ID.engine" \
+  "$app/Contents/MacOS/zeron-engine"
+codesign --force --entitlements "$entitlements" --sign - "$app"
+codesign --verify --strict --verbose=2 "$app"
+
+echo "packaged: $app ($profile, $(du -sh "$app" | cut -f1))"
+echo "install:  ditto \"$app\" \"/Applications/$APP_NAME.app\""
