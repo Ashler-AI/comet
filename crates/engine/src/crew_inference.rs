@@ -766,10 +766,11 @@ mod tests {
     async fn the_engine_lists_the_managed_catalog_and_refuses_its_own_logins() {
         let (origin, _fixture, _captured) = agent_auth().await;
         let crew = Arc::new(CrewInference::start(&origin, static_token()).unwrap());
-        let registry = Arc::new(crate::default_registry());
+        // No harnesses: nothing here may start a CLI or reach beyond loopback.
+        let registry = Arc::new(HarnessRegistry::new());
         registry.set_crew_inference(crew.clone());
         let dir = tempfile::tempdir().unwrap();
-        let core = crate::EngineCore::assemble(dir.path(), registry.clone(), HarnessId::ClaudeCode, None).unwrap();
+        let core = crate::EngineCore::assemble(dir.path(), registry.clone(), HarnessId::Mock, None).unwrap();
         crew.follow_workspace(core.workspace.clone());
         let client = zeron_rpc::memory_client(core.rpc_service());
 
