@@ -361,16 +361,25 @@ fn settings_have_no_members_and_no_profile_edits() {
     app.click("#settings-nav >> role:tab \"About & updates\"");
     app.frames(30);
     assert!(shows(&mut app, "#settings-page >> \"Crew (zgx dev)\""), "{}", app.tree());
-    // The search finds no Members page.
-    app.type_text("#settings-nav >> #settings-search", "members");
-    app.frames(10);
-    assert!(!shows(&mut app, "#settings-search-results >> \"Members\""), "{}", app.tree());
     // General has no "Keep chats on this device": signed in is synced.
     app.click("#settings-nav >> role:tab \"General\"");
     app.frames(30);
     assert_eq!(app.error(), None);
     assert!(shows(&mut app, "#settings-page >> \"Hide email addresses\""), "{}", app.tree());
     assert!(!shows(&mut app, "#settings-page >> \"Keep chats on this device\""), "{}", app.tree());
+    // The search finds no Members page, and no keeping chats local, though
+    // it still finds General's other privacy row.
+    app.type_text("#settings-nav >> #settings-search", "members");
+    app.frames(10);
+    assert!(!shows(&mut app, "#settings-search-results >> \"Members\""), "{}", app.tree());
+    // (The field itself: with results open, the search box's middle is its list.)
+    let field = "#settings-search >> role:textbox \"Search settings\"";
+    app.fill(field, "hide email");
+    app.frames(10);
+    assert!(shows(&mut app, "#settings-search-results >> \"Hide email addresses\""), "{}", app.tree());
+    app.fill(field, "keep chats");
+    app.frames(10);
+    assert!(!shows(&mut app, "#settings-search-results >> \"Keep chats on this device\""), "{}", app.tree());
 }
 
 /// Without the flag, Settings are Zeron's as they were.
