@@ -97,6 +97,7 @@ import { DeleteWorkflow, ProvisionWorkflow, SleepWorkflow, WakeWorkflow } from "
 import { runCloudCron } from "./cloud/billing";
 import { handleAttachmentBlob } from "./attachment-blobs";
 import { runnerChatGate, runnerDeviceGate } from "./runner-access";
+import type { RunnerDrop } from "./runner-revocation";
 import { UserDirectory } from "./user-directory";
 
 export { AuthGrant, SessionRoom, DeviceRoom, RegistryRoom, ChatRoom, PreviewRoom, CloudAccount, CloudIndex, UserDirectory };
@@ -144,14 +145,16 @@ export default {
     //    client-minted). The DO handles /ws, /checkpoint (GET Range-resumable
     //    + POST floor-guarded), host-published /tail + /diff sidecars,
     //    /stats, /reset. ──────────────────────────────────────────────────────
+    let chatRunner: RunnerDrop | undefined;
     if (parts[0] === "chat2" && parts[1] && ID_RE.test(parts[1])) {
-      // A Cloud runner reaches only the chats its device hosts.
-      const notHost = await runnerChatGate(env, auth, parts[1]);
-      if (notHost) return notHost;
+      // A Cloud runner reaches the chats its session's reach allows.
+      const admission = await runnerChatGate(env, auth, parts[1]);
+      if (admission.refused) return admission.refused;
+      if (admission.epoch !== undefined && auth.deviceId) chatRunner = { device: auth.deviceId, epoch: admission.epoch };
     }
     // Crew: no org header, so a chat room never asks the registry who hosts
     // it (`/chat-host`); only the relay layer, off in this build, would.
-    const chatResponse = chatRoute(request, env, auth.userId);
+    const chatResponse = chatRoute(request, env, auth.userId, undefined, chatRunner);
     if (chatResponse) return chatResponse;
 
     // ── workspace rooms: the legacy Loro workspace doc, retired (crew/router.ts: 410)
@@ -209,11 +212,13 @@ export default {
     // ── device rooms ────────────────────────────────────────────────────────
     if (parts[0] === "device" && parts[1] && ID_RE.test(parts[1])) {
       const deviceId = parts[1];
-      // Another device's link or nudge: only a delegate's machine (the
+      // Another device's link or nudge: as the runner's reach allows (the
       // policy already admitted nothing else but liveness).
+      let runnerEpoch: number | undefined;
       if (parts[2] === "ws" || parts[2] === "nudge") {
-        const refusedDevice = await runnerDeviceGate(env, auth, deviceId);
-        if (refusedDevice) return refusedDevice;
+        const admission = await runnerDeviceGate(env, auth, deviceId);
+        if (admission.refused) return admission.refused;
+        runnerEpoch = admission.epoch;
       }
       if (parts[2] === "ws") {
         if (request.headers.get("upgrade")?.toLowerCase() !== "websocket") {
@@ -229,7 +234,10 @@ export default {
           request,
           auth,
           "/ws",
-          `?role=${role}&connId=${encodeURIComponent(connId)}`
+          `?role=${role}&connId=${encodeURIComponent(connId)}`,
+          undefined,
+          undefined,
+          runnerEpoch
         );
       }
       if (parts[2] === "sidecar" && parts[3] && /^[a-z0-9-]{1,64}$/.test(parts[3])) {
@@ -266,8 +274,8 @@ export default {
       if (partId === undefined || !PART_RE.test(partId)) {
         return json({ error: "bad part id" }, 400);
       }
-      const notHost = await runnerChatGate(env, auth, parts[1]);
-      if (notHost) return notHost;
+      const admission = await runnerChatGate(env, auth, parts[1]);
+      if (admission.refused) return admission.refused;
       const key = `blob/${auth.userId}/${parts[1]}/${partId}`;
       if (request.method === "PUT") {
         const body = await request.arrayBuffer();

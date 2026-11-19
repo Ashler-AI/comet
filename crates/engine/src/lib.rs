@@ -44,6 +44,7 @@ mod chat_persistence;
 mod cloud_accounts;
 pub mod cloud_client;
 pub mod cloud_disk;
+pub mod commands;
 pub mod commit_credit;
 pub mod credentials;
 pub mod deferred;
@@ -58,6 +59,8 @@ pub(crate) mod home_index;
 mod http_error;
 pub mod instance_lock;
 pub mod local_import;
+pub mod keep_running;
+pub mod heap;
 pub mod managed;
 mod hosted_models;
 mod model_catalogs;
@@ -73,6 +76,7 @@ pub mod run_journal;
 pub mod runner;
 pub mod wake_trace;
 pub mod wake_update;
+pub mod self_schedule;
 pub mod sessions;
 pub mod source_control;
 pub mod spaces;
@@ -191,6 +195,8 @@ pub struct EngineCore {
     pub repos: Repos,
     pub workspace_files: WorkspaceFiles,
     pub terminals: Terminals,
+    /// Agents' shell commands on this device ([`commands`]).
+    pub commands: commands::Commands,
     /// I/O routing for terminals on other devices (direct link or relay).
     pub remote_terminals: remote_terminals::RemoteTerminals,
     pub project_actions: ProjectActionsStore,
@@ -221,6 +227,9 @@ pub struct EngineCore {
     /// Cloud runner only: credential broker + heartbeat (dropped on shutdown).
     cloud: std::sync::Mutex<Option<runner::CloudRunner>>,
     /// Exclusive data-dir lock — held for the engine's lifetime (single-instance).
+    /// This process's agents, recorded in the data dir so that whatever
+    /// a killed engine leaves running is ended by the next one.
+    _agent_ledger: zeron_harness::process::registry::Attachment,
     _instance_lock: InstanceLock,
 }
 
@@ -282,6 +291,11 @@ impl EngineCore {
         let data_dir = profile.device_root();
         std::fs::create_dir_all(data_dir)?;
         update_trial::refuse_mid_update(data_dir)?;
+        // Agents an engine on this data dir left running when it died (a
+        // SIGKILL, a crash) are ended; ours are recorded for the next one
+        // to do the same. Only with the data dir's lock held.
+        let agent_ledger = zeron_harness::process::registry::attach(data_dir);
+        zeron_harness::process::registry::sweep_in_background(data_dir);
         let legacy_uploads_root = profile.claim_legacy_uploads_root()?;
         // Crew: a sandbox host is the device its grant names.
         let device_id = match profile.device_id_override() {
@@ -390,12 +404,18 @@ impl EngineCore {
             repos.clone(),
             workspace.clone(),
             device_id.clone(),
-            runner::session()
-                .and_then(|session| session.path.clone())
-                .map(std::path::PathBuf::from),
+            runner::session().and_then(|session| {
+                Some(workspace_files::CloudCheckout {
+                    path: std::path::PathBuf::from(session.path.clone()?),
+                    chat_id: session.chat_id.clone(),
+                })
+            }),
         );
         let terminals = Terminals::new();
         sessions.track_terminal_activity(terminals.clone(), workspace.clone());
+        let commands = commands::Commands::default();
+        // An agent's background commands end with its chat.
+        commands.follow_chats(workspace.watch_chats());
         let project_actions = ProjectActionsStore::open(profile.store_root())?;
         doc_host.set_project_action_runtime(project_actions.clone(), terminals.clone());
         let previews = zeron_preview::PreviewService::new(
@@ -504,6 +524,7 @@ impl EngineCore {
             repos,
             workspace_files,
             terminals,
+            commands,
             remote_terminals: Default::default(),
             project_actions,
             previews,
@@ -523,6 +544,7 @@ impl EngineCore {
             updater_wake: std::sync::Mutex::new(None),
             cloud: std::sync::Mutex::new(None),
             viewport_focus,
+            _agent_ledger: agent_ledger,
             _instance_lock: lock,
         })
     }
@@ -531,16 +553,18 @@ impl EngineCore {
         self.workspace_scope
     }
 
-    /// When an update may restart this engine: never under a live run or an open
-    /// terminal. On a Cloud machine, a message waiting counts too: nothing is
+    /// When an update may restart this engine: never under a live run, an open
+    /// terminal or a running command. On a Cloud machine, a message waiting counts too: nothing is
     /// running yet, and a restart would land just as its turn starts.
     pub fn update_quiescence(&self, cloud: bool) -> zeron_update::QuiescentCheck {
         let sessions = self.sessions.clone();
         let terminals = self.terminals.clone();
+        let commands = self.commands.clone();
         let doc_host = cloud.then(|| self.doc_host.clone());
         Arc::new(move || {
             !sessions.any_active()
                 && !terminals.any_open()
+                && commands.running() == 0
                 && !doc_host.as_ref().is_some_and(DocHost::has_waiting_commands)
         })
     }
@@ -684,6 +708,7 @@ impl EngineCore {
         .with_auth(self.auth())
         .with_previews(self.previews.clone())
         .with_remote_terminals(self.remote_terminals.clone())
+        .with_commands(self.commands.clone())
         .with_harness_updates(self.harness_updates.clone())
         .with_viewport_focus(self.viewport_focus.clone())
         .with_plugins(self.plugins.clone());
@@ -769,6 +794,7 @@ impl EngineCore {
         }
         self.sessions.shutdown().await;
         self.terminals.shutdown();
+        self.commands.shutdown().await;
         self.sessions.stop_activity_projection().await;
         self.agent_accounts.shutdown();
         self.change_requests.shutdown();
@@ -1008,9 +1034,11 @@ impl Engine {
             } else {
                 WorkspaceScope::Local
             }
-        } else if auth.loaded_workos_session() {
+        } else if auth.loaded_workos_session() && !auth.keeps_chats_local() {
             WorkspaceScope::Synced
         } else {
+            // Signed out, or signed in with chats kept on this device: the
+            // local profile, with no edge transports.
             WorkspaceScope::Local
         }
     }
@@ -1212,11 +1240,18 @@ impl Engine {
             core.registry.set_run_environment(Arc::new(broker.clone()));
             broker.start();
             let sessions = core.sessions.clone();
+            let commands = core.commands.clone();
             let activity = runner::RelayActivity::default();
             let heartbeat = runner::spawn_heartbeat(
                 identity.edge_url(),
                 tokens,
-                Arc::new(move || sessions.run_counts()),
+                // An agent's running commands (a dev server left running)
+                // keep the machine awake as background work does.
+                Arc::new(move || {
+                    let mut counts = sessions.run_counts();
+                    counts.background += commands.running();
+                    counts
+                }),
                 Arc::new(cloud_disk::machine_usage),
                 activity.clone(),
                 runner::HEARTBEAT_INTERVAL,
@@ -1324,6 +1359,9 @@ impl Engine {
         // dir (update-channel.json), so this report follows the app's choice.
         zeron_update::channel::set_data_dir(&config.data_dir);
         let updater = zeron_update::Updater::spawn(config.edge_url.clone(), Some(quiescent));
+        // A check that came due while the machine slept runs as it wakes,
+        // so the loop needn't look at the clock each minute.
+        updater.follow_wakes(zeron_sync::wake::subscribe());
         // Whatever restarts this engine into another version (an update, a
         // newer install, a channel switch's update), the store it leaves is
         // one every version reads.
@@ -1508,6 +1546,16 @@ impl Engine {
             .core()
             .sessions
             .set_ipc_token_file(zeron_rpc::ipc_auth::agent_token_path(&config.data_dir));
+        // Agents' Zeron tools come from this engine itself (before the port:
+        // a run revived on boot waits on the port, then reads both).
+        if let Err(err) = runtime
+            .core()
+            .sessions
+            .serve_mcp_endpoint(runtime.core().rpc_service())
+            .await
+        {
+            tracing::warn!(error = %err, "agent MCP endpoint not served; agents get `zeron mcp`");
+        }
         runtime.core().sessions.set_ipc_port(config.ipc_port);
         update_trial::prove_and_commit(runtime.core(), &config);
         wake_update::start(runtime.core());
