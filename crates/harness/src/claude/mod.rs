@@ -621,6 +621,8 @@ impl ClaudeHarness {
         if request.reasoning == Some(ReasoningLevel::Ultracode) {
             settings.insert("ultracode".into(), Value::Bool(true));
         }
+        // Crew: a managed run never falls back to the CLI's own login.
+        crate::crew_inference::claude_settings(&request.env, &mut settings);
         if !settings.is_empty() {
             args.push("--settings".into());
             args.push(Value::Object(settings).to_string());
@@ -749,6 +751,7 @@ impl ClaudeHarness {
         request: &RunRequest,
         title_only: bool,
     ) -> Result<Runtime, HarnessError> {
+        crate::crew_inference::validate(HarnessId::ClaudeCode, &request.env)?;
         let (mut command, mcp_config) = Self::build_command_with_config(exe, request, title_only);
         tracing::debug!(target: "first_word", title_only, "claude spawning");
         let mut child = crate::process::spawn_agent(&mut command).map_err(|e| {

@@ -1105,6 +1105,8 @@ struct AppServer {
 fn spawn_app_server(exe: &Path, request: &RunRequest) -> Result<AppServer, HarnessError> {
     let mut cmd = Command::new(exe);
     cmd.arg("app-server");
+    // Crew: a managed run's `crew` model provider, never the ChatGPT login.
+    cmd.args(crate::crew_inference::codex_config_args(&request.env)?);
     crate::compose_child_path(&mut cmd, exe);
     // Host-resolved credentials (a Cloud device's managed CODEX_HOME,
     // GH_TOKEN, …). Absent on laptops: the CLI's own login is used.
@@ -1547,6 +1549,8 @@ async fn run_session(session: Session) {
         interrupt,
         turn,
     } = controls;
+    // Crew: voice would use the ChatGPT login, so a managed run has none.
+    let realtime = realtime.filter(|_| !crate::crew_inference::managed(&request.env));
     let request_input = Arc::new(request_input);
 
     // ---- wire params ------------------------------------------------------
@@ -1621,6 +1625,8 @@ async fn run_session(session: Session) {
         if let Some(tier) = &start_tier {
             p.insert("serviceTier".into(), Value::String(tier.clone()));
         }
+        // Crew: a managed thread stays on the `crew` provider, resumed too.
+        crate::crew_inference::codex_thread_params(&request.env, &mut p);
         p
     };
 
