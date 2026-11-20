@@ -1161,6 +1161,8 @@ fn full_registry() -> HarnessRegistry {
         Box::new(|| zeron_harness::MuseHarness::new().installed()),
         Box::new(|| Ok(Arc::new(zeron_harness::MuseHarness::new()) as Arc<dyn Harness>)),
     );
+    // Crew: OMP, Crew's build of the Pi coding agent, on its own RPC driver (crates/harness/src/crew_omp).
+    registry.register(Arc::new(zeron_harness::OmpHarness::new()));
     registry
 }
 
@@ -1268,7 +1270,9 @@ mod tests {
                 HarnessId::Pi,
                 HarnessId::Opencode,
                 HarnessId::Antigravity,
-                HarnessId::Muse
+                HarnessId::Muse,
+                // Crew: OMP.
+                HarnessId::Omp
             ]
         );
         assert!(registry.resolve(HarnessId::Mock).is_ok());

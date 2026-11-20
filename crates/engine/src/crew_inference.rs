@@ -204,6 +204,7 @@ impl CrewInference {
     pub(crate) async fn offer(&self, harness: HarnessId, mut models: Vec<Model>) -> Result<Vec<Model>, String> {
         self.serves(harness)?;
         models.retain(|model| relay::routable(harness, &model.id));
+        self.mark_default(harness, &mut models).await;
         self.keep_default(harness, &models);
         let accounts = self.accounts().await;
         let mut options: HashMap<&'static str, ModelOption> = HashMap::new();
@@ -219,6 +220,22 @@ impl CrewInference {
             model.options.push(option);
         }
         Ok(models)
+    }
+
+    /// OMP marks no model its default: a Crew one that names none runs what
+    /// a Claude Code one would, Claude Code's own default (its CLI's), on
+    /// OMP's Anthropic provider, when OMP lists it; else OMP's first.
+    async fn mark_default(&self, harness: HarnessId, models: &mut [Model]) {
+        if harness != HarnessId::Omp || models.iter().any(|model| model.default) {
+            return;
+        }
+        let Ok(claude) = Box::pin(self.default_model(HarnessId::ClaudeCode)).await else {
+            return;
+        };
+        let wanted = format!("anthropic/{claude}");
+        if let Some(model) = models.iter_mut().find(|model| model.id == wanted) {
+            model.default = true;
+        }
     }
 
     fn keep_default(&self, harness: HarnessId, models: &[Model]) {
@@ -239,6 +256,7 @@ impl CrewInference {
         let harness_impl = registry.resolve(harness).map_err(|error| error.to_string())?;
         let mut models = harness_impl.models().await.map_err(|error| error.to_string())?;
         models.retain(|model| relay::routable(harness, &model.id));
+        Box::pin(self.mark_default(harness, &mut models)).await;
         self.keep_default(harness, &models);
         lock(&self.defaults)
             .get(&harness)
@@ -1001,6 +1019,34 @@ mod tests {
         let mut run = request(None, None);
         assert!(registry.prepare_run(HarnessId::ClaudeCode, Some(CHAT), &mut run).await.is_err());
         assert!(lock(&crew.chat_configs).is_none(), "the workspace is let go");
+    }
+
+    /// OMP's list spans two providers and marks no default: what Agent Auth
+    /// can route is offered, each with its provider's account choice, and its
+    /// default is Claude Code's own, on OMP's Anthropic provider.
+    #[tokio::test]
+    async fn omp_offers_both_providers_and_defaults_to_claude_code_s_default() {
+        let crew = CrewInference::closed();
+        crew.offer(HarnessId::ClaudeCode, vec![model("claude-fable-5-2", false), model("claude-opus-5-5", true)])
+            .await
+            .unwrap();
+        let omp = crew
+            .offer(
+                HarnessId::Omp,
+                vec![
+                    model("anthropic/claude-fable-5", false),
+                    model("anthropic/claude-opus-5-5", false),
+                    model("openai/gpt-6.2-sol", false),
+                    model("google/gemini-3-pro", false),
+                ],
+            )
+            .await
+            .unwrap();
+        let ids: Vec<&str> = omp.iter().map(|model| model.id.as_str()).collect();
+        assert_eq!(ids, ["anthropic/claude-fable-5", "anthropic/claude-opus-5-5", "openai/gpt-6.2-sol"], "routable only");
+        assert!(omp.iter().all(|model| model.options.iter().any(|option| option.id == ACCOUNT_OPTION)));
+        assert!(omp.iter().any(|model| model.id == "anthropic/claude-opus-5-5" && model.default));
+        assert_eq!(crew.default_model(HarnessId::Omp).await.unwrap(), "anthropic/claude-opus-5-5");
     }
 
     /// The development switch is `local` by either of Crew's names, and only
