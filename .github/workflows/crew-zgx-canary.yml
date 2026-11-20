@@ -1,0 +1,148 @@
+name: Crew zgx canary (signed)
+
+# A Developer ID signed, notarized "Crew zgx Canary.app" from the thin port
+# (docs/crew/zgx-thin-port.md, slice 7), for people to install by hand beside
+# their other Crews. Built only when a `crew-zgx-canary-*` tag is pushed, so
+# pushes to the branch run nothing; never published: the zipped app is this
+# run's artifact.
+#
+#   git tag crew-zgx-canary-YYYYMMDD-N <commit> && git push origin crew-zgx-canary-YYYYMMDD-N
+#
+# Signing is Crew's release credentials (release.yml's macos job), packaging
+# scripts/crew/package-zgx-app, the zgx toolchain upstream's (Zig 0.16 for
+# Ghostty).
+on:
+  push:
+    tags: ['crew-zgx-canary-*']
+
+permissions:
+  contents: read
+
+concurrency:
+  group: crew-zgx-canary
+  cancel-in-progress: false
+
+jobs:
+  macos:
+    runs-on: macos-15
+    timeout-minutes: 180
+    env:
+      COMET_MACOS_SIGNING_TEAM_ID: ${{ vars.MACOS_SIGNING_TEAM_ID }}
+      CODESIGN_IDENTITY: ${{ secrets.MACOS_CODESIGN_IDENTITY }}
+      NOTARYTOOL_KEYCHAIN_PROFILE: crew-zgx-canary
+      CREW_ZGX_PROFILE: release
+    steps:
+      - uses: actions/checkout@v4
+      - name: Require Apple silicon runner
+        run: test "$(uname -m)" = arm64
+      - name: Import Developer ID and notarization credentials
+        shell: bash
+        env:
+          MACOS_CERTIFICATE_P12_BASE64: ${{ secrets.MACOS_CERTIFICATE_P12_BASE64 }}
+          MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+          APPLE_ID: ${{ secrets.MACOS_NOTARY_APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.MACOS_NOTARY_APP_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.MACOS_NOTARY_TEAM_ID }}
+        run: |
+          set -euo pipefail
+          umask 077
+          export CODESIGN_KEYCHAIN="$RUNNER_TEMP/crew-signing.keychain-db"
+          echo "CODESIGN_KEYCHAIN=$CODESIGN_KEYCHAIN" >> "$GITHUB_ENV"
+          for name in COMET_MACOS_SIGNING_TEAM_ID CODESIGN_IDENTITY MACOS_CERTIFICATE_P12_BASE64 MACOS_CERTIFICATE_PASSWORD APPLE_ID APPLE_PASSWORD APPLE_TEAM_ID; do
+            if [[ -z "${!name}" ]]; then
+              echo "::error::Missing required macOS distribution credential: $name (see dist/README.md)"
+              exit 1
+            fi
+          done
+          if [[ "$APPLE_TEAM_ID" != "$COMET_MACOS_SIGNING_TEAM_ID" ]]; then
+            echo "::error::Notarization team must match vars.MACOS_SIGNING_TEAM_ID"
+            exit 1
+          fi
+          certificate="$RUNNER_TEMP/crew-signing.p12"
+          probe="$RUNNER_TEMP/crew-signing-probe"
+          trap 'rm -f "$certificate" "$probe"' EXIT
+          keychain_password="$(uuidgen)"
+          echo "::add-mask::$keychain_password"
+          printf '%s' "$MACOS_CERTIFICATE_P12_BASE64" | base64 --decode > "$certificate"
+          security create-keychain -p "$keychain_password" "$CODESIGN_KEYCHAIN"
+          security set-keychain-settings -lut 21600 "$CODESIGN_KEYCHAIN"
+          security unlock-keychain -p "$keychain_password" "$CODESIGN_KEYCHAIN"
+          # codesign still uses the search list for private-key/chain discovery.
+          python3 - "$CODESIGN_KEYCHAIN" <<'PY'
+          import shlex, subprocess, sys
+          keychains = shlex.split(subprocess.check_output(["security", "list-keychains", "-d", "user"], text=True))
+          if sys.argv[1] not in keychains:
+              subprocess.run(["security", "list-keychains", "-d", "user", "-s", *keychains, sys.argv[1]], check=True)
+          PY
+          security import "$certificate" -P "$MACOS_CERTIFICATE_PASSWORD" -k "$CODESIGN_KEYCHAIN" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$keychain_password" "$CODESIGN_KEYCHAIN" >/dev/null
+          xcrun notarytool store-credentials "$NOTARYTOOL_KEYCHAIN_PROFILE" \
+            --keychain "$CODESIGN_KEYCHAIN" --apple-id "$APPLE_ID" \
+            --password "$APPLE_PASSWORD" --team-id "$APPLE_TEAM_ID"
+          cp /usr/bin/true "$probe"
+          codesign --force --options runtime --timestamp --verbose=4 \
+            --sign "$CODESIGN_IDENTITY" --keychain "$CODESIGN_KEYCHAIN" "$probe"
+          codesign --verify --strict --verbose=2 "$probe"
+      - name: Select checked-in Rust toolchain
+        run: rustup show active-toolchain || rustup toolchain install
+      # zgx's terminals are Ghostty's, built with Zig 0.16 (zgx-ghostty-sys).
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+        with:
+          version: 0.16.0
+      - name: Point the packager at Zig
+        run: echo "ZIG=$(command -v zig)" >> "$GITHUB_ENV"
+      - uses: actions/cache@v4
+        with:
+          path: ~/Library/Caches/zgx-ghostty
+          key: zgx-ghostty-${{ hashFiles('apps/zgx/Cargo.lock') }}
+          restore-keys: zgx-ghostty-
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: crew-zgx-canary
+          # (The packager builds zgx into <root>/target/zgx: relative to
+          # apps/zgx, as rust-cache reads a workspace's target.)
+          workspaces: |
+            . -> target
+            apps/zgx -> ../../target/zgx
+      - name: Use TCP for Apple ticket delivery
+        shell: bash
+        run: |
+          set -euo pipefail
+          # https://github.com/actions/runner-images/issues/14924 (release.yml's)
+          if [[ "$(sudo pfctl -sr)" != *'anchor "com.apple/*"'* ]]; then
+            echo "::error::Expected macOS packet-filter anchor is absent."
+            exit 1
+          fi
+          printf 'block return out quick proto udp from any to any port 443\n' |
+            sudo pfctl -a com.apple/crew-notary -f -
+          sudo pfctl -E
+      - name: Package, sign and notarize
+        run: scripts/crew/package-zgx-app
+      - name: Inspect the bundle
+        run: |
+          app="target/package-crew-zgx/Crew zgx Canary.app"
+          plist="$app/Contents/Info.plist"
+          test "$(plutil -extract CFBundleIdentifier raw "$plist")" = ai.ashler.crew.zgx-canary
+          test "$(plutil -extract CrewSourceCommit raw "$plist")" = "$GITHUB_SHA"
+          test ! -e "$app/Contents/Resources/plugins-builtin/parallax-scenes"
+          codesign --verify --deep --strict --verbose=2 "$app"
+          codesign -dv "$app" 2>&1 | grep -E '^(Authority|TeamIdentifier|Timestamp|Runtime)'
+          spctl --assess --type execute --verbose=2 "$app"
+          xcrun stapler validate "$app"
+          du -sh "$app"
+          ls -la target/package-crew-zgx/
+      - uses: actions/upload-artifact@v4
+        with:
+          name: crew-zgx-canary-macos-arm64
+          path: target/package-crew-zgx/*.zip
+          if-no-files-found: error
+          retention-days: 14
+      - name: Remove temporary signing credentials
+        if: ${{ always() }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -f "${CODESIGN_KEYCHAIN:-}" ]]; then
+            security delete-keychain "$CODESIGN_KEYCHAIN"
+          fi
+          rm -f "$RUNNER_TEMP/crew-signing.p12"

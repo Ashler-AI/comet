@@ -18,6 +18,16 @@
 #   CREW_ZGX_PROFILE=release scripts/crew/package-zgx-app   # much slower to build
 #   CREW_ZGX_TARGET_DIR=/path                               # default: <worktree>/target
 #
+# To hand to others (.github/workflows/crew-zgx-canary.yml), signed with a
+# Developer ID instead, with the hardened runtime and a secure timestamp:
+#
+#   CODESIGN_IDENTITY="Developer ID Application: …"  sign with it (ad hoc without)
+#   CODESIGN_KEYCHAIN=/path/x.keychain-db             where the identity and the
+#                                                     notary profile are kept
+#   NOTARYTOOL_KEYCHAIN_PROFILE=name                  then notarize and staple it,
+#                                                     and zip the stapled app
+#                                                     (<target>/package-crew-zgx/*.zip)
+#
 # Needs Zig 0.16 for zgx's terminals (Ghostty): ZIG, or ~/.crew-zgx-dev/zig/zig.
 set -euo pipefail
 
@@ -43,13 +53,21 @@ out="$target/package-crew-zgx"
 app="$out/$APP_NAME.app"
 
 cargo_build() {
-  "$root/scripts/crew/clean-env" CREW_FLAVOR="$FLAVOR" ZIG="$zig" \
+  # (CI kept: scripts/local-cargo.py runs as cargo would there, not one
+  # build at a time at two jobs as on a development Mac.)
+  "$root/scripts/crew/clean-env" CREW_FLAVOR="$FLAVOR" ZIG="$zig" ${CI:+CI="$CI"} ${build_env[@]+"${build_env[@]}"} \
     python3 "$root/scripts/local-cargo.py" build "$@"
 }
 # The engine (the root workspace), then the interface: apps/zgx is a
 # workspace of its own, and cargo reads its .cargo/config.toml (Luau without
 # its asserts, mimalloc's page sizes) only where it runs, so it's named here.
+# A release engine is built without Luau's asserts too, as upstream's is.
+build_env=()
+if [[ "$profile" == release ]]; then
+  build_env=(LUAU_CXXFLAGS=-DNDEBUG)
+fi
 cargo_build -p zeron --bin zeron-engine ${release[@]+"${release[@]}"} --target-dir "$target"
+build_env=()
 cargo_build --manifest-path "$root/apps/zgx/Cargo.toml" --config "$root/apps/zgx/.cargo/config.toml" \
   ${release[@]+"${release[@]}"} --target-dir "$target/zgx"
 engine="$target/$profile/zeron-engine"
@@ -96,12 +114,41 @@ cp "$root/assets/fonts/licenses/"* "$root/apps/zgx/fonts/"*-OFL.txt "$app/Conten
 cp "$root/THIRD_PARTY_NOTICES.md" "$root/LICENSE" "$app/Contents/Resources/licenses/"
 "$root/scripts/macos-app-icon.sh" "$app/Contents/Resources"
 
-# Ad hoc, inside out: the engine (its own identifier), then the bundle.
+# Inside out: the engine (its own identifier), then the bundle. Ad hoc, or
+# a Developer ID with the hardened runtime and a secure timestamp.
 entitlements="$root/dist/macos/Zeron.entitlements"
-codesign --force --entitlements "$entitlements" --sign - --identifier "$BUNDLE_ID.engine" \
-  "$app/Contents/MacOS/zeron-engine"
-codesign --force --entitlements "$entitlements" --sign - "$app"
-codesign --verify --strict --verbose=2 "$app"
+keychain=()
+[[ -n "${CODESIGN_KEYCHAIN:-}" ]] && keychain=(--keychain "$CODESIGN_KEYCHAIN")
+if [[ -n "${CODESIGN_IDENTITY:-}" ]]; then
+  sign=(--force --options runtime --timestamp --entitlements "$entitlements"
+    --sign "$CODESIGN_IDENTITY" ${keychain[@]+"${keychain[@]}"})
+else
+  sign=(--force --entitlements "$entitlements" --sign -)
+fi
+codesign "${sign[@]}" --identifier "$BUNDLE_ID.engine" "$app/Contents/MacOS/zeron-engine"
+codesign "${sign[@]}" "$app"
+codesign --verify --deep --strict --verbose=2 "$app"
+
+# Notarized and stapled, then zipped to hand out (as scripts/package-macos.sh
+# notarizes Crew's: accepted, or the build fails).
+if [[ -n "${NOTARYTOOL_KEYCHAIN_PROFILE:-}" ]]; then
+  [[ -n "${CODESIGN_IDENTITY:-}" ]] || die "notarizing needs CODESIGN_IDENTITY"
+  zip="$out/crew-zgx-canary-$version-$(uname -m).zip"
+  notes="$(mktemp -d)"
+  ditto -c -k --keepParent "$app" "$notes/app.zip"
+  xcrun notarytool submit "$notes/app.zip" --keychain-profile "$NOTARYTOOL_KEYCHAIN_PROFILE" \
+    ${keychain[@]+"${keychain[@]}"} --wait --output-format json >"$notes/result.json"
+  if [[ "$(plutil -extract status raw -o - "$notes/result.json")" != Accepted ]]; then
+    cat "$notes/result.json" >&2
+    die "notarization was not accepted: see notarytool log <id> for why"
+  fi
+  xcrun stapler staple "$app"
+  xcrun stapler validate "$app"
+  spctl --assess --type execute --verbose=2 "$app"
+  rm -rf "$notes" "$zip"
+  ditto -c -k --keepParent "$app" "$zip"
+  echo "zipped:   $zip"
+fi
 
 echo "packaged: $app ($profile, $(du -sh "$app" | cut -f1), from $commit)"
 echo "install:  ditto \"$app\" \"/Applications/$APP_NAME.app\""
