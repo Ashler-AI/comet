@@ -58,7 +58,7 @@ search.index(M.ID, ui.t("settings.providers.title"), ui.t("settings.providers.te
 		terms = ui.t("settings.providers.skills_separate.terms"),
 	},
 	-- (A Crew build has no more agents to add.)
-	if crew.on then nil else { key = "more", title = ui.t("settings.providers.more.label"), terms = ui.t("settings.providers.more.terms") },
+	if crew.managed_inference then nil else { key = "more", title = ui.t("settings.providers.more.label"), terms = ui.t("settings.providers.more.terms") },
 })
 
 local function now(): agents.Now
@@ -71,7 +71,7 @@ end
 local function shown(): { agents.Agent }
 	local out = {}
 	for _, a in now().list do
-		if (a.mark or (a :: any).registry) and (not crew.on or crew.managed(a.id)) then
+		if (a.mark or (a :: any).registry) and not crew.hides(a.id) then
 			table.insert(out, a)
 		end
 	end
@@ -440,7 +440,7 @@ local function card(row: State<agents.Agent>): Node
 			end
 		end,
 		-- (A Crew build signs it in itself.)
-		managed = if crew.on
+		managed = if crew.managed(id)
 			then { label = ui.t("crew.providers.managed"), description = ui.t("crew.providers.managed_hint") }
 			else nil,
 	}
@@ -502,7 +502,7 @@ local function more(): Node
 		end, { key = by_id })
 	end
 	-- A Crew build: its own agents still to install, if any, and no others.
-	if crew.on then
+	if crew.managed_inference then
 		return ui.show(
 			function()
 				return #list:get() > 0

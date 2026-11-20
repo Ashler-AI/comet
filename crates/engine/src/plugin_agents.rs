@@ -59,15 +59,20 @@ impl AgentHost for EngineAgentHost {
     fn models(&self, harness: HarnessId) -> BoxFuture<'static, Result<Vec<Model>, String>> {
         let (registry, data_dir) = (self.registry.clone(), self.data_dir.clone());
         Box::pin(async move {
-            // Crew: the managed catalog, as `ListModels` lists it.
-            if let Some(crew) = registry.crew_inference() {
-                return crew.models(harness).await;
+            // Crew: only what managed inference runs, as `ListModels` lists it.
+            let crew = registry.crew_inference();
+            if let Some(crew) = &crew {
+                crew.serves(harness)?;
             }
             let lease = Arc::new(registry.execution_lease(harness).await);
             let resolved = registry.resolve(harness).map_err(|e| e.to_string())?;
-            crate::model_catalogs::list_with_lease(&data_dir, resolved, false, Some(lease))
+            let models = crate::model_catalogs::list_with_lease(&data_dir, resolved, false, Some(lease))
                 .await
-                .map_err(|e| e.to_string())
+                .map_err(|e| e.to_string())?;
+            match crew {
+                Some(crew) => crew.offer(harness, models).await,
+                None => Ok(models),
+            }
         })
     }
 

@@ -832,6 +832,8 @@ impl ClaudeHarness {
         // Nor may it attach to (or install into) a running IDE.
         cmd.env("CLAUDE_CODE_AUTO_CONNECT_IDE", "0")
             .env("CLAUDE_CODE_IDE_SKIP_AUTO_INSTALL", "1");
+        // Crew: a managed engine probes as a managed run launches.
+        crate::crew_inference::managed_probe(HarnessId::ClaudeCode, &mut cmd)?;
         cmd.stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())

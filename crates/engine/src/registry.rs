@@ -250,19 +250,25 @@ impl HarnessRegistry {
         id: HarnessId,
         lease: Arc<tokio::sync::OwnedRwLockReadGuard<()>>,
     ) -> Result<Vec<zeron_proto::Model>, HarnessError> {
-        // Crew: the managed catalog; no CLI is probed.
-        if let Some(crew) = self.crew.get() {
-            return crew.models(id).await.map_err(HarnessError::Protocol);
+        // Crew: only what managed inference runs is asked for its models.
+        let crew = self.crew.get().cloned();
+        if let Some(crew) = &crew {
+            crew.serves(id).map_err(HarnessError::Protocol)?;
         }
         let harness = self.resolve(id)?;
-        tokio::spawn(async move {
+        let models = tokio::spawn(async move {
             // An RPC cancellation must not drop the gate before the probe's
             // own deadline and child cleanup finish.
             let _lease = lease;
             harness.models().await
         })
         .await
-        .map_err(|error| HarnessError::Protocol(format!("model discovery task failed: {error}")))?
+        .map_err(|error| HarnessError::Protocol(format!("model discovery task failed: {error}")))??;
+        // Crew: the harness's own models, as Agent Auth runs them.
+        match crew {
+            Some(crew) => crew.offer(id, models).await.map_err(HarnessError::Protocol),
+            None => Ok(models),
+        }
     }
 
     pub async fn discover_commands(

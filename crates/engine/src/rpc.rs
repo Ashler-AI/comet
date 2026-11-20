@@ -3678,9 +3678,10 @@ impl RpcService for EngineRpc {
             }
             methods::LIST_MODELS => {
                 let p: ListModelsParams = parse_params(params)?;
-                // Crew: the managed catalog, with the account choice; no CLI probe.
-                if let Some(crew) = self.registry.crew_inference() {
-                    return RpcReply::value(&crew.models(p.harness).await.map_err(RpcError::Failed)?);
+                // Crew: only what managed inference runs is listed.
+                let crew = self.registry.crew_inference();
+                if let Some(crew) = &crew {
+                    crew.serves(p.harness).map_err(RpcError::Failed)?;
                 }
                 let lease = std::sync::Arc::new(self.registry.execution_lease(p.harness).await);
                 let harness = self
@@ -3695,6 +3696,11 @@ impl RpcService for EngineRpc {
                 )
                 .await
                 .map_err(|e| RpcError::Failed(e.to_string()))?;
+                // Crew: the harness's own models, as Agent Auth runs them.
+                let models = match crew {
+                    Some(crew) => crew.offer(p.harness, models).await.map_err(RpcError::Failed)?,
+                    None => models,
+                };
                 // A catalog that changed is told to plugins (models.updated).
                 if let Some(plugins) = &self.plugins {
                     plugins.agents().observe_models(p.harness, &models);

@@ -63,6 +63,25 @@ pub const RUNTIME: &str = "crew-runtime.json";
 /// What a call that would reach the Edge answers instead.
 pub const NO_EDGE: &str = "refused";
 
+/// The development switch for an engine's inference, as Crew's launcher
+/// reads it (`COMET_INFERENCE_MODE`, or `ZERON_INFERENCE_MODE`): `local` runs
+/// agents on this device's own logins rather than Crew's shared accounts.
+/// Launch the app with it (through scripts/crew/clean-env, so it's never
+/// another Crew's), with no engine of this flavour running: the engine this
+/// app starts is handed it ([`engine_inference_mode`]), and setup and
+/// Settings → Providers offer own logins again (the `crew_managed` flag).
+pub fn local_inference() -> bool {
+    ["COMET_INFERENCE_MODE", "ZERON_INFERENCE_MODE"]
+        .iter()
+        .any(|name| std::env::var(name).is_ok_and(|mode| mode.trim().eq_ignore_ascii_case("local")))
+}
+
+/// What the engine this app starts is told of its inference (its own
+/// inherited variables are scrubbed first): `local`, or nothing.
+pub fn engine_inference_mode() -> Option<(&'static str, &'static str)> {
+    (MODE && local_inference()).then_some(("ZERON_INFERENCE_MODE", "local"))
+}
+
 /// Setup's pages finished, in this app's data dir (upstream keeps them on
 /// the account, at the Edge).
 const PAGES: &str = "crew-onboarding.json";
@@ -287,6 +306,9 @@ pub fn install(host: &ScriptHost) {
         return;
     }
     host.shared("crew_product", TITLE);
+    // Whether agents run on Crew's shared accounts (off: the development
+    // switch, `local_inference`).
+    host.shared("crew_managed", !local_inference());
     answer(
         host,
         Rc::new(Answers {

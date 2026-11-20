@@ -19,11 +19,15 @@
 //!
 //! A route that doesn't fit its harness stops the launch. Without a route in
 //! the map, nothing here changes a launch.
+//!
+//! A managed engine's model lists are each CLI's own, probed as a managed run
+//! would be launched ([`set_managed_discovery`]): nothing here names a model.
 
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use serde_json::Value;
-use zeron_proto::{HarnessId, Model, ReasoningLevel};
+use zeron_proto::HarnessId;
 
 use crate::HarnessError;
 use crate::process::Command;
@@ -288,58 +292,51 @@ pub(crate) fn codex_thread_params(
     }
 }
 
-/// The models a managed `harness` offers, without launching its CLI: Agent
-/// Auth decides at run time whether an account can serve one. `None`: the
-/// harness has no managed route.
-pub fn managed_models(harness: HarnessId) -> Option<Vec<Model>> {
-    match harness {
-        HarnessId::ClaudeCode => Some(crate::claude::catalog::static_models()),
-        HarnessId::Codex => Some(codex_models()),
-        _ => None,
+/// Whether this process's model discovery is a managed engine's: set once by
+/// the engine as its managed inference starts ([`set_managed_discovery`]).
+/// Process-wide, as an engine is a Scaffold one or not for its whole life.
+static MANAGED_DISCOVERY: AtomicBool = AtomicBool::new(false);
+
+/// Where a managed probe's placeholder route points: a loopback port nothing
+/// serves (discard). A probe lists models and runs no turn, so nothing is
+/// ever sent there.
+const DISCOVERY_ORIGIN: &str = "http://127.0.0.1:9";
+
+/// A managed engine's model lists are its harnesses' own (each CLI's, as for
+/// anyone, so a model a CLI release adds is offered without a change here),
+/// probed as a managed run would be launched: the route's environment on a
+/// placeholder route, no inherited credential, Codex on the `crew` provider.
+/// So a CLI lists what it would run through Agent Auth, never consulting this
+/// device's own login.
+pub fn set_managed_discovery(on: bool) {
+    MANAGED_DISCOVERY.store(on, Ordering::Relaxed);
+}
+
+/// A model probe of `harness` (Claude Code's `initialize`, Codex's
+/// `model/list`), dressed as a managed run when this engine's discovery is
+/// managed; untouched otherwise. Codex's overrides follow its `app-server`.
+pub(crate) fn managed_probe(harness: HarnessId, cmd: &mut Command) -> Result<(), HarnessError> {
+    managed_probe_if(MANAGED_DISCOVERY.load(Ordering::Relaxed), harness, cmd)
+}
+
+fn managed_probe_if(managed: bool, harness: HarnessId, cmd: &mut Command) -> Result<(), HarnessError> {
+    let Some(provider) = Provider::for_harness(harness).filter(|_| managed) else {
+        return Ok(());
+    };
+    let env = ManagedRoute {
+        provider,
+        base_url: DISCOVERY_ORIGIN.into(),
+        token: "model-discovery".into(),
     }
-}
-
-/// The model a managed run of `harness` uses when its chat names none.
-pub fn managed_default_model(harness: HarnessId) -> Option<String> {
-    let models = managed_models(harness)?;
-    models
-        .iter()
-        .find(|model| model.default)
-        .or(models.first())
-        .map(|model| model.id.clone())
-}
-
-/// Crew's managed Codex catalog: the OpenAI rows of its bundled Scaffold
-/// catalog (`omp/scaffold-models.json` in Crew), on upstream's row shape.
-fn codex_models() -> Vec<Model> {
-    use ReasoningLevel::{High, Low, Max, Medium, XHigh};
-    const FULL: &[ReasoningLevel] = &[Low, Medium, High, XHigh, Max];
-    const SHORT: &[ReasoningLevel] = &[Low, Medium, High];
-    let rows: [(&str, &str, &[ReasoningLevel]); 11] = [
-        ("gpt-6-sol", "GPT-6-Sol", FULL),
-        ("gpt-6.2-sol", "GPT-6.2-Sol", FULL),
-        ("gpt-6.1-sol", "GPT-6.1-Sol", FULL),
-        ("gpt-6.2-astra", "GPT-6.2-Astra", FULL),
-        ("gpt-6-astra", "GPT-6-Astra", SHORT),
-        ("gpt-6.1-terra", "GPT-6.1-Terra", SHORT),
-        ("gpt-6-luna", "GPT-6-Luna", FULL),
-        ("gpt-5.6-sol", "GPT-5.6-Sol", SHORT),
-        ("gpt-5.6-terra", "GPT-5.6-Terra", SHORT),
-        ("gpt-5.6-luna", "GPT-5.6-Luna", SHORT),
-        ("gpt-5.3-codex-spark", "GPT-5.3-Codex-Spark", SHORT),
-    ];
-    rows.into_iter()
-        .map(|(id, label, ladder)| Model {
-            id: id.into(),
-            label: label.into(),
-            description: None,
-            provider: None,
-            reasoning_levels: ladder.to_vec(),
-            options: Vec::new(),
-            // Crew's managed Codex default (its relay's `inference_binding`).
-            default: id == "gpt-6-sol",
-        })
-        .collect()
+    .env();
+    strip_inherited(cmd, &env);
+    if harness == HarnessId::Codex {
+        cmd.args(codex_config_args(&env)?);
+    }
+    for (key, value) in &env {
+        cmd.env(key, value);
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -497,20 +494,48 @@ mod tests {
         assert!(codex_config_args(&anthropic).is_err());
     }
 
+    /// A managed engine's model probe runs as a managed launch would, on a
+    /// placeholder route: no inherited credential, the route's variables, and
+    /// Codex on the `crew` provider (its overrides after `app-server`).
     #[test]
-    fn managed_catalogs_are_offline_and_name_a_default() {
-        let claude = managed_models(HarnessId::ClaudeCode).unwrap();
-        assert!(!claude.is_empty());
-        assert_eq!(managed_default_model(HarnessId::ClaudeCode).as_deref(), Some("claude-opus-5-5"));
-        let codex = managed_models(HarnessId::Codex).unwrap();
-        assert!(codex.iter().all(|model| !model.id.contains('/')));
-        assert_eq!(managed_default_model(HarnessId::Codex).as_deref(), Some("gpt-6-sol"));
-        assert!(managed_models(HarnessId::Cursor).is_none());
-        assert!(managed_default_model(HarnessId::Opencode).is_none());
+    fn a_managed_model_probe_runs_as_a_managed_launch_would() {
+        let mut claude = Command::new("claude");
+        claude.env("ANTHROPIC_API_KEY", "inherited-secret").env("CLAUDE_CODE_OAUTH_TOKEN", "inherited-secret");
+        managed_probe_if(true, HarnessId::ClaudeCode, &mut claude).unwrap();
+        let seen = envs(&mut claude);
+        assert_eq!(seen.get("ANTHROPIC_API_KEY"), Some(&None));
+        assert_eq!(seen.get("CLAUDE_CODE_OAUTH_TOKEN"), Some(&None));
+        assert_eq!(seen["ANTHROPIC_BASE_URL"].as_deref(), Some(DISCOVERY_ORIGIN));
+        assert_eq!(seen["CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC"].as_deref(), Some("1"));
+        assert!(!seen.values().flatten().any(|value| value == "inherited-secret"));
+
+        let mut codex = Command::new("codex");
+        codex.arg("app-server").env("OPENAI_API_KEY", "inherited-secret");
+        managed_probe_if(true, HarnessId::Codex, &mut codex).unwrap();
+        let args: Vec<String> = codex.as_std().get_args().map(|arg| arg.to_string_lossy().into_owned()).collect();
+        assert_eq!(args[0], "app-server");
+        assert!(args.contains(&"model_provider=\"crew\"".to_owned()), "{args:?}");
+        assert!(args.contains(&format!("model_providers.crew.base_url=\"{DISCOVERY_ORIGIN}/v1\"")), "{args:?}");
+        assert!(!envs(&mut codex).values().flatten().any(|value| value == "inherited-secret"));
     }
 
-    /// The app offers exactly the agents a Crew engine runs: setup and
-    /// Settings → Providers read apps/zgx/ui/account/crew.luau's `MANAGED`.
+    /// Unmanaged, or another agent: a probe is upstream's.
+    #[test]
+    fn an_unmanaged_model_probe_is_untouched() {
+        for (managed, harness) in [(false, HarnessId::ClaudeCode), (false, HarnessId::Codex), (true, HarnessId::Pi)] {
+            let mut cmd = Command::new("agent");
+            cmd.env("ANTHROPIC_API_KEY", "the-users-own");
+            managed_probe_if(managed, harness, &mut cmd).unwrap();
+            let seen = envs(&mut cmd);
+            assert_eq!(seen["ANTHROPIC_API_KEY"].as_deref(), Some("the-users-own"), "{harness:?}");
+            assert!(!seen.contains_key(ROUTE_ENV), "{harness:?}");
+            assert_eq!(cmd.as_std().get_args().count(), 0, "{harness:?}");
+        }
+    }
+
+    /// The app offers exactly the agents a Crew engine runs (those with a
+    /// managed route): setup and Settings → Providers read
+    /// apps/zgx/ui/account/crew.luau's `MANAGED`.
     #[test]
     fn the_app_offers_the_agents_crew_runs() {
         let script = include_str!("../../../apps/zgx/ui/account/crew.luau");
@@ -520,7 +545,7 @@ mod tests {
             .expect("crew.luau's MANAGED");
         for harness in HarnessId::ALL {
             let offered = line.contains(&format!("[\"{}\"] = true", harness.as_str()));
-            assert_eq!(offered, managed_models(harness).is_some(), "{}", harness.as_str());
+            assert_eq!(offered, Provider::for_harness(harness).is_some(), "{}", harness.as_str());
         }
     }
 }

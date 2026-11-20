@@ -48,7 +48,7 @@ use sha2::{Digest, Sha256};
 use tokio::net::TcpListener;
 use tokio::sync::{Mutex as AsyncMutex, Semaphore};
 use zeron_harness::CancellationToken;
-use zeron_harness::crew_inference::{Provider, managed_default_model};
+use zeron_harness::crew_inference::Provider;
 use zeron_proto::HarnessId;
 
 use super::agent_auth::{
@@ -362,15 +362,15 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 }
 
 /// The provider and provider model a managed `harness` run of `selected_model`
-/// reaches: Claude Code on Anthropic's, Codex on OpenAI's. No model, or
-/// `default`, is the managed catalog's default.
+/// reaches: Claude Code on Anthropic's, Codex on OpenAI's. A run names its
+/// model (its harness's own default when its chat names none:
+/// `CrewInference::prepare`); no model, or another provider's, has no route.
 fn inference_binding(harness: HarnessId, selected_model: Option<&str>) -> Option<(Provider, String)> {
     let provider = Provider::for_harness(harness)?;
     let selected = selected_model
         .map(str::trim)
         .filter(|value| !value.is_empty() && *value != "default")
-        .map(str::to_owned)
-        .or_else(|| managed_default_model(harness))?;
+        .map(str::to_owned)?;
     let lower = selected.to_ascii_lowercase();
     let own_prefix = match provider {
         Provider::Anthropic => lower.starts_with("anthropic/"),
@@ -381,6 +381,12 @@ fn inference_binding(harness: HarnessId, selected_model: Option<&str>) -> Option
     }
     let model = selected.rsplit_once('/').map_or(selected.as_str(), |(_, model)| model);
     (!model.is_empty()).then(|| (provider, model.to_owned()))
+}
+
+/// Whether a managed `harness` run of `model` has a route: one of its CLI's
+/// models that Agent Auth's provider for it serves. What a model list offers.
+pub(super) fn routable(harness: HarnessId, model: &str) -> bool {
+    inference_binding(harness, Some(model)).is_some()
 }
 
 /// Agent Auth keys routes by UUID. A chat id that isn't one (an imported

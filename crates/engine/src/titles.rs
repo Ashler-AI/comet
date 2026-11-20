@@ -302,15 +302,16 @@ impl Drop for TitleAfterFirstOutput {
 }
 
 /// The cheapest model a harness offers (zeron's `cheapestModel` heuristic):
-/// prefer a small-tier name (haiku/mini/nano/flash/small/lite), else the last
-/// listed model; `None` when the catalog is empty (harness picks its default).
+/// prefer a small-tier name (haiku/mini/nano/flash/small/lite, and Codex's
+/// luna: Crew titles on Agent Auth's shared accounts), else the last listed
+/// model; `None` when the catalog is empty (harness picks its default).
 fn cheapest_model(models: &[Model]) -> Option<String> {
     if models.is_empty() {
         return None;
     }
     let small = models.iter().find(|m| {
         let haystack = format!("{} {}", m.id, m.label).to_lowercase();
-        ["haiku", "mini", "nano", "flash", "small", "lite"]
+        ["haiku", "mini", "nano", "flash", "small", "lite", "luna"]
             .iter()
             .any(|tier| haystack.contains(tier))
     });
@@ -415,6 +416,13 @@ mod tests {
         let no_small = vec![model("opus-4", "Opus"), model("sonnet-4", "Sonnet")];
         assert_eq!(cheapest_model(&no_small).as_deref(), Some("sonnet-4"));
         assert_eq!(cheapest_model(&[]), None);
+        // Codex's, as its CLI lists them: its small tier is luna.
+        let codex = vec![
+            model("gpt-6.2-sol", "GPT-6.2-Sol"),
+            model("gpt-6-luna", "GPT-6-Luna"),
+            model("gpt-5.5", "GPT-5.5"),
+        ];
+        assert_eq!(cheapest_model(&codex).as_deref(), Some("gpt-6-luna"));
     }
 
     #[tokio::test]

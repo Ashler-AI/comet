@@ -14,6 +14,11 @@ pub(super) mod tests {
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use tokio::sync::mpsc;
 
+    /// A run names its model (`CrewInference::prepare` gives one that names
+    /// none its harness's own default): these stand for any.
+    const CODEX_MODEL: &str = "gpt-6-sol";
+    const CLAUDE_MODEL: &str = "claude-opus-5-5";
+
     #[derive(Clone)]
     struct LogWriter(Arc<Mutex<Vec<u8>>>);
 
@@ -507,7 +512,7 @@ pub(super) mod tests {
         let relay = start_relay(&origin, static_token());
         let sessions = (0..16).map(|index| format!("shared-session-{index}")).collect::<Vec<_>>();
         let prepared = futures::future::join_all(
-            sessions.iter().map(|session| relay.prepare(session, HarnessId::Codex, None, None)),
+            sessions.iter().map(|session| relay.prepare(session, HarnessId::Codex, Some(CODEX_MODEL), None)),
         )
         .await;
         let routes = prepared
@@ -547,7 +552,7 @@ pub(super) mod tests {
         let (tx, _rx) = mpsc::unbounded_channel();
         let origin = test_control_plane_with_authority(tx, fixture.clone()).await;
         let relay = start_relay(&origin, token.clone());
-        let prepared = relay.prepare("generation-session", HarnessId::Codex, None, None).await.unwrap();
+        let prepared = relay.prepare("generation-session", HarnessId::Codex, Some(CODEX_MODEL), None).await.unwrap();
         let route = route_of(&relay, &prepared.token);
         let first = relay.current_authority(&route).await.unwrap().credential_generation;
         token.generation.fetch_add(1, Ordering::SeqCst);
@@ -556,7 +561,7 @@ pub(super) mod tests {
         assert_eq!(renewed.authority.authority_id, "authority-2");
         token.signed_out.store(true, Ordering::SeqCst);
         assert!(relay.current_authority(&route).await.is_err());
-        match relay.prepare("signed-out", HarnessId::Codex, None, None).await {
+        match relay.prepare("signed-out", HarnessId::Codex, Some(CODEX_MODEL), None).await {
             Err(PrepareError::Authority(error)) => assert!(error.signed_out, "{error:?}"),
             other => panic!("a signed-out profile prepares nothing: {other:?}"),
         }
@@ -575,7 +580,7 @@ pub(super) mod tests {
             let relay = start_relay(&origin, token.clone());
             let preparing = {
                 let relay = relay.clone();
-                tokio::spawn(async move { relay.prepare("changing-profile", HarnessId::Codex, None, None).await })
+                tokio::spawn(async move { relay.prepare("changing-profile", HarnessId::Codex, Some(CODEX_MODEL), None).await })
             };
             tokio::time::timeout(Duration::from_secs(2), async {
                 while fixture.issued.load(Ordering::SeqCst) == 0 {
@@ -593,7 +598,7 @@ pub(super) mod tests {
             if !signed_out {
                 *lock(&fixture.issuance_gate) = None;
                 // The new credential owes nothing to the old one's cooldown.
-                relay.prepare("new-profile", HarnessId::Codex, None, None).await.unwrap();
+                relay.prepare("new-profile", HarnessId::Codex, Some(CODEX_MODEL), None).await.unwrap();
                 assert_eq!(fixture.issued.load(Ordering::SeqCst), 2);
             }
         }
@@ -607,16 +612,16 @@ pub(super) mod tests {
             let (tx, _rx) = mpsc::unbounded_channel();
             let origin = test_control_plane_with_authority(tx, fixture.clone()).await;
             let relay = start_relay(&origin, token.clone());
-            let prepared = relay.prepare("profile-route", HarnessId::Codex, None, None).await.unwrap();
+            let prepared = relay.prepare("profile-route", HarnessId::Codex, Some(CODEX_MODEL), None).await.unwrap();
             let old = route_of(&relay, &prepared.token);
-            let retired = relay.prepare("retired-profile", HarnessId::Codex, None, None).await.unwrap();
+            let retired = relay.prepare("retired-profile", HarnessId::Codex, Some(CODEX_MODEL), None).await.unwrap();
             relay.remove(&retired.token);
             token.generation.fetch_add(1, Ordering::SeqCst);
             *lock(&fixture.scope) = "user:another-scope".into();
             if change_owner {
                 *lock(&fixture.principal) = "identity:another-owner".into();
             }
-            let replacement = relay.prepare("retired-profile", HarnessId::Codex, None, None).await.unwrap();
+            let replacement = relay.prepare("retired-profile", HarnessId::Codex, Some(CODEX_MODEL), None).await.unwrap();
             assert_ne!(replacement.token, retired.token);
             assert!(relay.current_authority(&old).await.is_err());
             assert!(old.cancellation.is_cancelled());
@@ -639,7 +644,7 @@ pub(super) mod tests {
             let (tx, _rx) = mpsc::unbounded_channel();
             let origin = test_control_plane_with_authority(tx, fixture.clone()).await;
             let relay = start_relay(&origin, token.clone());
-            let prepared = relay.prepare("signout-wait", HarnessId::Codex, None, None).await.unwrap();
+            let prepared = relay.prepare("signout-wait", HarnessId::Codex, Some(CODEX_MODEL), None).await.unwrap();
             let route = route_of(&relay, &prepared.token);
             if wait == "expiry" {
                 set_fixture_expiry(&fixture, &relay, Utc::now() + TimeDelta::milliseconds(900)).await;
@@ -664,8 +669,8 @@ pub(super) mod tests {
         let (tx, _rx) = mpsc::unbounded_channel();
         let origin = test_control_plane_with_authority(tx, fixture.clone()).await;
         let relay = start_relay(&origin, static_token());
-        let first = relay.prepare("cooldown", HarnessId::Codex, None, None).await.unwrap();
-        let sibling = relay.prepare("cooldown-sibling", HarnessId::Codex, None, None).await.unwrap();
+        let first = relay.prepare("cooldown", HarnessId::Codex, Some(CODEX_MODEL), None).await.unwrap();
+        let sibling = relay.prepare("cooldown-sibling", HarnessId::Codex, Some(CODEX_MODEL), None).await.unwrap();
         set_fixture_expiry(&fixture, &relay, Utc::now() - TimeDelta::seconds(1)).await;
         fixture.fail_issuance.store(true, Ordering::SeqCst);
         let http = reqwest::Client::new();
@@ -685,14 +690,14 @@ pub(super) mod tests {
             assert_eq!(response.headers()["retry-after"], "1");
             assert_eq!(response.json::<Value>().await.unwrap()["error"], "agent_auth_unavailable");
         }
-        assert!(relay.prepare("cooldown-prepare", HarnessId::Codex, None, None).await.is_err());
+        assert!(relay.prepare("cooldown-prepare", HarnessId::Codex, Some(CODEX_MODEL), None).await.is_err());
         assert_eq!(fixture.issued.load(Ordering::SeqCst), 2);
         assert_eq!(fixture.forwarded.load(Ordering::SeqCst), 0);
         let (started, delay) = relay.inner.authority.lock().await.retry_at.unwrap();
         tokio::time::sleep(delay.saturating_sub(started.elapsed()) + Duration::from_millis(20)).await;
         fixture.fail_issuance.store(false, Ordering::SeqCst);
         *lock(&fixture.expires_at) = Utc::now() + TimeDelta::minutes(5);
-        relay.prepare("recovered", HarnessId::Codex, None, None).await.unwrap();
+        relay.prepare("recovered", HarnessId::Codex, Some(CODEX_MODEL), None).await.unwrap();
         assert_eq!(fixture.issued.load(Ordering::SeqCst), 3);
     }
 
@@ -706,7 +711,7 @@ pub(super) mod tests {
         let (tx, mut rx) = mpsc::unbounded_channel();
         let origin = test_control_plane_with_authority(tx, fixture.clone()).await;
         let relay = start_relay(&origin, static_token());
-        let route = relay.prepare("rejected", HarnessId::Codex, None, None).await.unwrap();
+        let route = relay.prepare("rejected", HarnessId::Codex, Some(CODEX_MODEL), None).await.unwrap();
         let http = reqwest::Client::new();
         let mut requests = tokio::task::JoinSet::new();
         for input in ["first", "stale"] {
@@ -726,11 +731,11 @@ pub(super) mod tests {
         assert_eq!(rejected.text().await.unwrap(), body);
         assert_eq!(fixture.issued.load(Ordering::SeqCst), 1);
         assert_eq!(fixture.forwarded.load(Ordering::SeqCst), 2);
-        relay.prepare("independent", HarnessId::Codex, None, None).await.unwrap();
+        relay.prepare("independent", HarnessId::Codex, Some(CODEX_MODEL), None).await.unwrap();
         assert_eq!(fixture.issued.load(Ordering::SeqCst), 2);
         gate.add_permits(1);
         assert_eq!(requests.join_next().await.unwrap().unwrap().text().await.unwrap(), body);
-        relay.prepare("after-stale", HarnessId::Codex, None, None).await.unwrap();
+        relay.prepare("after-stale", HarnessId::Codex, Some(CODEX_MODEL), None).await.unwrap();
         assert_eq!(fixture.issued.load(Ordering::SeqCst), 2);
         assert_eq!(fixture.forwarded.load(Ordering::SeqCst), 2);
         assert!(rx.try_recv().is_err());
@@ -749,7 +754,7 @@ pub(super) mod tests {
             let (tx, _rx) = mpsc::unbounded_channel();
             let origin = test_control_plane_with_authority(tx, fixture.clone()).await;
             let relay = start_relay(&origin, static_token());
-            let route = relay.prepare("provider-error", HarnessId::Codex, None, None).await.unwrap();
+            let route = relay.prepare("provider-error", HarnessId::Codex, Some(CODEX_MODEL), None).await.unwrap();
             let response = reqwest::Client::new()
                 .post(format!("{}/v1/responses", route.base_url))
                 .bearer_auth(&route.token)
@@ -760,7 +765,7 @@ pub(super) mod tests {
             assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
             assert_eq!(response.headers()["x-fixture-error"], "preserved");
             assert_eq!(response.text().await.unwrap(), body);
-            relay.prepare("after-provider-error", HarnessId::Codex, None, None).await.unwrap();
+            relay.prepare("after-provider-error", HarnessId::Codex, Some(CODEX_MODEL), None).await.unwrap();
             assert_eq!(fixture.issued.load(Ordering::SeqCst), 1);
             assert_eq!(fixture.forwarded.load(Ordering::SeqCst), 1);
         }
@@ -773,7 +778,7 @@ pub(super) mod tests {
         let (origin, mut connections, shutdown, server) =
             streaming_control_plane_with_status(tx, StatusCode::UNAUTHORIZED, Some(tail.clone())).await;
         let relay = start_relay(&origin, static_token());
-        let prepared = relay.prepare("stalled", HarnessId::Codex, None, None).await.unwrap();
+        let prepared = relay.prepare("stalled", HarnessId::Codex, Some(CODEX_MODEL), None).await.unwrap();
         let lease = relay.inner.authority.lock().await.lease.clone().unwrap();
         let response = tokio::time::timeout(
             Duration::from_secs(3),
@@ -1015,7 +1020,7 @@ pub(super) mod tests {
             .unwrap();
         assert_eq!(catalog["data"][0]["id"], "anthropic/claude-sonnet-5-5");
         // Another chat is another route.
-        let other_chat = relay.prepare("other-chat", HarnessId::ClaudeCode, None, None).await.unwrap();
+        let other_chat = relay.prepare("other-chat", HarnessId::ClaudeCode, Some(CLAUDE_MODEL), None).await.unwrap();
         assert_ne!(other_chat.token, first.token);
         assert_eq!(other_chat.model, "claude-opus-5-5");
     }
@@ -1028,8 +1033,8 @@ pub(super) mod tests {
         let (captured_tx, mut captured_rx) = mpsc::unbounded_channel();
         let origin = test_control_plane(captured_tx).await;
         let relay = start_relay(&origin, static_token());
-        let automatic = relay.prepare("chat", HarnessId::ClaudeCode, None, None).await.unwrap();
-        let pinned = relay.prepare("chat", HarnessId::ClaudeCode, None, Some("acct-claude-2")).await.unwrap();
+        let automatic = relay.prepare("chat", HarnessId::ClaudeCode, Some(CLAUDE_MODEL), None).await.unwrap();
+        let pinned = relay.prepare("chat", HarnessId::ClaudeCode, Some(CLAUDE_MODEL), Some("acct-claude-2")).await.unwrap();
         assert_ne!(pinned.token, automatic.token);
         assert_ne!(pinned.serial, automatic.serial);
         assert!(route_of(&relay, &pinned.token).request.requested_account_id.as_deref() == Some("acct-claude-2"));
@@ -1051,7 +1056,7 @@ pub(super) mod tests {
 
         // Switching provider: Codex for the same chat retires Claude's route,
         // and the old token has nothing of its provider to follow.
-        let codex = relay.prepare("chat", HarnessId::Codex, None, None).await.unwrap();
+        let codex = relay.prepare("chat", HarnessId::Codex, Some(CODEX_MODEL), None).await.unwrap();
         let gone = reqwest::Client::new()
             .get(format!("{}/v1/models", codex.base_url))
             .bearer_auth(&pinned.token)
@@ -1094,12 +1099,29 @@ pub(super) mod tests {
         server.await.expect("fixture server must not panic");
     }
 
+    /// A route is for a model its harness's provider serves, named: a run
+    /// that names none was given its harness's own default before
+    /// (`CrewInference::prepare`), and another provider's is never offered.
+    #[test]
+    fn a_route_is_for_a_named_model_of_its_harness_s_provider() {
+        assert!(routable(HarnessId::ClaudeCode, "claude-opus-5-5"));
+        assert!(routable(HarnessId::ClaudeCode, "anthropic/claude-fable-5-2"));
+        assert!(!routable(HarnessId::ClaudeCode, "gateway/sol"));
+        assert!(routable(HarnessId::Codex, "gpt-6.2-sol"));
+        assert!(routable(HarnessId::Codex, "openai/gpt-6.2-astra"));
+        assert!(!routable(HarnessId::Codex, "anthropic/claude-opus-5-5"));
+        assert!(!routable(HarnessId::Pi, "gpt-6.2-sol"));
+        for unnamed in [None, Some(""), Some("default")] {
+            assert_eq!(inference_binding(HarnessId::Codex, unnamed), None, "{unnamed:?}");
+        }
+    }
+
     #[tokio::test]
     async fn shutdown_retires_every_route_and_stops_serving() {
         let (captured_tx, _captured_rx) = mpsc::unbounded_channel();
         let origin = test_control_plane(captured_tx).await;
         let relay = start_relay(&origin, static_token());
-        let route = relay.prepare("chat", HarnessId::Codex, None, None).await.unwrap();
+        let route = relay.prepare("chat", HarnessId::Codex, Some(CODEX_MODEL), None).await.unwrap();
         let live = route_of(&relay, &route.token);
         relay.shutdown();
         assert!(live.cancellation.is_cancelled());
@@ -1210,16 +1232,6 @@ pub(super) mod tests {
     }
 
     #[test]
-    fn resolves_the_managed_defaults_when_the_chat_names_no_model() {
-        assert_eq!(
-            inference_binding(HarnessId::ClaudeCode, Some("default")),
-            Some((Provider::Anthropic, "claude-opus-5-5".into()))
-        );
-        assert_eq!(inference_binding(HarnessId::Codex, None), Some((Provider::Openai, "gpt-6-sol".into())));
-        assert_eq!(inference_binding(HarnessId::Codex, Some("  ")), Some((Provider::Openai, "gpt-6-sol".into())));
-    }
-
-    #[test]
     fn route_requests_preserve_automatic_and_pinned_account_selection() {
         let automatic = inference_route_request("session-1", HarnessId::Codex, Some("gpt-5.6-sol"), None).unwrap();
         assert_eq!(automatic.logical_session_id, "session-1");
@@ -1232,7 +1244,7 @@ pub(super) mod tests {
         assert_eq!(pinned.provider, Provider::Anthropic);
         assert_eq!(pinned.requested_account_id.as_deref(), Some("opaque-account-id"));
         assert!(matches!(
-            inference_route_request("session-1", HarnessId::Codex, None, Some(" ")),
+            inference_route_request("session-1", HarnessId::Codex, Some(CODEX_MODEL), Some(" ")),
             Err(PrepareError::InvalidAccount)
         ));
         assert!(matches!(

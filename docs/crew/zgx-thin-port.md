@@ -298,11 +298,26 @@ Deferred:
     `pin_mechanism` reports nothing pinnable.
   - Codex voice: `prepare_voice_bridge` answers `Unsupported`, and a managed Codex run
     never attaches realtime.
-  - Model lists (`ListModels`, plugins' `models`, titling's model choice) are the
-    managed catalog: Claude Code's curated rows, and Crew's OpenAI rows for Codex. Each
-    has an Account option: "Automatic · shared pool", then each healthy login from
-    `/api/agent-accounts` (cached a minute, 5 s at most, deduplicated as Crew's settings
-    do). No CLI is probed.
+  - Model lists (`ListModels`, plugins' `models`, titling's model choice) are each
+    harness's own, as for an upstream engine: Claude Code's `initialize` and Codex's
+    `model/list`, through upstream's catalog cache. The probe runs as a managed launch
+    would (`zeron_harness::crew_inference::set_managed_discovery`): on a placeholder
+    route, with no inherited credential, and Codex on the `crew` provider. It lists the
+    CLI's models without reading this device's login. Offline and logged out, Codex
+    0.169.1 lists 11 models, `gpt-6.2-sol` its default.
+  - `CrewInference::offer` keeps what Agent Auth can route (`relay::routable`: no other
+    provider's ids). Each model gets an Account option: "Automatic · shared pool", then
+    each healthy login from `/api/agent-accounts` (cached a minute, 5 s at most,
+    deduplicated as Crew's settings do). No model is named in Crew's code: one a CLI
+    release adds is offered as it arrives.
+  - A run that names no model runs its harness's own default, kept from its last list
+    or asked of the harness then. Titles use upstream's cheapest-model rule over the same
+    lists (Haiku for Claude Code; "luna", Codex's small tier, added to the rule).
+  - **Development switch:** `COMET_INFERENCE_MODE=local` (or `ZERON_INFERENCE_MODE`), as
+    Crew's launcher reads it. Launch the app with it through `scripts/crew/clean-env`,
+    with no engine of the flavour running. The app hands it to the engine it starts,
+    which then runs agents on this device's own logins as upstream does, and setup and
+    Settings → Providers offer own logins again (the host's `crew_managed`).
 - **Checked, left as upstream:** Auto's reviewer runs inside the agent's process
   (Claude Code's classifier, Codex's `auto_review`), so it uses the route. Command and
   skill discovery start the CLI's `initialize` handshake, with no model turn. Local
@@ -428,13 +443,29 @@ open -g -n --env ZGX_INSPECT_SOCKET=1 --env ZGX_RENDER_WHEN_COVERED=1 --env ZGX_
 
 ## Decisions for the owner
 
+Open:
+
 1. **Scaffold authority for test sign-in.**
    - Option one: staging Platform, for identity and Agent Auth only, with rooms on the local Edge.
+     The end-to-end runs use this.
    - Option two: the old canary Scaffold. It answers, but nobody has checked whether its authority is still valid.
-2. Agent Auth through upstream's `RunEnvironment` hook rather than `RunControls` route context.
-   Slice 5 is built this way.
-3. **Codex resume failure.** Upstream silently starts a fresh conversation; Crew treats it as an error.
-4. Approval to push this branch, run build-only CI and deploy any Edge.
+2. Deploying any Edge.
+
+Decided by the owner on 2026-11-20:
+
+- **Agent Auth** stays on upstream's `RunEnvironment` hook.
+- **Own logins:** managed by default, with Crew's development switch
+  (`COMET_INFERENCE_MODE=local`).
+- **Titles** stay on Agent Auth, on the cheapest model.
+- **Model lists** come from the native harnesses, mapped to Agent Auth, with no
+  hard-coded catalog.
+- **Codex resume failure:** start a fresh conversation and say so. Upstream now does
+  exactly this: "Couldn't restore the earlier Codex conversation …", shown as an error
+  row while the turn goes on. It fails only for a dead process or a refusal.
+- **Crew's wording:** an overlay file of Crew messages. Not built yet.
+- **The branch** is pushed to `origin`, and signed canaries are built from
+  `crew-zgx-canary-*` tags (`.github/workflows/crew-zgx-canary.yml`).
+- **Next:** finish the Agent Auth phase, OMP included.
 
 ## Status
 

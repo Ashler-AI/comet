@@ -20,12 +20,19 @@
 //!   before its next turn.
 //! - Upstream's other ways to a provider refuse while this is on: account
 //!   switching and pins (plugins' too, and their `run.preparing` pins never
-//!   apply), Codex voice, and CLI model probes; model lists are the managed
-//!   catalog with the account choice ([`CrewInference::models`]).
+//!   apply) and Codex voice.
+//! - Model lists are each harness's own (its CLI's, probed as a managed run
+//!   would launch: `zeron_harness::crew_inference::set_managed_discovery`),
+//!   less what Agent Auth can't route, each with the account choice
+//!   ([`CrewInference::offer`]). Nothing here names a model: one a CLI release
+//!   adds is offered as it arrives, and a chat that names none runs its
+//!   harness's own default.
 //!
 //! The authority is the engine's verified Scaffold session only
-//! ([`crate::auth::ProfileTokens`]); nothing here reads the environment or
-//! persists a credential. An engine with no Scaffold authority is unchanged.
+//! ([`crate::auth::ProfileTokens`]); nothing here persists a credential, and
+//! the environment is read for one thing, Crew's development switch
+//! (`ZERON_INFERENCE_MODE=local`: this device's own logins, as upstream). An
+//! engine with no Scaffold authority is unchanged.
 
 #[path = "crew_agent_auth.rs"]
 mod agent_auth;
@@ -33,11 +40,11 @@ mod agent_auth;
 mod relay;
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, Weak};
 use std::time::{Duration, Instant};
 
 use sha2::{Digest, Sha256};
-use zeron_harness::crew_inference::{ManagedRoute, Provider, managed_models};
+use zeron_harness::crew_inference::{ManagedRoute, Provider};
 use zeron_proto::{ChatConfig, HarnessId, Model, ModelOption, ModelOptionChoice, RunRequest};
 
 use crate::registry::{HarnessRegistry, RunEnvironment};
@@ -65,6 +72,20 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
+/// Crew's development switch, as its launcher reads it: `ZERON_INFERENCE_MODE`
+/// (or `COMET_INFERENCE_MODE`) `local` runs a Scaffold engine's agents on this
+/// device's own logins, as an upstream engine's. The zgx app hands it to the
+/// engine it starts (apps/zgx/src/crew.rs `local_inference`).
+fn local_inference() -> bool {
+    local_inference_in(|name| std::env::var(name).ok())
+}
+
+fn local_inference_in(var: impl Fn(&str) -> Option<String>) -> bool {
+    ["ZERON_INFERENCE_MODE", "COMET_INFERENCE_MODE"]
+        .iter()
+        .any(|name| var(name).is_some_and(|mode| mode.trim().eq_ignore_ascii_case("local")))
+}
+
 /// A Scaffold engine's managed inference (see the module docs).
 pub struct CrewInference {
     /// `None`: no Agent Auth to reach (no authority origin, or the relay
@@ -77,6 +98,11 @@ pub struct CrewInference {
     /// The logical session each harness's title runs share.
     title_sessions: Mutex<HashMap<HarnessId, String>>,
     accounts: tokio::sync::Mutex<Option<(Instant, Vec<RemoteAgentAccount>)>>,
+    /// The registry whose harnesses are asked for their catalogs, when a
+    /// run names no model before any list was asked for.
+    registry: OnceLock<Weak<HarnessRegistry>>,
+    /// Each harness's own default model, from its last catalog.
+    defaults: Mutex<HashMap<HarnessId, String>>,
 }
 
 impl CrewInference {
@@ -89,6 +115,10 @@ impl CrewInference {
         tokens: Arc<dyn zeron_rpc::TokenSource>,
     ) -> Option<Arc<Self>> {
         if !auth.scaffold_enabled() {
+            return None;
+        }
+        if local_inference() {
+            tracing::warn!("crew: inference mode local: agents run on this device's own logins");
             return None;
         }
         let Some(scaffold) = config.scaffold.as_ref() else {
@@ -124,6 +154,8 @@ impl CrewInference {
             chat_configs: Mutex::new(None),
             title_sessions: Mutex::new(HashMap::new()),
             accounts: tokio::sync::Mutex::new(None),
+            registry: OnceLock::new(),
+            defaults: Mutex::new(HashMap::new()),
         }
     }
 
@@ -160,18 +192,49 @@ impl CrewInference {
         Some(account_choice(&configs(chat_id)?.model_options))
     }
 
-    /// The managed catalog of `harness`, each model with the account choice.
-    /// No CLI is started and no local login read.
-    pub(crate) async fn models(&self, harness: HarnessId) -> Result<Vec<Model>, String> {
-        let (Some(provider), Some(mut models)) = (Provider::for_harness(harness), managed_models(harness)) else {
-            return Err(unsupported(harness));
-        };
+    /// Whether `harness` runs here at all (its catalog is then worth asking).
+    pub(crate) fn serves(&self, harness: HarnessId) -> Result<(), String> {
+        Provider::for_harness(harness).map(|_| ()).ok_or_else(|| unsupported(harness))
+    }
+
+    /// `harness`'s own catalog (its CLI's) as a managed engine offers it:
+    /// what Agent Auth can route, each with the account choice. Its default
+    /// is kept for a run that names no model.
+    pub(crate) async fn offer(&self, harness: HarnessId, mut models: Vec<Model>) -> Result<Vec<Model>, String> {
+        let provider = Provider::for_harness(harness).ok_or_else(|| unsupported(harness))?;
+        models.retain(|model| relay::routable(harness, &model.id));
+        self.keep_default(harness, &models);
         let option = account_option(provider, &self.accounts().await);
         for model in &mut models {
             model.options.retain(|existing| existing.id != ACCOUNT_OPTION);
             model.options.push(option.clone());
         }
         Ok(models)
+    }
+
+    fn keep_default(&self, harness: HarnessId, models: &[Model]) {
+        if let Some(model) = models.iter().find(|model| model.default).or(models.first()) {
+            lock(&self.defaults).insert(harness, model.id.clone());
+        }
+    }
+
+    /// The model a run of `harness` that names none runs: its own default,
+    /// from its last catalog, else from its catalog now.
+    async fn default_model(&self, harness: HarnessId) -> Result<String, String> {
+        if let Some(model) = lock(&self.defaults).get(&harness).cloned() {
+            return Ok(model);
+        }
+        // (A spawn holds the harness's execution lease already: its catalog is
+        // asked of the harness directly, as the registry's discovery would.)
+        let registry = self.registry.get().and_then(Weak::upgrade).ok_or_else(|| NOT_CONFIGURED.to_owned())?;
+        let harness_impl = registry.resolve(harness).map_err(|error| error.to_string())?;
+        let mut models = harness_impl.models().await.map_err(|error| error.to_string())?;
+        models.retain(|model| relay::routable(harness, &model.id));
+        self.keep_default(harness, &models);
+        lock(&self.defaults)
+            .get(&harness)
+            .cloned()
+            .ok_or_else(|| format!("{} offers no model Crew's shared accounts can run.", harness.as_str()))
     }
 
     /// The principal's shared accounts, kept a minute; on a failure the last
@@ -221,12 +284,23 @@ impl RunEnvironment for CrewInference {
             // harness's titling session.
             None => (self.title_session(harness), None),
         };
+        // A route is for a model: one the run names none of runs its
+        // harness's own default.
+        let named = request
+            .model
+            .as_deref()
+            .map(str::trim)
+            .filter(|model| !model.is_empty() && *model != "default")
+            .map(str::to_owned);
+        let model = match named {
+            Some(model) => model,
+            None => self.default_model(harness).await?,
+        };
         let route = relay
-            .prepare(&session, harness, request.model.as_deref(), account.as_deref())
+            .prepare(&session, harness, Some(&model), account.as_deref())
             .await
             .map_err(|error| refused(harness, error))?;
-        // The CLI runs the route's model: the managed default when the chat
-        // named none, without a provider prefix.
+        // The CLI runs the route's model, without a provider prefix.
         if request.model.as_deref() != Some(route.model.as_str()) {
             request.model = Some(route.model.clone());
         }
@@ -413,9 +487,12 @@ pub(crate) fn install(
     config: &crate::EngineConfig,
     auth: &crate::Auth,
     tokens: Arc<dyn zeron_rpc::TokenSource>,
-    registry: &HarnessRegistry,
+    registry: &Arc<HarnessRegistry>,
 ) -> Option<Arc<CrewInference>> {
     let crew = CrewInference::for_engine(config, auth, tokens)?;
+    let _ = crew.registry.set(Arc::downgrade(registry));
+    // Its harnesses' model probes run as its managed runs launch.
+    zeron_harness::crew_inference::set_managed_discovery(true);
     registry.set_crew_inference(crew.clone());
     Some(crew)
 }
@@ -459,6 +536,87 @@ mod tests {
         (origin, fixture, rx)
     }
 
+    fn model(id: &str, default: bool) -> Model {
+        Model {
+            id: id.into(),
+            label: id.into(),
+            description: None,
+            provider: None,
+            reasoning_levels: Vec::new(),
+            options: Vec::new(),
+            default,
+        }
+    }
+
+    /// A harness as its CLI would list its models (counting each ask); it
+    /// never runs.
+    struct CatalogHarness {
+        id: HarnessId,
+        models: Vec<Model>,
+        asked: std::sync::atomic::AtomicUsize,
+    }
+
+    impl CatalogHarness {
+        fn new(id: HarnessId, models: Vec<Model>) -> Arc<Self> {
+            Arc::new(Self { id, models, asked: Default::default() })
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl zeron_harness::Harness for CatalogHarness {
+        fn id(&self) -> HarnessId {
+            self.id
+        }
+        fn display_name(&self) -> &str {
+            "Catalog"
+        }
+        fn supports_steering(&self) -> bool {
+            false
+        }
+        fn steering_mode(&self) -> zeron_proto::SteeringMode {
+            zeron_proto::SteeringMode::TurnBoundary
+        }
+        fn reasoning_levels(&self) -> &[zeron_proto::ReasoningLevel] {
+            &[]
+        }
+        async fn models(&self) -> Result<Vec<Model>, zeron_harness::HarnessError> {
+            self.asked.fetch_add(1, Ordering::SeqCst);
+            Ok(self.models.clone())
+        }
+        async fn run(
+            &self,
+            _: RunRequest,
+            _: zeron_harness::RunControls,
+        ) -> Result<
+            futures::stream::BoxStream<'static, Result<zeron_proto::AgentEvent, zeron_harness::HarnessError>>,
+            zeron_harness::HarnessError,
+        > {
+            panic!("a catalog harness never runs")
+        }
+    }
+
+    /// Claude Code's CLI, as it lists its models: a default, a small one and
+    /// another provider's (a gateway's), which Agent Auth can't route.
+    fn claude_cli() -> Arc<CatalogHarness> {
+        CatalogHarness::new(
+            HarnessId::ClaudeCode,
+            vec![model("claude-fable-5-2", false), model("claude-opus-5-5", true), model("claude-haiku-5-5", false), model("gateway/sol", false)],
+        )
+    }
+
+    /// Codex's, as its `model/list` answers (a model a CLI release just
+    /// added among them).
+    fn codex_cli() -> Arc<CatalogHarness> {
+        CatalogHarness::new(HarnessId::Codex, vec![model("gpt-6.2-sol", true), model("gpt-6-luna", false), model("gpt-7-nova", false)])
+    }
+
+    /// [`install`]'s wiring, less the process-wide probe switch: the
+    /// registry's managed inference, and the registry it asks for catalogs.
+    fn attach(crew: &Arc<CrewInference>, registry: &Arc<HarnessRegistry>) {
+        let _ = crew.registry.set(Arc::downgrade(registry));
+        registry.set_crew_inference(crew.clone());
+    }
+
     /// An account environment that would put the user's own Claude login in
     /// a pinned chat's spawn (as `PinRunEnvironment` does).
     struct PinnedLogin;
@@ -480,10 +638,12 @@ mod tests {
     #[tokio::test]
     async fn managed_spawns_get_only_the_relay_env() {
         let (origin, fixture, mut captured) = agent_auth().await;
-        let registry = HarnessRegistry::new();
+        let registry = Arc::new(HarnessRegistry::new());
         registry.set_account_environment(Arc::new(PinnedLogin));
+        let claude_cli = claude_cli();
+        registry.register(claude_cli.clone());
         let crew = Arc::new(CrewInference::start(&origin, static_token()).unwrap());
-        registry.set_crew_inference(crew.clone());
+        attach(&crew, &registry);
 
         let mut claude = request(None, None);
         registry.prepare_run(HarnessId::ClaudeCode, Some(CHAT), &mut claude).await.unwrap();
@@ -515,8 +675,14 @@ mod tests {
         }
         assert_eq!(claude.env["ANTHROPIC_AUTH_TOKEN"], route.token);
         assert!(route.base_url.starts_with("http://127.0.0.1:"));
-        // The chat named no model: the managed default.
+        // The chat named no model: its harness's own default, asked of its CLI
+        // (no list was asked for yet), and kept.
         assert_eq!(claude.model.as_deref(), Some("claude-opus-5-5"));
+        assert_eq!(claude_cli.asked.load(Ordering::SeqCst), 1);
+        let mut again = request(None, None);
+        registry.prepare_run(HarnessId::ClaudeCode, Some(CHAT), &mut again).await.unwrap();
+        assert_eq!(again.model.as_deref(), Some("claude-opus-5-5"));
+        assert_eq!(claude_cli.asked.load(Ordering::SeqCst), 1, "the default is kept");
         assert_eq!(registry.run_credential(HarnessId::ClaudeCode, Some(CHAT)).await, crew.credential(HarnessId::ClaudeCode, Some(CHAT)).await);
 
         let response = reqwest::Client::new()
@@ -559,14 +725,14 @@ mod tests {
         let crew = CrewInference::start(&origin, token.clone()).unwrap();
 
         token.signed_out.store(true, Ordering::SeqCst);
-        let mut signed_out = request(None, None);
+        let mut signed_out = request(Some("claude-opus-5-5"), None);
         let error = crew.prepare(HarnessId::ClaudeCode, Some(CHAT), &mut signed_out).await.unwrap_err();
         assert_eq!(error, SIGNED_OUT);
         assert!(!zeron_harness::crew_inference::managed(&signed_out.env));
 
         token.signed_out.store(false, Ordering::SeqCst);
         fixture.fail_issuance.store(true, Ordering::SeqCst);
-        let mut refused = request(None, None);
+        let mut refused = request(Some("gpt-6.2-sol"), None);
         let error = crew.prepare(HarnessId::Codex, Some(CHAT), &mut refused).await.unwrap_err();
         assert!(error.contains("can't be reached"), "{error}");
         assert!(!zeron_harness::crew_inference::managed(&refused.env));
@@ -581,9 +747,14 @@ mod tests {
         let nowhere = format!("http://{}", listener.local_addr().unwrap());
         drop(listener);
         let unreachable = CrewInference::start(&nowhere, static_token()).unwrap();
-        let mut run = request(None, None);
+        let mut run = request(Some("claude-opus-5-5"), None);
         assert!(unreachable.prepare(HarnessId::ClaudeCode, Some(CHAT), &mut run).await.is_err());
         assert!(run.env.keys().all(|key| key == zeron_proto::ORIGIN_ENV));
+        // A run naming no model, with no harness to ask for its default:
+        // refused, nothing in its environment either.
+        let mut unnamed = request(None, None);
+        assert!(crew.prepare(HarnessId::Codex, Some(CHAT), &mut unnamed).await.is_err());
+        assert!(unnamed.env.keys().all(|key| key == zeron_proto::ORIGIN_ENV));
 
         // Managed with no authority at all: the registry refuses every spawn.
         let registry = HarnessRegistry::new();
@@ -598,57 +769,53 @@ mod tests {
     }
 
     /// (c) The other ways to a provider refuse while managed: other harnesses,
-    /// pins and account switching, CLI model probes (the managed catalog is
-    /// listed instead); titles go through Agent Auth too.
+    /// pins and account switching; titles go through Agent Auth too. A model
+    /// list is the harness's own (its CLI's), less what Agent Auth can't
+    /// route, each model with the account choice.
     #[tokio::test]
     async fn the_other_paths_refuse_in_managed_mode() {
         let (origin, fixture, _captured) = agent_auth().await;
         let crew = Arc::new(CrewInference::start(&origin, static_token()).unwrap());
-        let registry = HarnessRegistry::new();
-        // A CLI probe would resolve the harness: this one must never be.
-        registry.register_lazy(
-            crate::registry::HarnessDescriptor {
-                id: HarnessId::ClaudeCode,
-                name: "Claude Code".into(),
-                supports_steering: true,
-                steering_mode: zeron_proto::SteeringMode::StepBoundary,
-                reasoning_levels: Vec::new(),
-                installed: true,
-                can_install: false,
-                enabled: None,
-                access_modes: Vec::new(),
-                supports_plan: false,
-                icon: None,
-            },
-            Box::new(|| true),
-            Box::new(|| -> Result<Arc<dyn zeron_harness::Harness>, zeron_harness::HarnessError> {
-                panic!("a managed model list never starts the CLI")
-            }),
-        );
+        let registry = Arc::new(HarnessRegistry::new());
+        let claude_cli = claude_cli();
+        registry.register(claude_cli.clone());
+        registry.register(codex_cli());
         assert!(registry.refuse_own_logins().is_ok(), "unmanaged: as upstream");
-        registry.set_crew_inference(crew.clone());
+        attach(&crew, &registry);
 
         for harness in [HarnessId::Cursor, HarnessId::Opencode, HarnessId::Pi, HarnessId::Muse, HarnessId::Mock] {
             let mut run = request(None, None);
             let error = registry.prepare_run(harness, Some(CHAT), &mut run).await.unwrap_err();
             assert!(error.contains("Claude Code and Codex"), "{error}");
             assert!(!zeron_harness::crew_inference::managed(&run.env));
-            assert!(crew.models(harness).await.is_err());
+            assert!(crew.serves(harness).is_err());
+            assert!(crew.offer(harness, vec![model("any", true)]).await.is_err());
+            let listed = registry.discover_models(harness).await.unwrap_err();
+            assert!(listed.to_string().contains("Claude Code and Codex"), "{listed}");
         }
         assert_eq!(registry.refuse_own_logins().unwrap_err(), OWN_LOGINS_UNUSED);
 
         let lease = Arc::new(registry.execution_lease(HarnessId::ClaudeCode).await);
         let models = registry.discover_models_with_lease(HarnessId::ClaudeCode, lease).await.unwrap();
-        assert!(models.iter().any(|model| model.id == "claude-haiku-5-5"));
+        let ids: Vec<&str> = models.iter().map(|model| model.id.as_str()).collect();
+        assert_eq!(ids, ["claude-fable-5-2", "claude-opus-5-5", "claude-haiku-5-5"], "the CLI's, less a gateway's");
+        assert_eq!(claude_cli.asked.load(Ordering::SeqCst), 1, "asked of its CLI");
         let accounts = &models[0].options.iter().find(|option| option.id == ACCOUNT_OPTION).unwrap().choices;
         let ids: Vec<&str> = accounts.iter().map(|choice| choice.id.as_str()).collect();
         assert_eq!(ids, ["auto", "acct-claude-1", "acct-claude-2"], "healthy Anthropic logins only");
         assert_eq!(accounts[2].label, "Team Two");
-        let codex = crew.models(HarnessId::Codex).await.unwrap();
+        let codex = registry.discover_models(HarnessId::Codex).await.unwrap();
+        // A model a CLI release adds is offered as it arrives.
+        assert!(codex.iter().any(|model| model.id == "gpt-7-nova"));
+        assert!(codex.iter().any(|model| model.id == "gpt-6.2-sol" && model.default));
         let choices = &codex[0].options.last().unwrap().choices;
         let ids: Vec<&str> = choices.iter().map(|choice| choice.id.as_str()).collect();
         assert_eq!(ids, ["auto", "acct-openai-1"], "one ChatGPT login per email and workspace");
         assert_eq!(fixture.accounts_listed.load(Ordering::SeqCst), 1, "listed once a minute");
+        // A run naming none runs the default its list gave.
+        let mut unnamed = request(None, None);
+        registry.prepare_run(HarnessId::Codex, Some(CHAT), &mut unnamed).await.unwrap();
+        assert_eq!(unnamed.model.as_deref(), Some("gpt-6.2-sol"));
 
         // A title (no chat) is routed too, in its harness's titling session,
         // on Agent Auth's choice.
@@ -691,7 +858,7 @@ mod tests {
             })
         });
         let before = crew.credential(HarnessId::ClaudeCode, Some(CHAT)).await.unwrap();
-        let mut run = request(None, None);
+        let mut run = request(Some("claude-opus-5-5"), None);
         crew.prepare(HarnessId::ClaudeCode, Some(CHAT), &mut run).await.unwrap();
         let started = crew.credential(HarnessId::ClaudeCode, Some(CHAT)).await.unwrap();
         assert_ne!(before, started, "a route now serves the chat");
@@ -702,7 +869,7 @@ mod tests {
         *lock(&chosen) = Some("acct-claude-2".into());
         let switched = crew.credential(HarnessId::ClaudeCode, Some(CHAT)).await.unwrap();
         assert_ne!(switched, started);
-        let mut run = request(None, Some("acct-claude-2"));
+        let mut run = request(Some("claude-opus-5-5"), Some("acct-claude-2"));
         crew.prepare(HarnessId::ClaudeCode, Some(CHAT), &mut run).await.unwrap();
         let on_account = crew.credential(HarnessId::ClaudeCode, Some(CHAT)).await.unwrap();
         assert_ne!(on_account, switched);
@@ -714,10 +881,10 @@ mod tests {
 
         // A draft (no row yet: a warm start) is on the route it was given, so
         // its run, prepared the same, finds the warm runtime alike.
-        let mut warm = request(None, Some("acct-claude-1"));
+        let mut warm = request(Some("claude-opus-5-5"), Some("acct-claude-1"));
         crew.prepare(HarnessId::ClaudeCode, Some("draft"), &mut warm).await.unwrap();
         let parked = crew.credential(HarnessId::ClaudeCode, Some("draft")).await.unwrap();
-        let mut run = request(None, Some("acct-claude-1"));
+        let mut run = request(Some("claude-opus-5-5"), Some("acct-claude-1"));
         crew.prepare(HarnessId::ClaudeCode, Some("draft"), &mut run).await.unwrap();
         assert_eq!(run.env, warm.env, "the same route, token and all");
         assert_eq!(crew.credential(HarnessId::ClaudeCode, Some("draft")).await.unwrap(), parked);
@@ -758,17 +925,18 @@ mod tests {
         assert!(CrewInference::for_engine(&config, &auth, static_token()).is_none());
     }
 
-    /// Through the engine's own surface: `ListModels` answers the managed
-    /// catalog without starting a CLI, `ActivateAgentAccount` refuses, a
+    /// Through the engine's own surface: `ListModels` answers the harness's
+    /// own models with the account choice, `ActivateAgentAccount` refuses, a
     /// chat's account comes from its workspace row, and the routes end with
     /// the core.
     #[tokio::test]
-    async fn the_engine_lists_the_managed_catalog_and_refuses_its_own_logins() {
+    async fn the_engine_lists_its_harnesses_models_and_refuses_its_own_logins() {
         let (origin, _fixture, _captured) = agent_auth().await;
         let crew = Arc::new(CrewInference::start(&origin, static_token()).unwrap());
-        // No harnesses: nothing here may start a CLI or reach beyond loopback.
+        // Codex's CLI alone: nothing here reaches beyond loopback.
         let registry = Arc::new(HarnessRegistry::new());
-        registry.set_crew_inference(crew.clone());
+        registry.register(codex_cli());
+        attach(&crew, &registry);
         let dir = tempfile::tempdir().unwrap();
         let core = crate::EngineCore::assemble(dir.path(), registry.clone(), HarnessId::Mock, None).unwrap();
         crew.follow_workspace(core.workspace.clone());
@@ -779,7 +947,8 @@ mod tests {
             .await
             .unwrap();
         let models: Vec<Model> = serde_json::from_value(models).unwrap();
-        assert!(models.iter().any(|model| model.id == "gpt-6-sol" && model.default));
+        assert!(models.iter().any(|model| model.id == "gpt-6.2-sol" && model.default));
+        assert!(models.iter().any(|model| model.id == "gpt-7-nova"));
         let option = models[0].options.iter().find(|option| option.id == ACCOUNT_OPTION).unwrap();
         assert_eq!(option.default_choice, AUTOMATIC);
         assert!(option.choices.iter().any(|choice| choice.id == "acct-openai-1"));
@@ -820,6 +989,20 @@ mod tests {
         let mut run = request(None, None);
         assert!(registry.prepare_run(HarnessId::ClaudeCode, Some(CHAT), &mut run).await.is_err());
         assert!(lock(&crew.chat_configs).is_none(), "the workspace is let go");
+    }
+
+    /// The development switch is `local` by either of Crew's names, and only
+    /// that: managed is every other value, or none.
+    #[test]
+    fn only_the_local_switch_turns_managed_inference_off() {
+        let local = |pairs: &[(&str, &str)]| {
+            local_inference_in(|name| pairs.iter().find(|(key, _)| *key == name).map(|(_, value)| (*value).to_owned()))
+        };
+        assert!(local(&[("ZERON_INFERENCE_MODE", "local")]));
+        assert!(local(&[("COMET_INFERENCE_MODE", " Local ")]));
+        assert!(!local(&[]));
+        assert!(!local(&[("ZERON_INFERENCE_MODE", "managed")]));
+        assert!(!local(&[("COMET_INFERENCE_MODE", "")]));
     }
 
     #[test]

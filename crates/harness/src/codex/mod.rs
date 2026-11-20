@@ -381,6 +381,8 @@ impl CodexHarness {
         let exe = self.resolve_executable()?;
         let mut cmd = Command::new(&exe);
         cmd.arg("app-server");
+        // Crew: a managed engine probes as a managed run launches.
+        crate::crew_inference::managed_probe(HarnessId::Codex, &mut cmd)?;
         crate::compose_child_path(&mut cmd, &exe);
         cmd.stdin(Stdio::piped())
             .stdout(Stdio::piped())

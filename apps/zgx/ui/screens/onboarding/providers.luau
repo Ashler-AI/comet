@@ -35,7 +35,7 @@ end
 local function shown(): { agents.Agent }
 	local out = {}
 	for _, a in now().list do
-		if a.mark and (not crew.on or crew.managed(a.id)) then
+		if a.mark and not crew.hides(a.id) then
 			table.insert(out, a)
 		end
 	end
@@ -178,7 +178,7 @@ local function card(row: State<agents.Agent>): Node
 			end
 		end,
 		-- (A Crew build signs it in itself.)
-		managed = if crew.on
+		managed = if crew.managed(id)
 			then { label = ui.t("crew.providers.managed"), description = ui.t("crew.providers.managed_hint") }
 			else nil,
 	}
@@ -270,7 +270,7 @@ return function(props: Props): Node
 					return ui.t("onboarding.providers.unavailable"):get()
 				elseif k == "install" then
 					return ui.t("onboarding.providers.none"):get()
-				elseif crew.on then
+				elseif crew.managed_inference then
 					return ui.t("crew.providers.found", { n = #installed() }):get()
 				end
 				return ui.t("onboarding.providers.found", { n = #installed() }):get()

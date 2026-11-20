@@ -481,6 +481,28 @@ fn setup_s_agents_are_crew_s() {
     }
 }
 
+/// A Crew build launched with the development switch
+/// (`COMET_INFERENCE_MODE=local`: the host's `crew_managed` off) runs agents
+/// on this device's own logins: setup offers every agent and its own sign-in
+/// again, as Zeron's does.
+#[test]
+fn the_local_switch_offers_own_logins_again() {
+    let mut app = TestApp::new(|runtime| {
+        let host = ScriptHost::new(runtime, ui_dir().join("providers_fixture.luau"));
+        host.window_size(runtime.signal((680., 900.)));
+        host.shared("crew", true);
+        host.shared("crew_managed", false);
+        host
+    });
+    app.ui.scene.borrow_mut().resize(680., 900.);
+    app.frames(30);
+    assert_eq!(app.error(), None);
+    for kept in ["Cursor", "Connect a Claude Code account", "ada@example.com"] {
+        assert!(shows(&mut app, &format!("\"{kept}\"")), "{kept} is missing:\n{}", app.tree());
+    }
+    assert!(!shows(&mut app, "\"On Crew's shared accounts\""), "{}", app.tree());
+}
+
 /// Setup's first screen (ui/crew_signin_fixture.luau): a Crew build's
 /// welcomes to Crew with no account to create and no members' wall; its one
 /// pill signs in, and the quiet action at the left is Cancel, only while

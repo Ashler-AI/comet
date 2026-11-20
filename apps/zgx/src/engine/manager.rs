@@ -401,8 +401,13 @@ fn spawn(config: &Config, bin: &Path) -> std::io::Result<()> {
     zeron_launch::crew::scrub_inherited(&mut command);
     if crate::crew::MODE {
         // Crew: the engine reads its Edge and sign-in from its own
-        // crew-runtime.json (src/crew.rs); this app names neither.
+        // crew-runtime.json (src/crew.rs); this app names neither. Its
+        // inference is managed unless this app was launched with the
+        // development switch.
         command.env_remove("ZERON_EDGE_URL").env_remove("ZERON_WORKOS_CLIENT_ID");
+        if let Some((name, mode)) = crate::crew::engine_inference_mode() {
+            command.env(name, mode);
+        }
     } else {
         command.env("ZERON_EDGE_URL", &config.edge).env("ZERON_WORKOS_CLIENT_ID", &config.client);
     }
