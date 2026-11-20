@@ -23,12 +23,12 @@ M.PRODUCT = ui.shared("crew_product", "Crew (zgx dev)"):peek()
 -- on this device's own logins, as Zeron's do.
 M.managed_inference = M.on and ui.shared("crew_managed", true):peek() ~= false
 
--- The agents a Crew engine runs on Agent Auth: those with a managed route
--- (crates/harness/src/crew_inference.rs `Provider::for_harness`, whose test
--- reads this line). Every other agent fails closed there, so setup and
--- Settings → Providers offer these alone, with nothing of their own to sign
--- in to.
-local MANAGED = { ["claude-code"] = true, ["codex"] = true }
+-- The agents a Crew engine runs on Agent Auth
+-- (crates/harness/src/crew_inference.rs `Provider::managed_harness`, whose
+-- test reads this line); each shows once the engine lists it. Every other
+-- agent fails closed there, so setup and Settings → Providers offer these
+-- alone, with nothing of their own to sign in to.
+local MANAGED = { ["claude-code"] = true, ["codex"] = true, ["omp"] = true }
 
 function M.managed(id: string): boolean
 	return M.managed_inference and MANAGED[id] == true

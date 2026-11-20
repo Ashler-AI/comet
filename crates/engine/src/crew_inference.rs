@@ -194,20 +194,29 @@ impl CrewInference {
 
     /// Whether `harness` runs here at all (its catalog is then worth asking).
     pub(crate) fn serves(&self, harness: HarnessId) -> Result<(), String> {
-        Provider::for_harness(harness).map(|_| ()).ok_or_else(|| unsupported(harness))
+        if Provider::managed_harness(harness) { Ok(()) } else { Err(unsupported(harness)) }
     }
 
     /// `harness`'s own catalog (its CLI's) as a managed engine offers it:
-    /// what Agent Auth can route, each with the account choice. Its default
-    /// is kept for a run that names no model.
+    /// what Agent Auth can route, each with the account choice of its
+    /// provider (OMP's models span two). Its default is kept for a run that
+    /// names no model.
     pub(crate) async fn offer(&self, harness: HarnessId, mut models: Vec<Model>) -> Result<Vec<Model>, String> {
-        let provider = Provider::for_harness(harness).ok_or_else(|| unsupported(harness))?;
+        self.serves(harness)?;
         models.retain(|model| relay::routable(harness, &model.id));
         self.keep_default(harness, &models);
-        let option = account_option(provider, &self.accounts().await);
+        let accounts = self.accounts().await;
+        let mut options: HashMap<&'static str, ModelOption> = HashMap::new();
         for model in &mut models {
+            let Some(provider) = Provider::for_model(harness, &model.id) else {
+                continue;
+            };
+            let option = options
+                .entry(provider.as_str())
+                .or_insert_with(|| account_option(provider, &accounts))
+                .clone();
             model.options.retain(|existing| existing.id != ACCOUNT_OPTION);
-            model.options.push(option.clone());
+            model.options.push(option);
         }
         Ok(models)
     }
@@ -274,7 +283,7 @@ impl RunEnvironment for CrewInference {
         chat_id: Option<&str>,
         request: &mut RunRequest,
     ) -> Result<(), String> {
-        if Provider::for_harness(harness).is_none() {
+        if !Provider::managed_harness(harness) {
             return Err(unsupported(harness));
         }
         let relay = self.relay.as_ref().ok_or_else(|| NOT_CONFIGURED.to_owned())?;
@@ -314,7 +323,9 @@ impl RunEnvironment for CrewInference {
     }
 
     async fn credential(&self, harness: HarnessId, chat_id: Option<&str>) -> Option<String> {
-        Provider::for_harness(harness)?;
+        if !Provider::managed_harness(harness) {
+            return None;
+        }
         let relay = self.relay.as_ref()?;
         let Some(chat) = chat_id else {
             let session = self.title_session(harness);
@@ -416,6 +427,7 @@ fn agent_name(harness: HarnessId) -> &'static str {
         HarnessId::Hermes => "Hermes",
         HarnessId::Fx => "fx",
         HarnessId::Pi => "Pi",
+        HarnessId::Omp => "OMP",
         HarnessId::Opencode => "OpenCode",
         HarnessId::Antigravity => "Antigravity",
         HarnessId::Muse => "Muse",

@@ -497,6 +497,8 @@ pub mod claude;
 pub mod codex;
 /// Crew: a managed (Agent Auth) run's launch contract.
 pub mod crew_inference;
+// Crew: OMP, Crew's build of the Pi coding agent (docs/crew/zgx-thin-port.md).
+pub mod crew_omp;
 pub mod agent_ports;
 pub mod cursor;
 pub(crate) mod executable;
@@ -825,6 +827,7 @@ pub use cursor::CursorHarness;
 pub use opencode::OpencodeHarness;
 pub use muse::MuseHarness;
 pub use pi::PiHarness;
+pub use crew_omp::OmpHarness;
 
 // ---------------------------------------------------------------------------
 // Child lifecycle (shared by the codex and ACP harnesses)

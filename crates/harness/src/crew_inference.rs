@@ -125,11 +125,36 @@ impl Provider {
         }
     }
 
-    /// The provider `harness` reaches through Agent Auth, if it has one.
+    /// The one provider `harness` reaches through Agent Auth, if it has just
+    /// one: Claude Code's and Codex's. (OMP's is its model's: [`Self::for_model`].)
     pub fn for_harness(harness: HarnessId) -> Option<Self> {
         match harness {
             HarnessId::ClaudeCode => Some(Provider::Anthropic),
             HarnessId::Codex => Some(Provider::Openai),
+            _ => None,
+        }
+    }
+
+    /// Whether a managed engine runs `harness` on Agent Auth: Claude Code and
+    /// Codex on their providers, OMP on either, by its model.
+    pub fn managed_harness(harness: HarnessId) -> bool {
+        Self::for_harness(harness).is_some() || harness == HarnessId::Omp
+    }
+
+    /// The provider a managed run of `harness` on `model` reaches: Claude
+    /// Code's and Codex's own, OMP's by its model's provider
+    /// (`anthropic/…`, `openai/…` or `openai-codex/…`, as OMP lists them).
+    pub fn for_model(harness: HarnessId, model: &str) -> Option<Self> {
+        if let Some(provider) = Self::for_harness(harness) {
+            return Some(provider);
+        }
+        if harness != HarnessId::Omp {
+            return None;
+        }
+        let lower = model.trim().to_ascii_lowercase();
+        match lower.split_once('/')?.0 {
+            "anthropic" => Some(Provider::Anthropic),
+            "openai" | "openai-codex" => Some(Provider::Openai),
             _ => None,
         }
     }
@@ -217,17 +242,21 @@ pub fn managed(env: &BTreeMap<String, String>) -> bool {
     env.contains_key(ROUTE_ENV)
 }
 
-/// A managed launch of `harness` needs a sound route for its own provider;
-/// anything else must not start. An unmanaged one passes.
+/// A managed launch of `harness` needs a sound route for its own provider
+/// (OMP: either, its model's, which the engine chose by); anything else must
+/// not start. An unmanaged one passes.
 pub fn validate(harness: HarnessId, env: &BTreeMap<String, String>) -> Result<(), HarnessError> {
     if !managed(env) {
         return Ok(());
     }
-    match (ManagedRoute::from_env(env), Provider::for_harness(harness)) {
-        (Some(route), Some(provider)) if route.provider == provider => Ok(()),
-        _ => Err(HarnessError::Protocol(
-            "This agent can't use the Crew Agent Auth route it was given".into(),
-        )),
+    let fits = ManagedRoute::from_env(env).is_some_and(|route| match Provider::for_harness(harness) {
+        Some(provider) => route.provider == provider,
+        None => Provider::managed_harness(harness),
+    });
+    if fits {
+        Ok(())
+    } else {
+        Err(HarnessError::Protocol("This agent can't use the Crew Agent Auth route it was given".into()))
     }
 }
 
@@ -235,9 +264,12 @@ pub fn validate(harness: HarnessId, env: &BTreeMap<String, String>) -> Result<()
 /// [`STRIPPED`]. The run's own environment is applied after, so the route's
 /// variables are the ones the child sees.
 pub(crate) fn strip_inherited(cmd: &mut Command, env: &BTreeMap<String, String>) {
-    if !managed(env) {
-        return;
+    if managed(env) {
+        strip(cmd);
     }
+}
+
+fn strip(cmd: &mut Command) {
     for key in STRIPPED {
         cmd.env_remove(key);
     }
@@ -313,14 +345,29 @@ pub fn set_managed_discovery(on: bool) {
 }
 
 /// A model probe of `harness` (Claude Code's `initialize`, Codex's
-/// `model/list`), dressed as a managed run when this engine's discovery is
-/// managed; untouched otherwise. Codex's overrides follow its `app-server`.
+/// `model/list`, OMP's `models`), dressed as a managed run when this engine's
+/// discovery is managed; untouched otherwise. Codex's overrides follow its
+/// `app-server`.
 pub(crate) fn managed_probe(harness: HarnessId, cmd: &mut Command) -> Result<(), HarnessError> {
     managed_probe_if(MANAGED_DISCOVERY.load(Ordering::Relaxed), harness, cmd)
 }
 
 fn managed_probe_if(managed: bool, harness: HarnessId, cmd: &mut Command) -> Result<(), HarnessError> {
-    let Some(provider) = Provider::for_harness(harness).filter(|_| managed) else {
+    if !managed {
+        return Ok(());
+    }
+    // OMP lists only the providers it holds a key for: both, as placeholders
+    // on base URLs nothing serves (it reads `*_API_KEY`). Offline and signed
+    // out, 18.22.1 lists 84 Anthropic and OpenAI models so; with none, none.
+    if harness == HarnessId::Omp {
+        strip(cmd);
+        cmd.env("ANTHROPIC_API_KEY", "model-discovery")
+            .env("ANTHROPIC_BASE_URL", DISCOVERY_ORIGIN)
+            .env("OPENAI_API_KEY", "model-discovery")
+            .env("OPENAI_BASE_URL", format!("{DISCOVERY_ORIGIN}/v1"));
+        return Ok(());
+    }
+    let Some(provider) = Provider::for_harness(harness) else {
         return Ok(());
     };
     let env = ManagedRoute {
@@ -519,6 +566,41 @@ mod tests {
         assert!(!envs(&mut codex).values().flatten().any(|value| value == "inherited-secret"));
     }
 
+    /// OMP lists only the providers it holds a key for: its probe gets both,
+    /// as placeholders on base URLs nothing serves, and nothing inherited.
+    #[test]
+    fn a_managed_omp_probe_holds_placeholder_keys_for_both_providers() {
+        let mut omp = Command::new("omp");
+        omp.env("ANTHROPIC_API_KEY", "inherited-secret").env("OMP_AUTH_GATEWAY_TOKEN", "inherited-secret");
+        managed_probe_if(true, HarnessId::Omp, &mut omp).unwrap();
+        let seen = envs(&mut omp);
+        assert_eq!(seen["ANTHROPIC_API_KEY"].as_deref(), Some("model-discovery"));
+        assert_eq!(seen["OPENAI_API_KEY"].as_deref(), Some("model-discovery"));
+        assert_eq!(seen["OPENAI_BASE_URL"].as_deref(), Some("http://127.0.0.1:9/v1"));
+        assert_eq!(seen.get("OMP_AUTH_GATEWAY_TOKEN"), Some(&None));
+        assert!(!seen.values().flatten().any(|value| value == "inherited-secret"));
+    }
+
+    /// OMP runs on either provider, by its model; Claude Code and Codex on
+    /// their own whatever the model says.
+    #[test]
+    fn omp_s_provider_is_its_model_s() {
+        // Crew's rows name it `omp` (chats, sessions, imports).
+        assert_eq!(serde_json::from_value::<HarnessId>(serde_json::json!("omp")).unwrap(), HarnessId::Omp);
+        assert_eq!(HarnessId::Omp.as_str(), "omp");
+        assert!(Provider::managed_harness(HarnessId::Omp));
+        assert!(!Provider::managed_harness(HarnessId::Pi));
+        assert_eq!(Provider::for_model(HarnessId::Omp, "anthropic/claude-opus-5-5"), Some(Provider::Anthropic));
+        assert_eq!(Provider::for_model(HarnessId::Omp, "openai-codex/gpt-6.2-sol"), Some(Provider::Openai));
+        assert_eq!(Provider::for_model(HarnessId::Omp, "google/gemini-3-pro"), None);
+        assert_eq!(Provider::for_model(HarnessId::Omp, "claude-opus-5-5"), None);
+        assert_eq!(Provider::for_model(HarnessId::Codex, "anthropic/claude-opus-5-5"), Some(Provider::Openai));
+        // Either route fits an OMP launch; a single-provider harness only its own.
+        assert!(validate(HarnessId::Omp, &route(Provider::Anthropic).env()).is_ok());
+        assert!(validate(HarnessId::Omp, &route(Provider::Openai).env()).is_ok());
+        assert!(validate(HarnessId::Codex, &route(Provider::Anthropic).env()).is_err());
+    }
+
     /// Unmanaged, or another agent: a probe is upstream's.
     #[test]
     fn an_unmanaged_model_probe_is_untouched() {
@@ -545,7 +627,7 @@ mod tests {
             .expect("crew.luau's MANAGED");
         for harness in HarnessId::ALL {
             let offered = line.contains(&format!("[\"{}\"] = true", harness.as_str()));
-            assert_eq!(offered, Provider::for_harness(harness).is_some(), "{}", harness.as_str());
+            assert_eq!(offered, Provider::managed_harness(harness), "{}", harness.as_str());
         }
     }
 }

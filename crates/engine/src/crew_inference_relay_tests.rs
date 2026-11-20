@@ -1111,6 +1111,12 @@ pub(super) mod tests {
         assert!(routable(HarnessId::Codex, "openai/gpt-6.2-astra"));
         assert!(!routable(HarnessId::Codex, "anthropic/claude-opus-5-5"));
         assert!(!routable(HarnessId::Pi, "gpt-6.2-sol"));
+        // OMP's models name their provider, which picks the route.
+        assert_eq!(inference_binding(HarnessId::Omp, Some("anthropic/claude-opus-5-5")), Some((Provider::Anthropic, "claude-opus-5-5".into())));
+        assert_eq!(inference_binding(HarnessId::Omp, Some("openai/gpt-6.2-sol")), Some((Provider::Openai, "gpt-6.2-sol".into())));
+        assert!(routable(HarnessId::Omp, "openai-codex/gpt-6.2-sol"));
+        assert!(!routable(HarnessId::Omp, "google/gemini-3-pro"));
+        assert!(!routable(HarnessId::Omp, "claude-opus-5-5"), "no provider named");
         for unnamed in [None, Some(""), Some("default")] {
             assert_eq!(inference_binding(HarnessId::Codex, unnamed), None, "{unnamed:?}");
         }

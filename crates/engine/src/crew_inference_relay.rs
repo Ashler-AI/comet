@@ -362,15 +362,17 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 }
 
 /// The provider and provider model a managed `harness` run of `selected_model`
-/// reaches: Claude Code on Anthropic's, Codex on OpenAI's. A run names its
+/// reaches: Claude Code on Anthropic's, Codex on OpenAI's, OMP on its model's
+/// provider's. A run names its
 /// model (its harness's own default when its chat names none:
 /// `CrewInference::prepare`); no model, or another provider's, has no route.
 fn inference_binding(harness: HarnessId, selected_model: Option<&str>) -> Option<(Provider, String)> {
-    let provider = Provider::for_harness(harness)?;
     let selected = selected_model
         .map(str::trim)
         .filter(|value| !value.is_empty() && *value != "default")
         .map(str::to_owned)?;
+    // (OMP's provider is its model's: `anthropic/…`, `openai/…`.)
+    let provider = Provider::for_model(harness, &selected)?;
     let lower = selected.to_ascii_lowercase();
     let own_prefix = match provider {
         Provider::Anthropic => lower.starts_with("anthropic/"),
@@ -571,7 +573,11 @@ impl InferenceRelay {
         harness: HarnessId,
         requested_account_id: Option<&str>,
     ) -> Option<u64> {
-        let provider = Provider::for_harness(harness)?;
+        if !Provider::managed_harness(harness) {
+            return None;
+        }
+        // (OMP's route is on whichever provider its model is.)
+        let provider = Provider::for_harness(harness);
         let state = lock(&self.inner.route_state);
         state
             .active
@@ -579,7 +585,7 @@ impl InferenceRelay {
             .find(|route| {
                 route.session_id() == session_id
                     && route.request.harness == harness
-                    && route.request.provider == provider
+                    && provider.is_none_or(|provider| route.request.provider == provider)
                     && route.request.requested_account_id.as_deref() == requested_account_id
                     && !route.cancellation.is_cancelled()
             })
