@@ -361,6 +361,27 @@ exist, and turns end on `agent_end`, not `agent_settled`. So:
    Anthropic and OpenAI OMP turns from zgx through staging Agent Auth. Then OMP becomes
    a Scaffold engine's default, as in Crew.
 
+Status on 2026-11-20:
+
+- Steps 1–5 are built (`13891d510`, `7128ab04d`). OMP wears Pi's mark. A chat that names
+  no model runs Claude Code's own default on OMP's Anthropic provider.
+- The exit gate passed in the installed canary, through staging Agent Auth:
+  - "OMPPONG" on `comet-anthropic/claude-opus-5-5`, and "OMPOPENAI" on
+    `comet-openai/gpt-6.2-sol`;
+  - `omp --mode rpc --approval-mode yolo --extension …/agent-auth.ts`, with the gateway
+    on the engine's relay and no `COMET_INFERENCE_TOKEN`;
+  - the engine's only outside connection was scaffold-staging.
+- The model was set through the composer's `chat_model` state, because popups weren't
+  opening for the backgrounded app at the time.
+- Settings → Providers shows OMP's managed card. `ListModels` gives 84 models (21
+  Anthropic, 63 OpenAI).
+- Open:
+  - Each OMP turn took about 70 s, against about 3 s for Claude Code on the same relay.
+    Probably OMP's own startup; not looked into yet.
+  - OMP isn't a Scaffold engine's default yet. That's the owner's call, given the
+    latency.
+  - Zeron's MCP tools aren't wired into OMP, as in Crew.
+
 ### Scaffold sandboxes
 
 - Treat a sandbox host as an ordinary peer device (`comet-scaffold-{sandbox}-e{epoch}`)

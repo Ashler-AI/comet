@@ -561,6 +561,8 @@ pub(crate) fn mark(id: &str) -> Option<&'static str> {
         "devin" => "devin",
         "opencode" => "opencode",
         "pi" => "pi",
+        // Crew: OMP, Crew's build of Pi, wears Pi's mark.
+        "omp" => "pi",
         "hermes" => "hermes",
         "antigravity" => "antigravity",
         "muse" => "muse",
