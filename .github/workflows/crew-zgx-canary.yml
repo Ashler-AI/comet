@@ -24,7 +24,9 @@ concurrency:
 
 jobs:
   macos:
-    runs-on: macos-15
+    # (macOS 26: Xcode 26's asset tools, which compile the app icon, need its
+    # frameworks; upstream's zgx build runs on macos-latest too.)
+    runs-on: macos-latest
     timeout-minutes: 180
     env:
       COMET_MACOS_SIGNING_TEAM_ID: ${{ vars.MACOS_SIGNING_TEAM_ID }}
@@ -124,10 +126,11 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          # https://github.com/actions/runner-images/issues/14924 (release.yml's)
+          # https://github.com/actions/runner-images/issues/14924 (release.yml's),
+          # where the image has the packet filter's anchor to hang it on.
           if [[ "$(sudo pfctl -sr)" != *'anchor "com.apple/*"'* ]]; then
-            echo "::error::Expected macOS packet-filter anchor is absent."
-            exit 1
+            echo "::notice::No com.apple packet-filter anchor on this image; ticket delivery left as it is."
+            exit 0
           fi
           printf 'block return out quick proto udp from any to any port 443\n' |
             sudo pfctl -a com.apple/crew-notary -f -
