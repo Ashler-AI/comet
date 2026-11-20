@@ -584,8 +584,18 @@ Decided by the owner on 2026-11-20:
 - [ ] 6. Scaffold
 - [ ] 7. Packaging
   - Local half: `scripts/crew/package-zgx-app` (ad-hoc signed, no updater) and
-    `scripts/crew/local-backend`; see "Testing an installed build". The signed
-    build from CI still needs approval.
+    `scripts/crew/local-backend`; see "Testing an installed build".
+  - Signed builds (approved 2026-11-20): push a `crew-zgx-canary-*` tag.
+    `.github/workflows/crew-zgx-canary.yml` builds in release on `macos-latest`. It
+    needs macOS 26 and Xcode 26: Xcode 26's actool, which compiles the app icon, crashes
+    on macOS 15. The package script signs with Crew's Developer ID and notarizes and
+    staples through Crew's release secrets. The zipped app is the run's artifact, kept
+    14 days.
+  - First: `crew-zgx-canary-20261120-3` (run 44783173811, from `de41c5145`). A 195 MB
+    app. Checked on a Mac: `spctl` "accepted, source=Notarized Developer ID", the
+    staple valid, team 825LYXGJR6. To install, unzip it into /Applications.
+  - No updater yet: About's "Crew updates itself" overstates it. The app asks its Edge's
+    `/releases`, which the local Edge refuses.
   - Packaged 2026-11-19 from `9bca77d5c`: 361 MB debug bundle, `zeron` and
     `zeron-engine` 0.3.9, both the canary flavour.
   - Repackaged from `8df181726` (358 MB, without Parallax scenes) and driven again:
