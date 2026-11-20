@@ -376,10 +376,13 @@ Status on 2026-11-20:
 - Settings → Providers shows OMP's managed card. `ListModels` gives 84 models (21
   Anthropic, 63 OpenAI).
 - Open:
-  - Each OMP turn took about 70 s, against about 3 s for Claude Code on the same relay.
-    Probably OMP's own startup; not looked into yet.
-  - OMP isn't a Scaffold engine's default yet. That's the owner's call, given the
-    latency.
+  - Speed: a turn in an existing OMP chat answered in about 4 s by the wall clock, and
+    OMP's journal put its own turn at 2 s. The devtools `wait`'s "met after" figures
+    (70 s, 34 s) overstate time for a backgrounded window, as they did for Codex. Command
+    and skill discovery in the project's worktree take 3 s and 1 s.
+  - OMP isn't the default yet. In zgx the composer names each new chat's agent (the
+    engine's `default_harness` only fills chats without a config row), so making OMP the
+    default means changing what every new chat starts on: the owner's call.
   - Zeron's MCP tools aren't wired into OMP, as in Crew.
 
 ### Scaffold sandboxes
