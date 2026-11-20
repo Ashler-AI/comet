@@ -332,6 +332,35 @@ Deferred:
     provider, if any, aren't blocked; the isolated home has no such login unless one is
     made there.
 
+### OMP (the Agent Auth phase's remainder)
+
+Crew's default agent under Scaffold is OMP, Crew's build of the Pi coding agent
+(`omp`, oh-my-pi). Upstream has no OMP harness. Its Pi driver can't drive OMP: against
+`omp` 18.22.1, `--no-themes` and `--session-id` aren't OMP flags, `get_commands` doesn't
+exist, and turns end on `agent_end`, not `agent_settled`. So:
+
+1. `HarnessId::Omp` (slug `omp`), with its arms in upstream's matches. Crew rows that
+   name `omp` must deserialize.
+2. A Crew driver, `crates/harness/src/crew_omp/` (Crew main's `omp/` trimmed to managed
+   turns): RPC startup on its `ready` frame (chunked frames when offered), `agent_end`,
+   goal and todo rows, host-tool replies, `--mode rpc --approval-mode yolo`, `--resume`,
+   the screenshot cap (Agent Auth's 8 MiB), and every model role pinned to the routed
+   model. Left out for now: the supervisor (upstream reaps agents), the journal writer
+   check, fork, Google, and the sandbox profile.
+3. The managed route chosen per model, not per harness: an OMP model's provider
+   (`anthropic/…` or `openai/…`) picks the relay route. The relay already serves
+   `/v1/models`, `/v1/messages` and `/v1/responses` with bearer or `x-api-key`. OMP gets
+   `auth_gateway.ts` (`comet-anthropic` and `comet-openai` providers on the relay), with
+   its guard exiting rather than throwing, and never `COMET_INFERENCE_TOKEN`.
+4. Native model lists: `omp models --json`, probed as a managed launch (placeholder
+   `ANTHROPIC_API_KEY`/`OPENAI_API_KEY`, base URLs nothing serves). Offline and signed
+   out, 18.22.1 lists 84 Anthropic and OpenAI models, `claude-opus-5-5` and `gpt-6.2-sol`
+   among them. With nothing set it lists none. Rows carry `cost`, so titles can take the
+   cheapest. No row is marked default.
+5. `omp` in `MANAGED` (crew.luau), its mark, ported tests, and the exit gate: real
+   Anthropic and OpenAI OMP turns from zgx through staging Agent Auth. Then OMP becomes
+   a Scaffold engine's default, as in Crew.
+
 ### Scaffold sandboxes
 
 - Treat a sandbox host as an ordinary peer device (`comet-scaffold-{sandbox}-e{epoch}`)
