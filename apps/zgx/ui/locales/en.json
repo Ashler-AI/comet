@@ -3975,6 +3975,9 @@
       "managed": "On Crew's shared accounts",
       "managed_hint": "Agent Auth signs it in: there's no account to connect.",
       "found": "{n, plural, one {Found # agent on this computer. It runs on Crew's shared accounts.} other {Found # agents on this computer. They run on Crew's shared accounts.}}"
+    },
+    "account": {
+      "sign_out_title": "Sign out of Crew?"
     }
   }
 }

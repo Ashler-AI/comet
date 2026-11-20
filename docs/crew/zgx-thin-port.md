@@ -418,6 +418,9 @@ open -g -n --env ZGX_INSPECT_SOCKET=1 --env ZGX_RENDER_WHEN_COVERED=1 --env ZGX_
     holds to `managed_models`). Each card says "On Crew's shared accounts" in place of
     accounts, connect rows and API keys. There's no other agent to install and no
     registry.
+  - Found on the re-run. Crew's account page offered signing keys, which always
+    failed ("Couldn't load your signing keys"): a Crew engine keeps no plugin-key
+    directory. The section is gone, and signing out asks "Sign out of Crew?".
 - Not findings, on a second look:
   - `zeron/` worktree branches are Crew main's too (`crates/engine/src/repos.rs`).
   - The managed Claude catalog has Fable 5.2: upstream's `static_models()` lists all

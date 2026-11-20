@@ -365,12 +365,19 @@ fn settings_have_no_members_and_no_profile_edits() {
     app.click("#settings-nav >> role:tab \"Account\"");
     app.frames(30);
     assert_eq!(app.error(), None);
-    for gone in ["Photo", "Name", "Title", "Username", "Save changes", "Delete account", "Claim a username"] {
+    // (No signing keys either: a Crew engine keeps no plugin-key directory.)
+    for gone in ["Photo", "Name", "Title", "Username", "Save changes", "Delete account", "Claim a username", "Signing keys"] {
         assert!(!shows(&mut app, &format!("#settings-page >> \"{gone}\"")), "{gone} shows:\n{}", app.tree());
     }
     for kept in ["Signed in as", "ada@example.net", "Signed in on", "Sign out"] {
         assert!(shows(&mut app, &format!("#settings-page >> \"{kept}\"")), "{kept} is missing:\n{}", app.tree());
     }
+    // Signing out asks to sign out of Crew.
+    app.click("#settings-page >> role:button \"Sign out\"");
+    app.frames(20);
+    assert!(shows(&mut app, "role:dialog \"Sign out of Crew?\""), "{}", app.tree());
+    app.click("role:dialog \"Sign out of Crew?\" >> role:button \"Cancel\"");
+    app.frames(20);
     // Where the session works: the project, as the engine says.
     assert!(app.tree().contains("In org_1."), "{}", app.tree());
     // Nothing the design lint finds on it.

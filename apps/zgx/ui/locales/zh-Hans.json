@@ -3975,6 +3975,9 @@
       "managed": "使用 Crew 的共享账户",
       "managed_hint": "由 Agent Auth 登录，无需连接账户。",
       "found": "{n, plural, other {在此电脑上找到 # 个智能体，均使用 Crew 的共享账户运行。}}"
+    },
+    "account": {
+      "sign_out_title": "退出登录 Crew？"
     }
   }
 }

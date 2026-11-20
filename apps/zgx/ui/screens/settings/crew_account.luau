@@ -2,10 +2,11 @@
 -- place: its id is `profile`, so the sidebar foot's you opens it and
 -- `settings/account` lands here. Whom you're signed in as, with Scaffold,
 -- and the project your sessions work in; the computers they sync across;
--- the keys your devices sign with; and signing out (out of plugins' reach:
--- it ends the engine's session and opens setup again). Nothing of a Zeron
--- account to edit: no name, title or photo, no username or card, and no
--- deleting the account from here.
+-- and signing out (out of plugins' reach: it ends the engine's session and
+-- opens setup again). Nothing of a Zeron account to edit: no name, title or
+-- photo, no username or card, and no deleting the account from here. No
+-- signing keys either: a Crew engine keeps no plugin-key directory, since
+-- Crew's Edge has none (crates/engine/src/lib.rs).
 
 local host = require("@app/screens/settings/host")
 local ds = require("@ds")
@@ -13,8 +14,6 @@ local auth = require("@account/auth")
 local sessions = require("@account/sessions")
 local store = require("@app/screens/settings/store")
 local search = require("@app/screens/settings/search")
-local visits = require("@app/screens/settings/visits")
-local signing_keys = require("@app/screens/settings/signing_keys")
 local device_icon = require("@app/screens/settings/devices").icon
 
 local M = {}
@@ -27,7 +26,6 @@ M.TITLE = "Account"
 search.index(M.ID, ui.t("settings.profile.title"), ui.t("settings.profile.terms"), {
 	{ key = "email", title = ui.t("settings.profile.email.label"), terms = ui.t("settings.profile.email.terms") },
 	{ key = "devices", title = ui.t("settings.profile.devices.label"), terms = ui.t("settings.profile.devices.terms") },
-	{ key = "signing_keys", title = ui.t("settings.profile.keys.label"), terms = ui.t("settings.profile.keys.terms") },
 	{ key = "sign_out", title = ui.t("settings.profile.sign_out.label"), terms = ui.t("settings.profile.sign_out.terms") },
 })
 
@@ -59,11 +57,6 @@ local function signed_out(): boolean
 end
 
 function M.view(): Node
-	visits.once("profile", function()
-		if auth.signed_in:peek() then
-			signing_keys.load(true)
-		end
-	end)
 	-- Where you're signed in: your devices, not Cloud sessions' machines.
 	local devices = ui.computed(function(): { sessions.Device }
 		return sessions.computers(sessions.devices:get())
@@ -126,7 +119,6 @@ function M.view(): Node
 					}
 				)
 			),
-			ui.show(auth.signed_in, search.anchor("signing_keys", signing_keys.section())),
 			-- Signing out, last: out of plugins' reach. Signed out, the way in
 			-- (setup, as signing out leaves you).
 			ui.column {
@@ -174,7 +166,7 @@ function M.view(): Node
 		},
 		ds.Dialog {
 			open = confirming,
-			title = ui.t("settings.profile.sign_out.confirm_title"),
+			title = ui.t("crew.account.sign_out_title"),
 			body = ui.t("settings.profile.sign_out.confirm_body"),
 			tone = "danger",
 			confirm = { label = ui.t("settings.profile.sign_out.label"), on_click = sign_out },
