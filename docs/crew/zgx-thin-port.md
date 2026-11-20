@@ -482,6 +482,23 @@ open -g -n --env ZGX_INSPECT_SOCKET=1 --env ZGX_RENDER_WHEN_COVERED=1 --env ZGX_
   - Since the merge: "Keep chats on this device" (upstream #1432) is refused in
     Crew mode and left out of Settings → General, since a Crew engine's scope
     comes from its Scaffold session.
+  - The end-to-end findings fixed (run record above), at `8df181726`:
+    - `cargo test --bin zeron-zgx`: 764 passed, 0 failed, 33 ignored. That includes
+      the new `crew::` tests: Crew's welcome (`ui/crew_signin_fixture.luau`), setup's
+      agents, Settings → Providers, the Crew heading, no star chip, and the account
+      page's sign-out.
+    - The integration tests `design_lint` 1, `leftovers` 3, `onboarding_continue_ink`
+      1, `reload` 16 and `sidebar_row_ink` 1 pass at `ff2b87b68`. `design_lint` and
+      `leftovers` pass again after the account page change.
+    - `cargo test -p zeron-cli -p zeron-harness --lib -- crew`: 7 and 8 passed. That
+      includes `the_app_offers_the_agents_crew_runs` and the packaging check.
+    - Upstream's Luau UI tests: 1,470 tests, 0 failed. The command was
+      `scripts/ci/test-zgx.sh ui` with the zgx CLI built at the pinned rev from
+      cargo's checkout, using that checkout's `.cargo/config.toml`.
+  - Still Zeron's in Crew mode: 143 English messages that name Zeron (About's
+    updates, the Plugins page and others), the menu's "Use Zeron v3", and the host
+    toast layer's accessible name. That needs a copy pass, which is the owner's call
+    because of upstream conflicts.
 - [ ] 5. Agent Auth: built and unit-tested on 2026-11-19; merged from
   `crew/zgx-thin-port-agent-auth`.
   - `cargo test -p zeron-harness --lib crew_inference`: 7 passed. These cover the
@@ -500,6 +517,10 @@ open -g -n --env ZGX_INSPECT_SOCKET=1 --env ZGX_RENDER_WHEN_COVERED=1 --env ZGX_
     build from CI still needs approval.
   - Packaged 2026-11-19 from `9bca77d5c`: 361 MB debug bundle, `zeron` and
     `zeron-engine` 0.3.9, both the canary flavour.
+  - Repackaged from `8df181726` (358 MB, without Parallax scenes) and driven again:
+    - Crew's welcome, then "Sign in" through Scaffold staging.
+    - Setup's agents, Settings → Providers, the Crew heading and the account page.
+    - A Claude Code turn on Agent Auth ("PONG3", Opus 5.5, through the engine's relay).
   - Its engine, started headless in a scratch data dir, served IPC within 2 s.
     It answered `EngineInfo` with `zgx-interface-v1` among its capabilities, and
     `AuthStatus` as `signedOut`.
