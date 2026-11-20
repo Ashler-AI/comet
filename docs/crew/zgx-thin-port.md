@@ -699,6 +699,9 @@ Decided by the owner on 2026-11-20:
     staple valid, team 825LYXGJR6. To install, unzip it into /Applications.
   - With OMP: `crew-zgx-canary-20261120-4` (run 44793705345, from `e7d17b9cb`). 196 MB,
     notarized, the staple valid.
+  - With shared accounts: `crew-zgx-canary-20261120-5` (run 44828398975, from
+    `c0856a4f5`, 38 minutes). An 86 MB zip; `spctl` "accepted, source=Notarized
+    Developer ID", the staple valid, `CrewSourceCommit` the tag's commit.
   - No updater yet: About's "Crew updates itself" overstates it. The app asks its Edge's
     `/releases`, which the local Edge refuses.
   - Packaged 2026-11-19 from `9bca77d5c`: 361 MB debug bundle, `zeron` and
