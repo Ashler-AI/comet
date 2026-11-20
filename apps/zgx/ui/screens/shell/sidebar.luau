@@ -773,13 +773,15 @@ end
 -- landing page links.
 local REPO = "https://github.com/zeronsh/comet"
 local starred = ui.persist("shell_star_banner_dismissed", false)
+-- (Never in a Crew build: Zeron's repository isn't Crew's to ask for.)
+local crew_build = require("@account/crew").on
 function star(): Node
 	local function away()
 		starred:set(true)
 	end
 	return ui.show(
 		function(): boolean
-			return not starred:get()
+			return not crew_build and not starred:get()
 		end,
 		-- A chip of the accent, a row's corner: its × as far from the chip's
 		-- edge at the end as from its top and foot, concentric.

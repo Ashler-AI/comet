@@ -19,9 +19,15 @@
 --
 -- The gallery's Sign in example draws this screen, with its other walls to
 -- compare and the states sign-in can be in (waiting on the browser, failed).
+--
+-- A Crew build's (ui/account/crew.luau) welcomes to Crew: its sign-in is
+-- the only way to an account (there's none to make here), so the pill signs
+-- in and the quiet action at the left is only Cancel while it waits; and no
+-- wall, since a Crew account has no member's card.
 
 local ds = require("@ds")
 local state = require("./state")
+local crew = require("@account/crew")
 local Onboarding = ds.Onboarding
 
 local M = {}
@@ -63,12 +69,18 @@ local MEMBERS = M.MEMBERS
 -- before "to", so the product's name keeps its preposition and neither line
 -- ends on a small word.
 -- (Messages: they follow the language chosen.)
-local TITLE = ui.t("onboarding.signin.title")
-local LINES = {
-	ui.t("onboarding.signin.lines.phone"),
-	ui.t("onboarding.signin.lines.machines"),
-	ui.t("onboarding.signin.lines.cloud"),
-}
+local TITLE = if crew.on then ui.t("crew.signin.title") else ui.t("onboarding.signin.title")
+local LINES = if crew.on
+	then {
+		ui.t("crew.signin.lines.agents"),
+		ui.t("crew.signin.lines.chats"),
+		ui.t("crew.signin.lines.account"),
+	}
+	else {
+		ui.t("onboarding.signin.lines.phone"),
+		ui.t("onboarding.signin.lines.machines"),
+		ui.t("onboarding.signin.lines.cloud"),
+	}
 
 -- The words' column, no narrower than the title's widest word at display
 -- size ("Welcome" at 170): a word never breaks inside itself; and no wider
@@ -171,10 +183,20 @@ function M.wall(): Wall
 	}
 end
 
+-- No wall (a Crew build's): the words alone.
+function M.no_wall(): Wall
+	return {
+		build = function()
+			return ui.div {}
+		end,
+		intrudes = 0,
+	}
+end
+
 function M.screen(props: Props?): Node
 	local p: Props = props or {}
 	local status = p.status or ui.state("signin_status", "ready")
-	local walls = p.walls or { one = M.wall }
+	local walls = p.walls or { one = if crew.on then M.no_wall else M.wall }
 	local direction = p.direction or ui.state("signin_wall", "one")
 	-- What the state says, under the lines: nothing while ready.
 	local function said(): string
@@ -235,22 +257,27 @@ function M.screen(props: Props?): Node
 		local kept = walls[direction:get()]().intrudes + pad
 		return math.max(WORD, math.min(MEASURE + pad, (room.width or 680 - 2 * inset) - kept))
 	end
+	local lead = Onboarding.Quiet {
+		label = function()
+			return if status:get() == "waiting" then ui.t("common.cancel"):get() else ui.t("onboarding.signin.have_account"):get()
+		end,
+		on_click = function()
+			local go = if status:peek() == "waiting" then p.on_cancel else p.on_existing
+			if go then
+				go()
+			end
+		end,
+	}
 	return Onboarding.Step {
 		center = true,
 		-- (Each ghost pill's words stand on the window's inset plus its pad,
 		-- its wash hanging out past it: the lines' edge and the label's are
 		-- one.)
-		lead = Onboarding.Quiet {
-			label = function()
-				return if status:get() == "waiting" then ui.t("common.cancel"):get() else ui.t("onboarding.signin.have_account"):get()
-			end,
-			on_click = function()
-				local go = if status:peek() == "waiting" then p.on_cancel else p.on_existing
-				if go then
-					go()
-				end
-			end,
-		},
+		lead = if crew.on
+			then ui.show(function()
+				return status:get() == "waiting"
+			end, lead)
+			else lead,
 		aside = Onboarding.Quiet { label = ui.t("onboarding.skip_for_now") :: any, on_click = p.on_skip },
 		continue = {
 			label = function()
@@ -258,12 +285,13 @@ function M.screen(props: Props?): Node
 				return if s == "waiting"
 					then ui.t("onboarding.signin.waiting_browser"):get()
 					elseif s == "failed" then ui.t("onboarding.try_again"):get()
+					elseif crew.on then ui.t("crew.signin.sign_in"):get()
 					else ui.t("onboarding.signin.create"):get()
 			end,
 			disabled = function()
 				return status:get() == "waiting"
 			end,
-			on_click = p.on_create,
+			on_click = if crew.on then p.on_existing else p.on_create,
 		},
 		-- The wall first, under the words: laid over the window in a box of
 		-- its own that takes no room in the screen's column (so the words are

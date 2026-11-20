@@ -406,13 +406,22 @@ open -g -n --env ZGX_INSPECT_SOCKET=1 --env ZGX_RENDER_WHEN_COVERED=1 --env ZGX_
   local. The engine's only outbound connections were to scaffold-staging's address
   (Agent Auth).
 - Found and fixed: the canary shared `crew-zgx-dev`'s app data (`0bda58b98`).
-- Found, not fixed (slice 4 and 5 follow-ups):
-  - Setup's first screen, the member cards, "Star on GitHub", Settings' "Zeron" heading,
-    Parallax scenes' copy and `zeron/` worktree branches are still Zeron's.
-  - Setup's agents step and Settings → Providers still offer to connect this Mac's own
-    agent logins and to install other agents. Managed runs refuse all of these.
-  - The managed Claude catalog is upstream's list (Fable 5.1 and 5, Opus 5.5, 4.8 and
-    4.7, Sonnet 5.5), without Crew's Fable 5.2.
+- Found, then fixed in Crew mode (`ui/account/crew.luau` the switch):
+  - Setup's first screen was Zeron's. It now welcomes to Crew: Crew's lines, no
+    member-card wall, one "Sign in" pill, and Cancel only while the browser has
+    the sign-in. There's no "Create an account" or "I already have an account".
+  - Zeron's "Star on GitHub" sidebar chip is gone. Settings' last heading reads
+    "Crew"; it is still the `Zeron` group, so plugin pages keep listing ahead of it.
+  - The bundle leaves out the Parallax scenes plugin, which is Zeron's member-card art.
+  - Setup's agents step and Settings → Providers show only the agents a Crew engine
+    runs (`MANAGED`, which the harness's `the_app_offers_the_agents_crew_runs` test
+    holds to `managed_models`). Each card says "On Crew's shared accounts" in place of
+    accounts, connect rows and API keys. There's no other agent to install and no
+    registry.
+- Not findings, on a second look:
+  - `zeron/` worktree branches are Crew main's too (`crates/engine/src/repos.rs`).
+  - The managed Claude catalog has Fable 5.2: upstream's `static_models()` lists all
+    10 models. The picker showed only the rows it had mounted.
 
 ## Decisions for the owner
 

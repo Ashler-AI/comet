@@ -3960,5 +3960,21 @@
       "imported_toast": "{count, plural, one {已导入主题} other {已导入 # 个主题}}",
       "imported_body": "它在“你的”中。"
     }
+  },
+  "crew": {
+    "signin": {
+      "title": "欢迎使用\nCrew",
+      "lines": {
+        "agents": "你的智能体使用 Crew 的共享账户运行。",
+        "chats": "你的聊天在各台电脑间保持同步。",
+        "account": "使用 Scaffold 登录以开始。"
+      },
+      "sign_in": "登录"
+    },
+    "providers": {
+      "managed": "使用 Crew 的共享账户",
+      "managed_hint": "由 Agent Auth 登录，无需连接账户。",
+      "found": "{n, plural, other {在此电脑上找到 # 个智能体，均使用 Crew 的共享账户运行。}}"
+    }
   }
 }

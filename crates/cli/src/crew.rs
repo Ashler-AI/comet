@@ -196,12 +196,14 @@ mod tests {
         }
     }
 
-    /// The packaged canary's bundle is named, and built, as this flavour.
+    /// The packaged canary's bundle is named, and built, as this flavour,
+    /// without Zeron's member-card scenes.
     #[test]
     fn the_packaged_canary_is_the_canary_flavour() {
         let script = include_str!("../../../scripts/crew/package-zgx-app");
         assert!(script.contains(&format!("APP_NAME=\"{CANARY_PRODUCT}\"")), "the bundle's name");
         assert!(script.contains("FLAVOR=zgx-canary"), "built as the canary");
+        assert!(script.contains("--exclude '/parallax-scenes/'"), "no member-card scenes");
     }
 
     #[test]

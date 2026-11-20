@@ -297,6 +297,10 @@ export type CardProps = {
 	keys_here: (() -> boolean)?,
 	key_request: (() -> string?)?,
 	key_request_seen: (() -> ())?,
+	-- An agent signed in for you (a Crew build's: on Crew's shared
+	-- accounts): the row that says so, in place of its accounts and the way
+	-- to add one.
+	managed: { label: string | Message, description: (string | Message)? }?,
 }
 
 export type LoginMethod = {
@@ -1529,6 +1533,21 @@ function M.Card(c: CardProps): Node
 		else function()
 			return (given :: string?) or "idle"
 		end
+	-- An agent signed in for you: who signs it in, and no accounts to add.
+	if c.managed then
+		return Settings.Group {
+			ui.column {
+				w_full = true,
+				head,
+				rule(),
+				Settings.Row {
+					label = c.managed.label,
+					description = c.managed.description,
+					lead = M.disc(Icon { name = "shield-check", size = 16 }),
+				},
+			},
+		}
+	end
 	-- An agent with a login per model provider: its accounts, a provider's
 	-- together, and its add rows at the foot.
 	if c.groups then

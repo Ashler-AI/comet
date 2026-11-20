@@ -82,10 +82,11 @@ plutil -convert xml1 "$plist"
 plutil -lint "$plist" >/dev/null
 
 # The scripts and the built-in plugins, as upstream's bundle carries them
-# (scripts/package-zgx-macos.sh): not zgx's generated types or the tests.
+# (scripts/package-zgx-macos.sh): not zgx's generated types or the tests,
+# and not Zeron's member-card scenes (a Crew account has no member's card).
 rsync -a --exclude '.zgx/' --exclude '/tests/' --exclude '.lock' --exclude '.DS_Store' \
   "$root/apps/zgx/ui/" "$app/Contents/Resources/ui/"
-rsync -a --exclude '.zgx/' --exclude '.DS_Store' \
+rsync -a --exclude '.zgx/' --exclude '.DS_Store' --exclude '/parallax-scenes/' \
   "$root/apps/zgx/plugins-builtin/" "$app/Contents/Resources/plugins-builtin/"
 for dir in "$app/Contents/Resources/plugins-builtin/"*/; do
   cp "$root/apps/zgx/plugins-sdk/zeron.luau" "$dir/zeron.luau"

@@ -3960,5 +3960,21 @@
       "imported_toast": "{count, plural, one {Theme imported} other {# themes imported}}",
       "imported_body": "It's under Yours."
     }
+  },
+  "crew": {
+    "signin": {
+      "title": "Welcome\nto Crew",
+      "lines": {
+        "agents": "Your agents run on Crew's shared accounts.",
+        "chats": "Your chats stay in step across your computers.",
+        "account": "Sign in with Scaffold to begin."
+      },
+      "sign_in": "Sign in"
+    },
+    "providers": {
+      "managed": "On Crew's shared accounts",
+      "managed_hint": "Agent Auth signs it in: there's no account to connect.",
+      "found": "{n, plural, one {Found # agent on this computer. It runs on Crew's shared accounts.} other {Found # agents on this computer. They run on Crew's shared accounts.}}"
+    }
   }
 }

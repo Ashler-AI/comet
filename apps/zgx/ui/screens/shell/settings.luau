@@ -182,7 +182,13 @@ local function title_of(id: string, title: string): string
 	local known = TITLE_KEYS[id]
 	return if known and known[1] == title then ui.t(known[2]):get() else title
 end
+-- (A Crew build's About is under Crew: ui/account/crew.luau. Still the
+-- "Zeron" group, so pages that come and go list ahead of it.)
+local crew_build = require("@account/crew").on
 local function group_of(group: string): string
+	if crew_build and group == EXTRAS_BEFORE then
+		return "Crew"
+	end
 	local key = GROUP_KEYS[group]
 	return if key then ui.t(key):get() else group
 end

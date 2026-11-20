@@ -307,24 +307,42 @@ fn setup_without_the_flag_is_zeron_s() {
     assert_eq!(app.text("#result"), "ok");
 }
 
-/// The main window's shell (ui/shell_fixture.luau, Settings' calls answered
-/// by ui/settings_stub.luau) signed in, on Settings.
-fn settings(crew: bool) -> TestApp {
+/// A fixture under ui/ mounted `w` by `h`, with the host's `crew` flag or
+/// without it.
+fn mount(fixture: &str, crew: bool, (w, h): (f32, f32)) -> TestApp {
     let app = TestApp::new(|runtime| {
-        let host = ScriptHost::new(runtime, ui_dir().join("shell_fixture.luau"));
-        host.window_size(runtime.signal((1200., 900.)));
+        let host = ScriptHost::new(runtime, ui_dir().join(fixture));
+        host.window_size(runtime.signal((w, h)));
         if crew {
             host.shared("crew", true);
         }
         host
     });
-    app.ui.scene.borrow_mut().resize(1200., 900.);
+    app.ui.scene.borrow_mut().resize(w, h);
     app.frames(30);
-    assert_eq!(app.error(), None, "the shell failed to load");
+    assert_eq!(app.error(), None, "{fixture} failed to load");
+    app
+}
+
+/// The main window's shell (ui/shell_fixture.luau, Settings' calls answered
+/// by ui/settings_stub.luau).
+fn shell(crew: bool) -> TestApp {
+    mount("shell_fixture.luau", crew, (1200., 900.))
+}
+
+/// The shell signed in, on Settings.
+fn settings(crew: bool) -> TestApp {
+    let app = shell(crew);
     assert!(app.host.run_command("settings_stub.sign_in"));
     assert!(app.host.run_command("shell.settings"));
     app.frames(20);
     app
+}
+
+/// What the design lint found as it built (nothing, for a screen that keeps
+/// the design system's rules).
+fn lint(app: &TestApp) -> Vec<String> {
+    app.host.warnings().into_iter().filter(|w| w.contains("design lint")).collect()
 }
 
 /// Whether anything matches `target`: one node or several (`find` says
@@ -356,8 +374,10 @@ fn settings_have_no_members_and_no_profile_edits() {
     // Where the session works: the project, as the engine says.
     assert!(app.tree().contains("In org_1."), "{}", app.tree());
     // Nothing the design lint finds on it.
-    let lint: Vec<String> = app.host.warnings().into_iter().filter(|w| w.contains("design lint")).collect();
-    assert!(lint.is_empty(), "{lint:#?}");
+    assert!(lint(&app).is_empty(), "{:#?}", lint(&app));
+    // About is under Crew's heading, not Zeron's, and still last.
+    assert!(shows(&mut app, "#settings-nav >> \"Crew\""), "{}", app.tree());
+    assert!(!shows(&mut app, "#settings-nav >> \"Zeron\""), "{}", app.tree());
     app.click("#settings-nav >> role:tab \"About & updates\"");
     app.frames(30);
     assert!(shows(&mut app, "#settings-page >> \"Crew (zgx dev)\""), "{}", app.tree());
@@ -387,6 +407,15 @@ fn settings_have_no_members_and_no_profile_edits() {
 fn settings_without_the_flag_are_zeron_s() {
     let mut app = settings(false);
     assert!(shows(&mut app, "#settings-nav >> role:tab \"Members\""), "{}", app.tree());
+    assert!(shows(&mut app, "#settings-nav >> \"Zeron\""), "{}", app.tree());
+    assert!(!shows(&mut app, "#settings-nav >> \"Crew\""), "{}", app.tree());
+    // Providers: an account to connect, and more agents to add.
+    app.click("#settings-nav >> role:tab \"Providers\"");
+    app.frames(30);
+    for kept in ["Connect a Claude Code account", "More agents", "Add another agent"] {
+        assert!(shows(&mut app, &format!("#settings-page >> \"{kept}\"")), "{kept} is missing:\n{}", app.tree());
+    }
+    assert!(!shows(&mut app, "#settings-page >> \"On Crew's shared accounts\""), "{}", app.tree());
     app.click("#settings-nav >> role:tab \"Account\"");
     app.frames(30);
     for kept in ["Photo", "Name", "Username", "Save changes", "Delete account"] {
@@ -399,4 +428,86 @@ fn settings_without_the_flag_are_zeron_s() {
     app.type_text("#settings-nav >> #settings-search", "members");
     app.frames(10);
     assert!(shows(&mut app, "#settings-search-results >> \"Members\""), "{}", app.tree());
+}
+
+/// Crew's Settings → Providers: the agents it runs, each signed in by Crew
+/// (no account to connect, no key to type), and no more agents to add.
+#[test]
+fn providers_are_crew_s() {
+    let mut app = settings(true);
+    app.click("#settings-nav >> role:tab \"Providers\"");
+    app.frames(30);
+    assert_eq!(app.error(), None);
+    for kept in ["Claude Code", "On Crew's shared accounts"] {
+        assert!(shows(&mut app, &format!("#settings-page >> \"{kept}\"")), "{kept} is missing:\n{}", app.tree());
+    }
+    for gone in ["Connect a Claude Code account", "More agents", "Add another agent"] {
+        assert!(!shows(&mut app, &format!("#settings-page >> \"{gone}\"")), "{gone} shows:\n{}", app.tree());
+    }
+    // The search finds no more agents to add.
+    app.type_text("#settings-nav >> #settings-search", "install");
+    app.frames(10);
+    assert!(!shows(&mut app, "#settings-search-results >> \"More agents\""), "{}", app.tree());
+    assert!(lint(&app).is_empty(), "{:#?}", lint(&app));
+}
+
+/// Setup's Your agents (ui/providers_fixture.luau: six agents on this
+/// computer, Codex with an account of its own): a Crew build's shows the two
+/// it runs, signed in by Crew, and says so.
+#[test]
+fn setup_s_agents_are_crew_s() {
+    let mut app = mount("providers_fixture.luau", true, (680., 900.));
+    for kept in ["Claude Code", "Codex"] {
+        assert!(shows(&mut app, &format!("\"{kept}\"")), "{kept} is missing:\n{}", app.tree());
+    }
+    for gone in ["Cursor", "Grok", "Devin", "Pi", "Connect a Claude Code account", "Add account", "ada@example.com"] {
+        assert!(!shows(&mut app, &format!("\"{gone}\"")), "{gone} shows:\n{}", app.tree());
+    }
+    // (By its whole text: the tree cuts a long one short.)
+    let found = "\"Found 2 agents on this computer. They run on Crew's shared accounts.\"";
+    assert!(shows(&mut app, found), "{}", app.tree());
+    assert!(lint(&app).is_empty(), "{:#?}", lint(&app));
+    // Without the flag, every agent found, and the way to connect one.
+    let mut zeron = mount("providers_fixture.luau", false, (680., 900.));
+    for kept in ["Cursor", "Connect a Claude Code account"] {
+        assert!(shows(&mut zeron, &format!("\"{kept}\"")), "{kept} is missing:\n{}", zeron.tree());
+    }
+}
+
+/// Setup's first screen (ui/crew_signin_fixture.luau): a Crew build's
+/// welcomes to Crew with no account to create and no members' wall; its one
+/// pill signs in, and the quiet action at the left is Cancel, only while
+/// the browser has the sign-in.
+#[test]
+fn the_welcome_is_crew_s() {
+    let mut app = mount("crew_signin_fixture.luau", true, (680., 500.));
+    assert!(app.tree().contains("to Crew"), "{}", app.tree());
+    for gone in ["Create an account", "I already have an account", "Cancel"] {
+        assert!(!shows(&mut app, &format!("\"{gone}\"")), "{gone} shows:\n{}", app.tree());
+    }
+    assert!(app.find("wall").is_none(), "a members' wall:\n{}", app.tree());
+    app.click("role:button \"Sign in\"");
+    app.frames(4);
+    assert_eq!(state(&app, "crew_signin_went"), Some(Value::from("existing")));
+    assert!(app.host.run_command("crew_signin.waiting"));
+    app.frames(20);
+    app.click("\"Cancel\"");
+    app.frames(4);
+    assert_eq!(state(&app, "crew_signin_went"), Some(Value::from("cancel")));
+    assert!(lint(&app).is_empty(), "{:#?}", lint(&app));
+    // Without the flag, Zeron's: an account to create, and the wall.
+    let mut zeron = mount("crew_signin_fixture.luau", false, (680., 500.));
+    assert!(zeron.tree().contains("to Zeron"), "{}", zeron.tree());
+    zeron.click("role:button \"Create an account\"");
+    zeron.frames(4);
+    assert_eq!(state(&zeron, "crew_signin_went"), Some(Value::from("create")));
+    assert!(shows(&mut zeron, "\"I already have an account\""), "{}", zeron.tree());
+    assert!(zeron.find("wall").is_some(), "no wall:\n{}", zeron.tree());
+}
+
+/// The sidebar asks nobody to star Zeron's repository in a Crew build.
+#[test]
+fn the_sidebar_has_no_star_banner() {
+    assert!(shell(true).find("star-banner").is_none());
+    assert!(shell(false).find("star-banner").is_some());
 }

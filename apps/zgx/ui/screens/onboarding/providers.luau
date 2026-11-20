@@ -21,6 +21,7 @@ local ds = require("@ds")
 local agents = require("@account/agents")
 local toast = require("@ds/toast")
 local state = require("./state")
+local crew = require("@account/crew")
 local Onboarding = ds.Onboarding
 
 export type Props = { step: number?, count: number?, on_back: () -> (), on_continue: () -> () }
@@ -29,11 +30,12 @@ local function now(): agents.Now
 	return agents.now:get() :: agents.Now
 end
 
--- The agents shown: those with a mark (every one Zeron runs but a test rig).
+-- The agents shown: those with a mark (every one Zeron runs but a test rig);
+-- in a Crew build, those it runs alone.
 local function shown(): { agents.Agent }
 	local out = {}
 	for _, a in now().list do
-		if a.mark then
+		if a.mark and (not crew.on or crew.managed(a.id)) then
 			table.insert(out, a)
 		end
 	end
@@ -175,6 +177,10 @@ local function card(row: State<agents.Agent>): Node
 				agents.remove(id, acc.id)
 			end
 		end,
+		-- (A Crew build signs it in itself.)
+		managed = if crew.on
+			then { label = ui.t("crew.providers.managed"), description = ui.t("crew.providers.managed_hint") }
+			else nil,
 	}
 end
 
@@ -264,6 +270,8 @@ return function(props: Props): Node
 					return ui.t("onboarding.providers.unavailable"):get()
 				elseif k == "install" then
 					return ui.t("onboarding.providers.none"):get()
+				elseif crew.on then
+					return ui.t("crew.providers.found", { n = #installed() }):get()
 				end
 				return ui.t("onboarding.providers.found", { n = #installed() }):get()
 			end,

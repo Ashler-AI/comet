@@ -508,4 +508,19 @@ mod tests {
         assert!(managed_models(HarnessId::Cursor).is_none());
         assert!(managed_default_model(HarnessId::Opencode).is_none());
     }
+
+    /// The app offers exactly the agents a Crew engine runs: setup and
+    /// Settings → Providers read apps/zgx/ui/account/crew.luau's `MANAGED`.
+    #[test]
+    fn the_app_offers_the_agents_crew_runs() {
+        let script = include_str!("../../../apps/zgx/ui/account/crew.luau");
+        let line = script
+            .lines()
+            .find(|line| line.starts_with("local MANAGED = "))
+            .expect("crew.luau's MANAGED");
+        for harness in HarnessId::ALL {
+            let offered = line.contains(&format!("[\"{}\"] = true", harness.as_str()));
+            assert_eq!(offered, managed_models(harness).is_some(), "{}", harness.as_str());
+        }
+    }
 }

@@ -24,6 +24,7 @@ local registry = require("@account/registry")
 local add_agent = require("@app/screens/settings/add_agent")
 local sign_in_terminal = require("@app/screens/settings/sign_in_terminal")
 local cloud = require("@account/cloud")
+local crew = require("@account/crew")
 
 local M = {}
 
@@ -56,7 +57,8 @@ search.index(M.ID, ui.t("settings.providers.title"), ui.t("settings.providers.te
 		section = ui.t("settings.providers.agent_settings"),
 		terms = ui.t("settings.providers.skills_separate.terms"),
 	},
-	{ key = "more", title = ui.t("settings.providers.more.label"), terms = ui.t("settings.providers.more.terms") },
+	-- (A Crew build has no more agents to add.)
+	if crew.on then nil else { key = "more", title = ui.t("settings.providers.more.label"), terms = ui.t("settings.providers.more.terms") },
 })
 
 local function now(): agents.Now
@@ -64,11 +66,12 @@ local function now(): agents.Now
 end
 
 -- The agents shown: those with a mark (every one Zeron runs but a test rig),
--- and those added from the ACP registry.
+-- and those added from the ACP registry; in a Crew build, those it runs
+-- alone (ui/account/crew.luau).
 local function shown(): { agents.Agent }
 	local out = {}
 	for _, a in now().list do
-		if a.mark or (a :: any).registry then
+		if (a.mark or (a :: any).registry) and (not crew.on or crew.managed(a.id)) then
 			table.insert(out, a)
 		end
 	end
@@ -436,6 +439,10 @@ local function card(row: State<agents.Agent>): Node
 				agents.dismiss_reset(acc.id)
 			end
 		end,
+		-- (A Crew build signs it in itself.)
+		managed = if crew.on
+			then { label = ui.t("crew.providers.managed"), description = ui.t("crew.providers.managed_hint") }
+			else nil,
 	}
 end
 
@@ -478,6 +485,34 @@ local function more(): Node
 		end
 		return n
 	end
+	local function rows(): Node
+		return ui.each(list, function(_a: agents.Agent, _i: number, row: State<agents.Agent>): Node
+			local a = row:peek()
+			return ui.column {
+				w_full = true,
+				ui.show(function()
+					return top() ~= a.id
+				end, ds.Settings.Rule()),
+				ds.ProviderCard.InstallRow({ name = a.name, mark = a.mark :: string, manual = not a.can_install }, function()
+					return row:get().installing
+				end, function()
+					agents.install(a.id)
+				end),
+			}
+		end, { key = by_id })
+	end
+	-- A Crew build: its own agents still to install, if any, and no others.
+	if crew.on then
+		return ui.show(
+			function()
+				return #list:get() > 0
+			end,
+			ds.Settings.Section {
+				title = ui.t("settings.providers.more.label"),
+				ds.Settings.Group { ui.column { w_full = true, rows() } },
+			}
+		)
+	end
 	return search.anchor(
 		"more",
 		ds.Settings.Section {
@@ -486,20 +521,7 @@ local function more(): Node
 			ds.Settings.Group {
 				ui.column {
 					w_full = true,
-					ui.each(list, function(_a: agents.Agent, _i: number, row: State<agents.Agent>): Node
-						local a = row:peek()
-						return ui.column {
-							w_full = true,
-							ui.show(function()
-								return top() ~= a.id
-							end, ds.Settings.Rule()),
-							ds.ProviderCard.InstallRow({ name = a.name, mark = a.mark :: string, manual = not a.can_install }, function()
-								return row:get().installing
-							end, function()
-								agents.install(a.id)
-							end),
-						}
-					end, { key = by_id }),
+					rows(),
 					ui.show(function()
 						return #list:get() > 0
 					end, ds.Settings.Rule()),
