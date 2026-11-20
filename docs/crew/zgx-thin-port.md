@@ -287,7 +287,8 @@ Deferred:
     realtime voice. A route for another provider stops the launch.
   - Upstream seams: `registry.rs` (one `crew` field; `environments()`;
     `discover_models_with_lease`), `lib.rs` (install, follow the workspace, shutdown),
-    `rpc.rs` (`ListModels`, `ActivateAgentAccount`, `prepare_voice_bridge`) and
+    `rpc.rs` (`ListModels`, the account calls handed to `crew_accounts.rs`,
+    `prepare_voice_bridge`) and
     `plugin_agents.rs` (`activate`, `models`, `pin_mechanism`, `set_pin`). The engine
     gains `hyper`, `hyper-util` and `http-body-util`, which `zeron-mcp` already builds.
 - **Fails closed**, in managed mode:
@@ -384,6 +385,64 @@ Status on 2026-11-20:
     engine's `default_harness` only fills chats without a config row), so making OMP the
     default means changing what every new chat starts on: the owner's call.
   - Zeron's MCP tools aren't wired into OMP, as in Crew.
+
+### Shared accounts
+
+Crew's Shared accounts page, as zgx has it. Agent Auth's logins (`/api/agent-accounts`)
+are the accounts every managed agent runs on, so a Crew build lists and manages them in
+Settings → Providers.
+
+- **App** (`ui/screens/settings/crew_accounts.luau`, one seam in `providers.luau`): a
+  "Shared accounts" section after the agents, on this computer's page. It has a Claude card
+  and a ChatGPT card, built from upstream's `ProviderCard`:
+  - each account with its plan and two usage meters, its "5-hour" and "Weekly" windows by
+    name. A window Agent Auth hasn't reported shows 0: most staging accounts report only a
+    Weekly one, which upstream's first-window rule would also show as the session.
+    After the plan: how it stands with Agent Auth when it can't be used ("Needs
+    attention", "Disabled", "Revoked"), and in words any other window, a model's or
+    tier's own ("Opus weekly 80%"), or "Usage unavailable";
+  - no "In use", nothing to switch to, no API keys and no banked resets: a chat runs on
+    one automatically, or on the one its Account option names;
+  - adding one is its agent's sign-in (Claude Code's paste-code login, Codex's browser
+    login), shown on the card as upstream shows it;
+  - removing one asks first ("Remove this shared account?").
+- The cards read the agents' rows: Claude's from `claude-code`, ChatGPT's from `codex`.
+  OMP's rows carry the same accounts again, by provider, so they're not shown twice.
+  OMP's card, like the others, says it's on Crew's shared accounts.
+- The model picker has no Account row or usage ring of upstream's for a managed agent.
+  A chat's account is the Account option (`shared.luau`'s `model_accounts`).
+- The host passes an account's `usageError` (`error`) and its named windows with their
+  resets (`windows`) to its row. For a Crew build it also shows the engine's words when a
+  shared sign-in fails (`crew::shared_accounts`).
+- **Engine** (`crates/engine/src/crew_accounts.rs`, `crew_shared_login.rs`): one seam in
+  `rpc.rs` hands a managed engine's account calls to Crew's code. Every other engine
+  answers them as upstream does.
+  - `ListAgentAccounts` lists `/api/agent-accounts` (for a minute; `forceUsage` lists again).
+    Each login is shown once, through a healthy copy: Crew's `login_key` and
+    `shared_logins`, ported.
+    - Rows: an Anthropic login is Claude Code's and OMP's (`provider: "anthropic"`); an
+      OpenAI login is Codex's and OMP's. None is active or switchable.
+    - Plan windows come in the order the app reads them: the family's 5-hour, then its
+      Weekly, then a model's or tier's own ("Opus weekly", "5-hour (Spark)").
+    - A failed list gives no rows and a warning per agent.
+  - `StartAgentLogin` `{harness, provider?}`:
+    - Claude Code, or OMP with `anthropic`, starts Claude's paste-code sign-in.
+    - Codex, or OMP with `openai`, starts ChatGPT's browser sign-in: upstream's Codex
+      capture, in a throwaway home.
+    - Signed out of Crew, it's refused before a browser opens.
+  - `CompleteAgentLogin` and `PollAgentLogin` import the capture
+    (`POST /api/agent-accounts/import`). Nothing is written to this device: no slot, no
+    Keychain item, no CLI store.
+    - A code is redeemed once. A failed import keeps the tokens in memory (15 minutes at
+      most) for the next poll or completion. The app's "Try again" starts a new sign-in.
+  - `ForgetAgentAccount` revokes the login and every saved copy
+    (`DELETE /api/agent-accounts/{id}`).
+  - An import or a revocation lists again, and the chats' Account option follows.
+  - Refused with a sentence: `ActivateAgentAccount`, `RenameAgentAccount`, `AddAgentApiKey`,
+    `VaultPutApiKey` and `ConsumeCodexResetCredit`, and any account call relayed from
+    another device.
+  - `agent_accounts.rs` gains the module and one field: Claude's capture carries
+    `accountUuid`, Agent Auth's key for it.
 
 ### Scaffold sandboxes
 
@@ -605,6 +664,26 @@ Decided by the owner on 2026-11-20:
     other paths refusing; and an engine without a Scaffold authority unchanged.
   - Open: the exit gate, real turns from zgx through staging Platform's Agent Auth
     (decision 1).
+  - Shared accounts (2026-11-20, section above):
+    - Tests: `zeron-engine --lib` on `crew_inference crew_accounts agent_accounts
+      rpc::tests`, 193 passed. The full `zeron-zgx` bin suite, 770 passed, 0 failed,
+      33 ignored, with the new `crew::` tests for the section and the model picker.
+      Luau UI 1,470 passed; `design_lint` and `leftovers` pass. The workspace `check
+      --all-targets` is clean of new warnings.
+    - The installed canary, against staging Agent Auth:
+      - The section listed 6 Claude and 5 ChatGPT logins, each once, with plans and
+        meters. Accounts with only a Weekly window show 0% for the session, and a
+        full one says "Limit reached, resets Tue".
+      - Claude's sign-in opened `claude.ai/oauth/authorize` (Claude Code's client, PKCE)
+        and asked for the code; cancelled.
+      - ChatGPT's opened `auth.openai.com/oauth/authorize` with Codex's loopback on
+        1455. Cancelling stopped it.
+      - The remove dialog showed "Remove this shared account?". It was opened through
+        its state and cancelled, with nothing removed (11 logins before and after).
+        Devtools can't press a row of the ⋯ menu in a backgrounded app, as with the
+        model picker; the UI test covers the menu → dialog step.
+    - Not done: completing a real sign-in or removing a real account (both change
+      staging's shared pool).
 - [ ] 6. Scaffold
 - [ ] 7. Packaging
   - Local half: `scripts/crew/package-zgx-app` (ad-hoc signed, no updater) and

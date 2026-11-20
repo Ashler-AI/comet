@@ -25,6 +25,7 @@ local add_agent = require("@app/screens/settings/add_agent")
 local sign_in_terminal = require("@app/screens/settings/sign_in_terminal")
 local cloud = require("@account/cloud")
 local crew = require("@account/crew")
+local crew_accounts = require("@app/screens/settings/crew_accounts")
 
 local M = {}
 
@@ -57,8 +58,10 @@ search.index(M.ID, ui.t("settings.providers.title"), ui.t("settings.providers.te
 		section = ui.t("settings.providers.agent_settings"),
 		terms = ui.t("settings.providers.skills_separate.terms"),
 	},
-	-- (A Crew build has no more agents to add.)
-	if crew.managed_inference then nil else { key = "more", title = ui.t("settings.providers.more.label"), terms = ui.t("settings.providers.more.terms") },
+	-- (A Crew build has no more agents to add: its shared accounts instead.)
+	if crew.managed_inference
+		then { key = "shared_accounts", title = ui.t("crew.accounts.title"), terms = ui.t("crew.accounts.terms") }
+		else { key = "more", title = ui.t("settings.providers.more.label"), terms = ui.t("settings.providers.more.terms") },
 })
 
 local function now(): agents.Now
@@ -633,6 +636,10 @@ local function body(k: string): Node
 	end
 	if k == "cloud" then
 		return ui.column { w_full = true, gap = "$space.6", cards(), cloud_keys() }
+	end
+	-- (A Crew build: the shared accounts its agents run on, after them.)
+	if crew.managed_inference then
+		return ui.column { w_full = true, gap = "$space.6", cards(), crew_accounts.section(), more() }
 	end
 	return ui.column { w_full = true, gap = "$space.6", cards(), more() }
 end

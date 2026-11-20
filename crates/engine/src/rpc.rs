@@ -3552,6 +3552,13 @@ impl RpcService for EngineRpc {
         ) {
             self.voice.retire();
         }
+        // Crew: a managed engine's accounts are Crew's shared ones.
+        if let Some(crew) = self.registry.crew_inference()
+            && let Some(reply) =
+                Box::pin(crew.accounts_rpc(&self.agent_accounts, method, &params)).await
+        {
+            return reply;
+        }
         if voice_remote::handles(method) {
             return self.voice_remote(method, params).await;
         }
@@ -6003,8 +6010,6 @@ impl RpcService for EngineRpc {
                 RpcReply::value(&snapshot)
             }
             methods::ACTIVATE_AGENT_ACCOUNT => {
-                // Crew: managed runs never use this device's own logins.
-                self.registry.refuse_own_logins().map_err(RpcError::Failed)?;
                 self.voice.retire();
                 let p: AgentAccountParams = parse_params(params)?;
                 let snapshot = self

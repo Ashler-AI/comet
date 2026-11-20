@@ -423,6 +423,7 @@ fn settings_without_the_flag_are_zeron_s() {
         assert!(shows(&mut app, &format!("#settings-page >> \"{kept}\"")), "{kept} is missing:\n{}", app.tree());
     }
     assert!(!shows(&mut app, "#settings-page >> \"On Crew's shared accounts\""), "{}", app.tree());
+    assert!(!shows(&mut app, "#settings-page >> \"Shared accounts\""), "{}", app.tree());
     app.click("#settings-nav >> role:tab \"Account\"");
     app.frames(30);
     for kept in ["Photo", "Name", "Username", "Save changes", "Delete account"] {
@@ -438,14 +439,15 @@ fn settings_without_the_flag_are_zeron_s() {
 }
 
 /// Crew's Settings → Providers: the agents it runs, each signed in by Crew
-/// (no account to connect, no key to type), and no more agents to add.
+/// (no account of its own to connect, no key to type), then Crew's shared
+/// accounts, and no more agents to add.
 #[test]
 fn providers_are_crew_s() {
     let mut app = settings(true);
     app.click("#settings-nav >> role:tab \"Providers\"");
     app.frames(30);
     assert_eq!(app.error(), None);
-    for kept in ["Claude Code", "On Crew's shared accounts"] {
+    for kept in ["Claude Code", "On Crew's shared accounts", "Shared accounts", "Connect a Claude account", "Connect a ChatGPT account"] {
         assert!(shows(&mut app, &format!("#settings-page >> \"{kept}\"")), "{kept} is missing:\n{}", app.tree());
     }
     for gone in ["Connect a Claude Code account", "More agents", "Add another agent"] {
@@ -456,6 +458,109 @@ fn providers_are_crew_s() {
     app.frames(10);
     assert!(!shows(&mut app, "#settings-search-results >> \"More agents\""), "{}", app.tree());
     assert!(lint(&app).is_empty(), "{:#?}", lint(&app));
+}
+
+/// What the Settings stub was asked (ui/settings_stub.luau's log).
+fn stub_calls(app: &TestApp) -> Vec<String> {
+    state(app, "settings_stub_calls").map(|v| strings(&json_of(&v))).unwrap_or_default()
+}
+
+/// This computer's agents as a Crew engine lists them (crates/engine
+/// crew_accounts.rs): the shared accounts as Claude Code's (Claude's) and
+/// Codex's (ChatGPT's), and OMP's the same again by provider. An account's
+/// `error` is how it stands with Agent Auth.
+fn shared_agents() -> Json {
+    let agent = |id: &str, name: &str, mark: &str, accounts: Json| {
+        json!({
+            "id": id, "name": name, "mark": mark, "installed": true, "can_install": true, "enabled": true,
+            "version": "1.0.0", "installing": false, "login": "idle", "accounts": accounts,
+        })
+    };
+    let ada = json!({
+        "id": "acc_claude", "email": "ada@claude.test", "plan": "Claude Max", "session": 0.25, "week": 0.5,
+        "active": false, "switchable": false, "error": "Needs attention",
+        "windows": [{ "label": "Weekly", "used": 0.5 }, { "label": "Opus weekly", "used": 0.8 }],
+    });
+    let mut omp = ada.clone();
+    omp["provider"] = json!("anthropic");
+    json!({ "state": "ready", "list": [
+        agent("claude-code", "Claude Code", "claude", json!([ada])),
+        agent("codex", "Codex", "openai", json!([])),
+        agent("omp", "OMP", "pi", json!([omp])),
+    ] })
+}
+
+/// Crew's shared accounts in Settings → Providers: Claude's and ChatGPT's, a
+/// card each, every account once (OMP's are the same accounts) with its
+/// plan, how it stands and its usage (a model's own window in words); none
+/// to put in use; removing one asks first, and adding one is its agent's
+/// sign-in. The search finds them.
+#[test]
+fn shared_accounts_are_listed_once_and_removed_when_asked() {
+    let mut app = settings(true);
+    app.click("#settings-nav >> role:tab \"Providers\"");
+    app.frames(30);
+    app.host.set_state("agents", crate::plugins::json_value(&shared_agents())).unwrap();
+    app.frames(30);
+    assert_eq!(app.error(), None);
+    let tree = app.tree();
+    for kept in ["Shared accounts", "Claude", "ChatGPT", "Claude Max · Needs attention · Opus weekly 80%", "Connect a ChatGPT account"] {
+        assert!(shows(&mut app, &format!("#settings-page >> \"{kept}\"")), "{kept} is missing:\n{tree}");
+    }
+    assert_eq!(tree.matches("ada@claude.test").count(), 1, "the account once:\n{tree}");
+    assert!(!shows(&mut app, "#settings-page >> \"In use\""), "{tree}");
+    // Its one action, removing it: asked first, and Cancel removes nothing.
+    let actions = "#settings-page >> role:button \"Account actions\"";
+    let dialog = "role:dialog \"Remove this shared account?\"";
+    app.click(actions);
+    app.frames(20);
+    assert!(!shows(&mut app, "\"Switch to this account\""), "{}", app.tree());
+    app.click("\"Remove account\"");
+    app.frames(20);
+    assert!(shows(&mut app, dialog), "{}", app.tree());
+    app.click(&format!("{dialog} >> role:button \"Cancel\""));
+    app.frames(20);
+    assert!(!stub_calls(&app).iter().any(|c| c.starts_with("agents.remove")), "{:?}", stub_calls(&app));
+    app.click(actions);
+    app.frames(20);
+    app.click("\"Remove account\"");
+    app.frames(20);
+    app.click(&format!("{dialog} >> role:button \"Remove\""));
+    app.frames(20);
+    assert!(stub_calls(&app).iter().any(|c| c == "agents.remove:claude-code"), "{:?}", stub_calls(&app));
+    // Another ChatGPT account: Codex's sign-in. (Its card is below the fold:
+    // the page scrolled to it first.)
+    let connect = "#settings-page >> \"Connect a ChatGPT account\"";
+    app.scroll("#setting-shared_accounts", 400.);
+    app.frames(10);
+    app.click(connect);
+    app.frames(20);
+    assert!(stub_calls(&app).iter().any(|c| c == "agents.sign_in:codex"), "{:?}", stub_calls(&app));
+    assert!(lint(&app).is_empty(), "{:#?}", lint(&app));
+    app.type_text("#settings-nav >> #settings-search", "shared");
+    app.frames(10);
+    assert!(shows(&mut app, "#settings-search-results >> \"Shared accounts\""), "{}", app.tree());
+}
+
+/// The composer's model picker (ui/chat_fixture.luau) has no Account row or
+/// usage ring of its own for an agent Crew runs: a chat's account is its
+/// Account option (Automatic, or one shared account). Zeron's has both.
+#[test]
+fn the_picker_leaves_accounts_to_the_account_option() {
+    let on_device = json!({ "": { "claude-code": [{
+        "id": "a1", "email": "ada@claude.test", "plan": "Claude Max", "active": true, "can_switch": false,
+        "windows": [{ "label": "5h", "used": 0.34 }],
+    }] } });
+    for crew in [true, false] {
+        let mut app = mount("chat_fixture.luau", crew, (900., 700.));
+        app.host.set_state("agents.on_device", crate::plugins::json_value(&on_device)).unwrap();
+        app.frames(10);
+        assert_eq!(app.find("model-picker-usage").is_some(), !crew, "crew {crew}:\n{}", app.tree());
+        app.click("role:button \"Model\"");
+        app.frames(30);
+        assert_eq!(app.error(), None);
+        assert_eq!(app.find("model-picker-account").is_some(), !crew, "crew {crew}:\n{}", app.tree());
+    }
 }
 
 /// Setup's Your agents (ui/providers_fixture.luau: six agents on this

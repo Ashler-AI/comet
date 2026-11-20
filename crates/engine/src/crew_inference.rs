@@ -21,6 +21,9 @@
 //! - Upstream's other ways to a provider refuse while this is on: account
 //!   switching and pins (plugins' too, and their `run.preparing` pins never
 //!   apply) and Codex voice.
+//! - The account RPCs answer Crew's shared accounts ([`accounts`]): listed
+//!   from Agent Auth, added by a sign-in on this device whose credential goes
+//!   to Agent Auth and nowhere else (`crew_shared_login.rs`), and revoked.
 //! - Model lists are each harness's own (its CLI's, probed as a managed run
 //!   would launch: `zeron_harness::crew_inference::set_managed_discovery`),
 //!   less what Agent Auth can't route, each with the account choice
@@ -34,19 +37,22 @@
 //! (`ZERON_INFERENCE_MODE=local`: this device's own logins, as upstream). An
 //! engine with no Scaffold authority is unchanged.
 
+#[path = "crew_accounts.rs"]
+mod accounts;
 #[path = "crew_agent_auth.rs"]
-mod agent_auth;
+pub(crate) mod agent_auth;
 #[path = "crew_inference_relay.rs"]
 mod relay;
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, Weak};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use sha2::{Digest, Sha256};
 use zeron_harness::crew_inference::{ManagedRoute, Provider};
 use zeron_proto::{ChatConfig, HarnessId, Model, ModelOption, ModelOptionChoice, RunRequest};
 
+use crate::agent_accounts::crew::SharedLogins;
 use crate::registry::{HarnessRegistry, RunEnvironment};
 use agent_auth::{AgentAuthClient, RemoteAgentAccount};
 use relay::{InferenceRelay, PrepareError};
@@ -97,7 +103,14 @@ pub struct CrewInference {
     chat_configs: Mutex<Option<ChatConfigs>>,
     /// The logical session each harness's title runs share.
     title_sessions: Mutex<HashMap<HarnessId, String>>,
-    accounts: tokio::sync::Mutex<Option<(Instant, Vec<RemoteAgentAccount>)>>,
+    /// The shared accounts as last listed (the Account option's, and
+    /// Settings').
+    listed: Mutex<accounts::Listed>,
+    /// One Agent Auth list at a time.
+    listing: tokio::sync::Mutex<()>,
+    /// Shared sign-ins under way (their credentials until Agent Auth has
+    /// them).
+    shared: SharedLogins,
     /// The registry whose harnesses are asked for their catalogs, when a
     /// run names no model before any list was asked for.
     registry: OnceLock<Weak<HarnessRegistry>>,
@@ -153,7 +166,9 @@ impl CrewInference {
             client: None,
             chat_configs: Mutex::new(None),
             title_sessions: Mutex::new(HashMap::new()),
-            accounts: tokio::sync::Mutex::new(None),
+            listed: Mutex::new(Default::default()),
+            listing: tokio::sync::Mutex::new(()),
+            shared: SharedLogins::default(),
             registry: OnceLock::new(),
             defaults: Mutex::new(HashMap::new()),
         }
@@ -170,12 +185,14 @@ impl CrewInference {
     }
 
     /// Stop the relay: every route ends. The workspace is let go, so a
-    /// replaced runtime's graph can be dropped.
+    /// replaced runtime's graph can be dropped, and so is any shared
+    /// sign-in's credential Agent Auth hasn't taken yet.
     pub(crate) fn shutdown(&self) {
         if let Some(relay) = &self.relay {
             relay.shutdown();
         }
         lock(&self.chat_configs).take();
+        self.shared.clear();
     }
 
     fn title_session(&self, harness: HarnessId) -> String {
@@ -264,30 +281,19 @@ impl CrewInference {
             .ok_or_else(|| format!("{} offers no model Crew's shared accounts can run.", harness.as_str()))
     }
 
-    /// The principal's shared accounts, kept a minute; on a failure the last
-    /// ones known (or none: the choice is then Automatic alone).
+    /// The principal's shared accounts, kept a minute (an import or a
+    /// revocation lists them again); on a failure the last ones known (or
+    /// none: the choice is then Automatic alone).
     async fn accounts(&self) -> Vec<RemoteAgentAccount> {
-        let Some(client) = &self.client else {
-            return Vec::new();
-        };
-        let mut cached = self.accounts.lock().await;
-        if let Some((listed, accounts)) = cached.as_ref()
-            && listed.elapsed() < ACCOUNTS_FRESH
-        {
-            return accounts.clone();
-        }
-        match tokio::time::timeout(ACCOUNTS_DEADLINE, client.list_accounts()).await {
-            Ok(Ok(accounts)) => {
-                *cached = Some((Instant::now(), accounts.clone()));
-                accounts
-            }
+        match tokio::time::timeout(ACCOUNTS_DEADLINE, self.list_accounts(Some(ACCOUNTS_FRESH))).await {
+            Ok(Ok(accounts)) => accounts,
             failed => {
                 let error = match failed {
                     Ok(Err(error)) => error.to_string(),
                     _ => "timed out".into(),
                 };
                 tracing::warn!(%error, "crew: shared accounts not listed");
-                cached.as_ref().map(|(_, accounts)| accounts.clone()).unwrap_or_default()
+                self.last_listed()
             }
         }
     }
@@ -384,25 +390,20 @@ fn fingerprint(harness: HarnessId, account: Option<&str>, serial: Option<u64>) -
 }
 
 /// The `crewAccountId` option for `provider`'s models: Automatic, then each
-/// healthy shared login of that provider once (Crew's settings list).
+/// healthy shared login of that provider once, through the copy Settings
+/// shows (Crew's settings list).
 fn account_option(provider: Provider, accounts: &[RemoteAgentAccount]) -> ModelOption {
     let mut choices = vec![ModelOptionChoice {
         id: AUTOMATIC.into(),
         label: "Automatic · shared pool".into(),
     }];
-    let mut logins: Vec<String> = Vec::new();
-    for account in accounts {
-        let healthy = matches!(account.status.as_str(), "connected" | "active" | "ready");
-        if !healthy || !account.provider.eq_ignore_ascii_case(provider.as_str()) || account.id.trim().is_empty() {
+    // One person in one workspace is one login, however often an older
+    // sign-in path saved it.
+    for login in accounts::shared_logins(accounts) {
+        let account = login.account;
+        if !account.healthy() || !account.provider.eq_ignore_ascii_case(provider.as_str()) {
             continue;
         }
-        // One person in one workspace is one login, however often an older
-        // sign-in path saved it.
-        let key = login_key(account);
-        if logins.contains(&key) {
-            continue;
-        }
-        logins.push(key);
         let label = [account.email.as_deref(), account.display_name.as_deref()]
             .into_iter()
             .flatten()
@@ -419,19 +420,6 @@ fn account_option(provider: Provider, accounts: &[RemoteAgentAccount]) -> ModelO
         label: "Account".into(),
         choices,
         default_choice: AUTOMATIC.into(),
-    }
-}
-
-/// Crew's `login_key`: a ChatGPT login is one email in one workspace.
-fn login_key(account: &RemoteAgentAccount) -> String {
-    let provider = account.provider.to_ascii_lowercase();
-    let identity = account.provider_account_id.as_deref().unwrap_or(&account.id);
-    match account.email.as_deref().map(str::trim).filter(|email| !email.is_empty()) {
-        Some(email) if provider == "openai" => {
-            let workspace = identity.split_once("::").map_or(identity, |(_, workspace)| workspace);
-            format!("openai\u{1f}{workspace}\u{1f}{}", email.to_lowercase())
-        }
-        _ => format!("{provider}\u{1f}{identity}"),
     }
 }
 

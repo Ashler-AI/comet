@@ -123,6 +123,9 @@ pub use muse::MuseRunEnvironment;
 pub use pins::{ChatPin, PinHook, PinRunEnvironment};
 mod stores;
 mod usage;
+// Crew: a managed engine's sign-ins add to Crew's shared accounts, by capture.
+#[path = "crew_shared_login.rs"]
+pub(crate) mod crew;
 
 // Claude Code's public OAuth client (the one the CLI itself uses for the manual
 // "paste the code" flow — no secret involved, PKCE carries the proof).
@@ -2484,6 +2487,9 @@ impl AgentAccounts {
                 "displayName": display_name,
                 "organization": org_name,
                 "plan": claude_plan(org_type.as_deref(), rate_tier.as_deref()),
+                // Crew: who it is, as a slot is keyed (Agent Auth's import;
+                // the vault's profile ignores it).
+                "accountUuid": account_uuid,
             });
             return capture(serde_json::json!({ "credential": oauth, "profile": profile }))
                 .await

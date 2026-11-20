@@ -3973,11 +3973,21 @@
     },
     "providers": {
       "managed": "使用 Crew 的共享账户",
-      "managed_hint": "由 Agent Auth 登录，无需连接账户。",
+      "managed_hint": "由 Agent Auth 使用 Crew 的共享账户登录，见“设置 → 提供方”。",
       "found": "{n, plural, other {在此电脑上找到 # 个智能体，均使用 Crew 的共享账户运行。}}"
     },
     "account": {
       "sign_out_title": "退出登录 Crew？"
+    },
+    "accounts": {
+      "title": "共享账户",
+      "description": "Crew 使用这些账户运行你的智能体。每个聊天会自动选用其中一个，或使用其“账户”选项指定的那个。",
+      "terms": "共享账户 agent auth 用量 限额 套餐 claude chatgpt anthropic openai 添加 移除",
+      "remove_title": "移除此共享账户？",
+      "remove_body": "Crew 将不再用它运行智能体。你之后可以再次添加。",
+      "remove": "移除",
+      "couldnt_remove": "无法移除该账户",
+      "no_usage": "暂无用量"
     }
   }
 }

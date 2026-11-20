@@ -76,6 +76,14 @@ pub fn local_inference() -> bool {
         .any(|name| std::env::var(name).is_ok_and(|mode| mode.trim().eq_ignore_ascii_case("local")))
 }
 
+/// Whether the agents' accounts are Crew's shared accounts: a Crew build's
+/// engine answers the account calls from Agent Auth (crates/engine
+/// crew_accounts.rs), unless the app was launched with the development
+/// switch ([`local_inference`]).
+pub fn shared_accounts() -> bool {
+    MODE && !local_inference()
+}
+
 /// What the engine this app starts is told of its inference (its own
 /// inherited variables are scrubbed first): `local`, or nothing.
 pub fn engine_inference_mode() -> Option<(&'static str, &'static str)> {

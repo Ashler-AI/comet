@@ -161,6 +161,19 @@ pub(super) mod tests {
         pub response_gate: Mutex<Option<Arc<Semaphore>>>,
         /// `GET /api/agent-accounts` answers.
         pub accounts_listed: AtomicU64,
+        /// What `GET /api/agent-accounts` lists (less what was revoked).
+        pub accounts: Mutex<Value>,
+        /// The list answers 503 while set.
+        pub fail_accounts: AtomicBool,
+        /// `DELETE /api/agent-accounts/{id}`'s ids, in order.
+        pub revoked: Mutex<Vec<String>>,
+        /// `POST /api/agent-accounts/import`'s bodies, in order.
+        pub imported: Mutex<Vec<Value>>,
+        /// How many imports to refuse (503) before one is taken.
+        pub refuse_imports: AtomicU64,
+        /// Codes Anthropic's token endpoint (`/token`, a stand-in on this
+        /// same port) redeemed.
+        pub redeemed: AtomicU64,
     }
 
     impl AuthorityFixture {
@@ -176,8 +189,38 @@ pub(super) mod tests {
                 rejection: Mutex::new(None),
                 response_gate: Mutex::new(None),
                 accounts_listed: AtomicU64::new(0),
+                accounts: Mutex::new(json!([
+                    {"id":"acct-claude-1","provider":"anthropic","providerAccountId":"org-1","email":"one@example.com","status":"connected"},
+                    {"id":"acct-claude-2","provider":"anthropic","providerAccountId":"org-2","displayName":"Team Two","status":"active"},
+                    {"id":"acct-claude-off","provider":"anthropic","providerAccountId":"org-3","email":"off@example.com","status":"revoked"},
+                    {"id":"acct-openai-1","provider":"openai","providerAccountId":"user::ws-1","email":"codex@example.com","status":"connected"},
+                    {"id":"acct-openai-copy","provider":"openai","providerAccountId":"other::ws-1","email":"Codex@example.com","status":"connected"}
+                ])),
+                fail_accounts: AtomicBool::new(false),
+                revoked: Mutex::new(Vec::new()),
+                imported: Mutex::new(Vec::new()),
+                refuse_imports: AtomicU64::new(0),
+                redeemed: AtomicU64::new(0),
             })
         }
+
+        fn listed(&self) -> Vec<Value> {
+            let revoked = lock(&self.revoked).clone();
+            lock(&self.accounts)
+                .as_array()
+                .cloned()
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|account| !revoked.iter().any(|id| account["id"] == id.as_str()))
+                .collect()
+        }
+    }
+
+    fn json_response(status: StatusCode, body: Value) -> Response<Full<Bytes>> {
+        Response::builder()
+            .status(status)
+            .body(Full::new(Bytes::from(body.to_string())))
+            .unwrap()
     }
 
     async fn set_fixture_expiry(fixture: &AuthorityFixture, relay: &InferenceRelay, expires_at: DateTime<Utc>) {
@@ -205,7 +248,9 @@ pub(super) mod tests {
     }
 
     /// A loopback Agent Auth: authority issuance, the two inference
-    /// endpoints, and a fixed account list.
+    /// endpoints, and the shared accounts (listed, imported, revoked). Also
+    /// Anthropic's token and profile endpoints (`/token`, `/profile`), for a
+    /// paste-code sign-in to redeem its code here.
     pub(crate) async fn test_control_plane_with_authority(
         captured: mpsc::UnboundedSender<CapturedRequest>,
         fixture: Arc<AuthorityFixture>,
@@ -231,13 +276,25 @@ pub(super) mod tests {
                             let headers = request.headers().clone();
                             let method = request.method().clone();
                             let bytes = request.into_body().collect().await.unwrap().to_bytes();
+                            // Anthropic's, not Agent Auth's: a code redeemed
+                            // (no bearer), and an optional profile.
+                            if method == Method::POST && path == "/token" {
+                                fixture.redeemed.fetch_add(1, Ordering::SeqCst);
+                                return Ok::<_, Infallible>(json_response(StatusCode::OK, json!({
+                                    "access_token": "access", "refresh_token": "refresh", "expires_in": 3600,
+                                    "account": {"email_address": "new@example.com", "uuid": "acct-new"}
+                                })));
+                            }
+                            if method == Method::GET && path == "/profile" {
+                                return Ok::<_, Infallible>(json_response(StatusCode::SERVICE_UNAVAILABLE, json!({})));
+                            }
                             // Ambient listener discovery (another test's preview
                             // scan) must neither break nor reach the fixture.
                             let known = matches!(
                                 path.as_str(),
                                 "/api/agent-accounts" | "/api/agent-auth/v2/authority"
                                     | "/api/agent-auth/v2/responses" | "/api/agent-auth/v2/messages"
-                            );
+                            ) || path.starts_with("/api/agent-accounts/");
                             if !known && (method == Method::HEAD || !headers.contains_key(AUTHORIZATION)) {
                                 return Ok::<_, Infallible>(Response::builder()
                                     .status(StatusCode::NOT_FOUND)
@@ -248,17 +305,55 @@ pub(super) mod tests {
                                 headers[AUTHORIZATION].to_str().unwrap().starts_with("Bearer "),
                                 "every Agent Auth call is authorized"
                             );
+                            if path.starts_with("/api/agent-accounts") {
+                                assert!(headers[AUTHORIZATION].to_str().unwrap().starts_with("Bearer comet-access-token"));
+                            }
                             let response = match path.as_str() {
                                 "/api/agent-accounts" => {
                                     fixture.accounts_listed.fetch_add(1, Ordering::SeqCst);
-                                    assert!(headers[AUTHORIZATION].to_str().unwrap().starts_with("Bearer comet-access-token"));
-                                    json!({"accounts": [
-                                        {"id":"acct-claude-1","provider":"anthropic","providerAccountId":"org-1","email":"one@example.com","status":"connected"},
-                                        {"id":"acct-claude-2","provider":"anthropic","providerAccountId":"org-2","displayName":"Team Two","status":"active"},
-                                        {"id":"acct-claude-off","provider":"anthropic","providerAccountId":"org-3","email":"off@example.com","status":"revoked"},
-                                        {"id":"acct-openai-1","provider":"openai","providerAccountId":"user::ws-1","email":"codex@example.com","status":"connected"},
-                                        {"id":"acct-openai-copy","provider":"openai","providerAccountId":"other::ws-1","email":"Codex@example.com","status":"connected"}
-                                    ]})
+                                    if fixture.fail_accounts.load(Ordering::SeqCst) {
+                                        return Ok::<_, Infallible>(json_response(
+                                            StatusCode::SERVICE_UNAVAILABLE,
+                                            json!({"error": "temporarily_unavailable"}),
+                                        ));
+                                    }
+                                    json!({"accounts": fixture.listed()})
+                                }
+                                "/api/agent-accounts/import" => {
+                                    assert_eq!(method, Method::POST);
+                                    let body: Value = serde_json::from_slice(&bytes).unwrap();
+                                    lock(&fixture.imported).push(body.clone());
+                                    if fixture
+                                        .refuse_imports
+                                        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |left| left.checked_sub(1))
+                                        .is_ok()
+                                    {
+                                        return Ok::<_, Infallible>(json_response(
+                                            StatusCode::SERVICE_UNAVAILABLE,
+                                            json!({"error": "temporarily_unavailable"}),
+                                        ));
+                                    }
+                                    let id = format!("imported-{}", lock(&fixture.imported).len());
+                                    let account = json!({
+                                        "id": id, "provider": body["provider"], "providerAccountId": body["providerAccountId"],
+                                        "email": body["email"], "plan": body["plan"], "status": "connected",
+                                    });
+                                    if let Some(accounts) = lock(&fixture.accounts).as_array_mut() {
+                                        accounts.push(account.clone());
+                                    }
+                                    return Ok::<_, Infallible>(json_response(StatusCode::CREATED, json!({"account": account})));
+                                }
+                                revoke if revoke.starts_with("/api/agent-accounts/") => {
+                                    assert_eq!(method, Method::DELETE);
+                                    let id = revoke.trim_start_matches("/api/agent-accounts/").to_owned();
+                                    if !fixture.listed().iter().any(|account| account["id"] == id.as_str()) {
+                                        return Ok::<_, Infallible>(json_response(
+                                            StatusCode::NOT_FOUND,
+                                            json!({"error": "agent_account_not_found"}),
+                                        ));
+                                    }
+                                    lock(&fixture.revoked).push(id);
+                                    json!({"ok": true})
                                 }
                                 "/api/agent-auth/v2/authority" => {
                                     assert!(headers[AUTHORIZATION].to_str().unwrap().starts_with("Bearer comet-access-token"));

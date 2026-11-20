@@ -13,6 +13,7 @@ local Quote = require("@ds/quote")
 local Annotation = require("@ds/annotation")
 local sessions = require("@account/sessions")
 local agents = require("@account/agents")
+local crew = require("@account/crew")
 local cloud = require("@account/cloud")
 local locale = require("@ds/locale")
 local toast = require("@ds/toast")
@@ -1198,6 +1199,12 @@ function M.model_accounts(device: () -> string?): any
 	end
 	return {
 		accounts = function(harness: string, model: string, provider: string?): { any }?
+			-- (Crew: one its shared accounts run, whose chat's account is its
+			-- Account option, Automatic or one named: no row of the agent's
+			-- own, and nothing to switch. ui/account/crew.luau)
+			if crew.managed(harness) then
+				return nil
+			end
 			local all = listed(harness)
 			if not all then
 				return nil
@@ -1228,7 +1235,7 @@ function M.model_accounts(device: () -> string?): any
 		-- The model's provider, named, and adding one of its accounts: Settings
 		-- → Providers, on the composer's device, its sign-in under way there.
 		account_group = function(harness: string, provider: string?): any
-			if not provider or not per_provider(harness, listed(harness)) then
+			if not provider or crew.managed(harness) or not per_provider(harness, listed(harness)) then
 				return nil
 			end
 			local offer = (agents.logins:get()[harness] or {})[provider]

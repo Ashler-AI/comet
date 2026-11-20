@@ -9,7 +9,10 @@
 //! - `POST /api/agent-auth/v2/{messages,responses}`: inference with that
 //!   authority, for one conversation and, when the chat chose one, one account;
 //! - `GET /api/agent-accounts`: the principal's shared accounts (the catalog's
-//!   account choices).
+//!   account choices, and Settings' list: `crew_accounts.rs`);
+//! - `POST /api/agent-accounts/import`: a login signed in on this device
+//!   handed to the shared pool (`crew_shared_login.rs`);
+//! - `DELETE /api/agent-accounts/{id}`: a shared account revoked.
 //!
 //! The Scaffold bearer comes from the engine's verified profile
 //! ([`crate::auth::ProfileTokens`]) on every request and is only ever an
@@ -21,7 +24,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use reqwest::{Method, StatusCode, Url};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use zeron_harness::CancellationToken;
 use zeron_rpc::{TokenError, TokenSource};
@@ -77,6 +80,32 @@ impl AgentAuthError {
             _ => false,
         }
     }
+
+    /// Why, in a few words a person can read, to end a sentence ("…couldn't
+    /// be loaded: {reason}."). A refusal keeps its code only (never a body,
+    /// a request id or a token), redacted all the same.
+    pub(crate) fn reason(&self) -> String {
+        match self {
+            Self::SignedOut => "you're signed out of Crew".into(),
+            Self::CredentialUnavailable => "your Crew sign-in is still being checked".into(),
+            Self::Cancelled => "it was cancelled".into(),
+            Self::Transport(_) => "Agent Auth can't be reached".into(),
+            Self::InvalidResponse(_) => "Agent Auth's answer wasn't understood".into(),
+            Self::Api(error) => {
+                let code = zeron_harness::redact::redact_output(&error.code.replace('_', " "));
+                match error.status {
+                    404 => format!("Agent Auth doesn't know it ({code})"),
+                    429 | 500 | 502 | 503 | 504 => format!("Agent Auth is unavailable right now ({code})"),
+                    _ => format!("Agent Auth refused it ({code})"),
+                }
+            }
+        }
+    }
+
+    /// Agent Auth has no such account (any more).
+    pub(crate) fn not_found(&self) -> bool {
+        matches!(self, Self::Api(error) if error.status == 404)
+    }
 }
 
 /// The Scaffold bearer as sent, and a fingerprint of it: cached authority is
@@ -113,9 +142,10 @@ impl std::fmt::Debug for AgentInferenceAuthority {
     }
 }
 
-/// One shared account (`GET /api/agent-accounts`). Only what the catalog
-/// shows; the credentials stay with Agent Auth.
-#[derive(Debug, Clone, Deserialize)]
+/// One shared account (`GET /api/agent-accounts`, and an import's answer).
+/// Only what the catalog and Settings show; the credentials stay with Agent
+/// Auth.
+#[derive(Debug, Clone, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct RemoteAgentAccount {
     pub id: String,
@@ -127,12 +157,111 @@ pub(crate) struct RemoteAgentAccount {
     #[serde(default)]
     pub display_name: Option<String>,
     #[serde(default)]
+    pub organization: Option<String>,
+    /// Platform's name for the plan; Crew's engine re-sends it as `planLabel`
+    /// (its Settings' `SharedAccount`), so either is read.
+    #[serde(default)]
+    plan: Option<String>,
+    #[serde(default)]
+    plan_label: Option<String>,
+    /// `connected`, `disabled`, `attention_required`, `revoked`.
+    #[serde(default, deserialize_with = "null_as_default")]
     pub status: String,
+    #[serde(default, deserialize_with = "null_as_default")]
+    pub usage_windows: Vec<RemoteUsageWindow>,
+}
+
+/// A plan window as Agent Auth reads it (`{modelPattern, label, usedFraction,
+/// resetAt}`), every field optional: one odd window never loses the list.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct RemoteUsageWindow {
+    /// The models it limits: a family's (`claude-*`, `gpt-*`), or one
+    /// model's or tier's (`claude-opus-*`, `gpt-5.3-codex-spark`).
+    #[serde(default)]
+    pub model_pattern: Option<String>,
+    #[serde(default)]
+    pub label: Option<String>,
+    #[serde(default)]
+    pub used_fraction: Option<f64>,
+    #[serde(default)]
+    pub reset_at: Option<String>,
+    #[serde(default)]
+    pub resets_at: Option<String>,
+}
+
+impl RemoteAgentAccount {
+    /// Crew's Settings' test: an account Agent Auth can route to.
+    pub(crate) fn healthy(&self) -> bool {
+        matches!(self.status.as_str(), "connected" | "active" | "ready")
+    }
+
+    pub(crate) fn plan_label(&self) -> Option<&str> {
+        [self.plan_label.as_deref(), self.plan.as_deref()]
+            .into_iter()
+            .flatten()
+            .map(str::trim)
+            .find(|plan| !plan.is_empty())
+    }
+}
+
+fn null_as_default<'de, D, T>(deserializer: D) -> Result<T, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Default + Deserialize<'de>,
+{
+    Ok(Option::<T>::deserialize(deserializer)?.unwrap_or_default())
 }
 
 #[derive(Deserialize)]
 struct RemoteAgentAccounts {
     accounts: Vec<RemoteAgentAccount>,
+}
+
+/// A login signed in on this device, for the shared pool
+/// (`POST /api/agent-accounts/import`), as Crew's `AgentAccountCredentialImport`.
+/// Never logged; kept in memory only until Agent Auth acknowledges it.
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct AgentAccountImport {
+    /// `anthropic` or `openai`.
+    pub provider: String,
+    /// Who the login is at the provider, as a slot is keyed: Claude's account
+    /// uuid, ChatGPT's `user::workspace`.
+    pub provider_account_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub email: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub organization: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub plan: Option<String>,
+    pub capabilities: Vec<String>,
+    pub credential: AgentAccountCredential,
+}
+
+/// The OAuth grant itself.
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct AgentAccountCredential {
+    pub access_token: String,
+    pub refresh_token: String,
+    /// RFC 3339.
+    pub expires_at: String,
+    pub scopes: Vec<String>,
+}
+
+/// Never prints the grant.
+impl std::fmt::Debug for AgentAccountImport {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AgentAccountImport")
+            .field("provider", &self.provider)
+            .field("provider_account_id", &self.provider_account_id)
+            .field("email", &self.email)
+            .field("credential", &"<redacted>")
+            .finish()
+    }
 }
 
 /// An inference request the relay forwards.
@@ -290,8 +419,20 @@ impl AgentAuthClient {
         body: Option<&serde_json::Value>,
         cancellation: &CancellationToken,
     ) -> Result<T, AgentAuthError> {
-        let credential = self.credential().await?;
         let url = self.origin.join(path).expect("static Agent Auth path");
+        let bytes = self.call(method, url, body, cancellation).await?;
+        serde_json::from_slice(&bytes).map_err(|_| AgentAuthError::InvalidResponse("not the expected JSON".into()))
+    }
+
+    /// One authorized request; a success's body (at most [`MAX_JSON_BYTES`]).
+    async fn call(
+        &self,
+        method: Method,
+        url: Url,
+        body: Option<&serde_json::Value>,
+        cancellation: &CancellationToken,
+    ) -> Result<Vec<u8>, AgentAuthError> {
+        let credential = self.credential().await?;
         let mut request = self
             .http
             .request(method, url)
@@ -324,7 +465,7 @@ impl AgentAuthClient {
         if !status.is_success() {
             return Err(api_error(status, &bytes, retry_after));
         }
-        serde_json::from_slice(&bytes).map_err(|_| AgentAuthError::InvalidResponse("not the expected JSON".into()))
+        Ok(bytes)
     }
 
     /// A short-lived inference authority for the signed-in principal.
@@ -347,6 +488,49 @@ impl AgentAuthClient {
             .json(Method::GET, "/api/agent-accounts", None, &CancellationToken::new())
             .await?;
         Ok(listed.accounts)
+    }
+
+    /// Hand a login to the shared pool; the account Agent Auth keeps it as.
+    pub(crate) async fn import_account(
+        &self,
+        import: &AgentAccountImport,
+    ) -> Result<RemoteAgentAccount, AgentAuthError> {
+        #[derive(Deserialize)]
+        struct Imported {
+            account: RemoteAgentAccount,
+        }
+        let body = serde_json::to_value(import)
+            .map_err(|_| AgentAuthError::InvalidResponse("the account couldn't be encoded".into()))?;
+        let imported: Imported = self
+            .json(
+                Method::POST,
+                "/api/agent-accounts/import",
+                Some(&body),
+                &CancellationToken::new(),
+            )
+            .await?;
+        Ok(imported.account)
+    }
+
+    /// Revoke one shared account. (One Agent Auth doesn't know answers 404:
+    /// `agent_account_not_found`.)
+    pub(crate) async fn revoke_account(&self, account_id: &str) -> Result<(), AgentAuthError> {
+        let id = account_id.trim();
+        if id.is_empty()
+            || id.len() > 256
+            || matches!(id, "." | "..")
+            || id.chars().any(|c| c == '/' || c == '\\' || c.is_whitespace() || c.is_control())
+        {
+            return Err(AgentAuthError::InvalidResponse("not a shared account's id".into()));
+        }
+        let mut url = self.origin.clone();
+        url.path_segments_mut()
+            .map_err(|_| AgentAuthError::InvalidResponse("the Scaffold URL has no path".into()))?
+            .clear()
+            .extend(["api", "agent-accounts", id]);
+        self.call(Method::DELETE, url, None, &CancellationToken::new())
+            .await
+            .map(drop)
     }
 
     /// Forward one inference request with `authority`, streaming both ways.

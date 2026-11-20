@@ -1264,6 +1264,11 @@ impl Agents {
             }
             Err(error) => {
                 eprintln!("zeron-zgx: agents: {id}'s code didn't finish the sign-in: {error}");
+                // Crew: why the shared account wasn't added, in the engine's
+                // words.
+                if crate::crew::shared_accounts() {
+                    self.note(&id, generation, Some(&error));
+                }
                 self.settle(&id, generation, true);
                 Err(fail(&error))
             }
@@ -1307,6 +1312,11 @@ impl Agents {
             Ok(start) => start,
             Err(error) => {
                 eprintln!("zeron-zgx: agents: {id}'s sign-in didn't start: {error}");
+                // Crew: why a shared account's sign-in can't start, in the
+                // engine's words.
+                if crate::crew::shared_accounts() {
+                    self.note(&id, generation, Some(&error));
+                }
                 self.settle(&id, generation, true);
                 return Err(fail(&error));
             }
@@ -1395,8 +1405,9 @@ impl Agents {
                         poll["message"].as_str().unwrap_or("no reason given")
                     );
                     // An agent from the ACP registry says why in its own
-                    // words (one that needs a terminal names the command).
-                    if id.starts_with("acp.") {
+                    // words (one that needs a terminal names the command);
+                    // Crew's engine, why a shared account wasn't added.
+                    if id.starts_with("acp.") || crate::crew::shared_accounts() {
                         self.note(&id, generation, poll["message"].as_str());
                     }
                     self.settle(&id, generation, true);
@@ -1791,6 +1802,29 @@ fn account_value(account: &Json, reset: Option<&Reset>) -> Value {
             Value::Bool(account["authKind"].as_str() == Some("api-key") && account["displayName"].as_str().is_some()),
         ),
     ];
+    // Crew: how a shared account stands with Agent Auth ("Needs attention",
+    // "Disabled", "Revoked"), and each of its windows as Agent Auth names
+    // it, for its row there (ui/screens/settings/crew_accounts.luau), whose
+    // meters are its "5-hour" and "Weekly" windows by name, and whose other
+    // windows ("Opus weekly") are said in words.
+    if let Some(error) = account["usageError"].as_str().filter(|e| !e.is_empty()) {
+        fields.push(("error", Value::from(error)));
+    }
+    let named: Vec<Value> = windows
+        .iter()
+        .filter_map(|w| {
+            let label = w["label"].as_str().filter(|l| !l.is_empty())?;
+            let mut window = vec![
+                ("label", Value::from(label)),
+                ("used", Value::from(w["usedFraction"].as_f64().unwrap_or(0.).clamp(0., 1.))),
+            ];
+            if let Some(at) = w["resetsAt"].as_str().and_then(epoch_secs) {
+                window.push(("resets", Value::from(at as f64)));
+            }
+            Some(Value::record(window))
+        })
+        .collect();
+    fields.push(("windows", Value::List(named.into())));
     if account["codexResetCredits"].is_object() {
         let (count, list) = banked(&account["codexResetCredits"], spent);
         fields.push(("banked", Value::from(count as f64)));
@@ -2137,6 +2171,29 @@ mod tests {
         assert_eq!(value.field("week").and_then(Value::as_f64), Some(1.0));
         assert_eq!(value.field("plan").map(text).as_deref(), Some("Pro"));
         assert_eq!(value.field("session_resets"), None);
+        // Crew: how a shared account stands, and each window by its name,
+        // with its reset.
+        let shared = account_value(&json!({
+            "id": "s1", "usageError": "Needs attention",
+            "usageWindows": [
+                { "label": "Weekly", "usedFraction": 0.4, "resetsAt": "2026-11-01T15:45:00Z" },
+                { "label": "Opus weekly", "usedFraction": 1.2 },
+                { "usedFraction": 0.9 }
+            ]
+        }), None);
+        assert_eq!(shared.field("error").map(text).as_deref(), Some("Needs attention"));
+        let named: Vec<(Option<String>, Option<f64>, Option<f64>)> = match shared.field("windows") {
+            Some(Value::List(list)) => list
+                .iter()
+                .map(|w| (w.field("label").map(text), w.field("used").and_then(Value::as_f64), w.field("resets").and_then(Value::as_f64)))
+                .collect(),
+            _ => Vec::new(),
+        };
+        assert_eq!(
+            named,
+            [(Some("Weekly".to_owned()), Some(0.4), Some(1_793_547_900.0)), (Some("Opus weekly".to_owned()), Some(1.0), None)],
+            "an unnamed window isn't one to say"
+        );
         let timed = account_value(&json!({
             "id": "a3", "usageWindows": [{ "label": "5h", "usedFraction": 1.0, "resetsAt": "2026-11-01T15:45:00Z" }]
         }), None);

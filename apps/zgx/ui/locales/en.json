@@ -3973,11 +3973,21 @@
     },
     "providers": {
       "managed": "On Crew's shared accounts",
-      "managed_hint": "Agent Auth signs it in: there's no account to connect.",
+      "managed_hint": "Agent Auth signs it in with Crew's shared accounts, in Settings → Providers.",
       "found": "{n, plural, one {Found # agent on this computer. It runs on Crew's shared accounts.} other {Found # agents on this computer. They run on Crew's shared accounts.}}"
     },
     "account": {
       "sign_out_title": "Sign out of Crew?"
+    },
+    "accounts": {
+      "title": "Shared accounts",
+      "description": "Crew runs your agents on these accounts. Each chat uses one automatically, or the one its Account option names.",
+      "terms": "shared accounts agent auth usage limits plan claude chatgpt anthropic openai add remove",
+      "remove_title": "Remove this shared account?",
+      "remove_body": "Crew stops running agents on it. You can add it again later.",
+      "remove": "Remove",
+      "couldnt_remove": "Couldn't remove the account",
+      "no_usage": "Usage unavailable"
     }
   }
 }
