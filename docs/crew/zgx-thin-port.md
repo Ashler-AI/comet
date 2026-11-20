@@ -618,6 +618,8 @@ Decided by the owner on 2026-11-20:
   - First: `crew-zgx-canary-20261120-3` (run 44783173811, from `de41c5145`). A 195 MB
     app. Checked on a Mac: `spctl` "accepted, source=Notarized Developer ID", the
     staple valid, team 825LYXGJR6. To install, unzip it into /Applications.
+  - With OMP: `crew-zgx-canary-20261120-4` (run 44793705345, from `e7d17b9cb`). 196 MB,
+    notarized, the staple valid.
   - No updater yet: About's "Crew updates itself" overstates it. The app asks its Edge's
     `/releases`, which the local Edge refuses.
   - Packaged 2026-11-19 from `9bca77d5c`: 361 MB debug bundle, `zeron` and
