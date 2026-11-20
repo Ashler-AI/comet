@@ -491,7 +491,7 @@ Decided by the owner on 2026-11-20:
 - **Codex resume failure:** start a fresh conversation and say so. Upstream now does
   exactly this: "Couldn't restore the earlier Codex conversation …", shown as an error
   row while the turn goes on. It fails only for a dead process or a refusal.
-- **Crew's wording:** an overlay file of Crew messages. Not built yet.
+- **Crew's wording:** an overlay file of Crew messages (built: see Status, slice 4).
 - **The branch** is pushed to `origin`, and signed canaries are built from
   `crew-zgx-canary-*` tags (`.github/workflows/crew-zgx-canary.yml`).
 - **Next:** finish the Agent Auth phase, OMP included.
@@ -555,10 +555,21 @@ Decided by the owner on 2026-11-20:
     - Upstream's Luau UI tests: 1,470 tests, 0 failed. The command was
       `scripts/ci/test-zgx.sh ui` with the zgx CLI built at the pinned rev from
       cargo's checkout, using that checkout's `.cargo/config.toml`.
-  - Still Zeron's in Crew mode: 143 English messages that name Zeron (About's
-    updates, the Plugins page and others), the menu's "Use Zeron v3", and the host
-    toast layer's accessible name. That needs a copy pass, which is the owner's call
-    because of upstream conflicts.
+  - Crew's wording (2026-11-20):
+    - `ui/crew/locales/<locale>.json` holds Crew's words for upstream's messages that
+      name Zeron: 114 English and 113 Chinese. A Crew build merges them over
+      `ui/locales` into its data folder and loads that (`src/crew_wording.rs`, one
+      seam in `src/plugins/mod.rs` `with_catalog`). Upstream's catalog files stay as
+      upstream wrote them.
+    - `ui/crew/locales/kept.json` lists the 29 that stay Zeron, each with why: the
+      "by Zeron" credits, the `.zeron-plugin` and `.zeron-template` formats,
+      "Use Zeron v3", the commit credit (`zeronsh[bot]`), and Zeron Cloud, Members,
+      invites, member cards and Profile, none of which Crew shows.
+    - `crew_wording_tests` fail when an upstream message naming Zeron has neither
+      Crew's words nor a reason, or when Crew's no longer match upstream's keys and
+      arguments.
+    - Still upstream's: Crew's own new messages (the `crew` block at the end of
+      `en.json` and `zh-Hans.json`), and the host toast layer's accessible name.
 - [ ] 5. Agent Auth: built and unit-tested on 2026-11-19; merged from
   `crew/zgx-thin-port-agent-auth`.
   - `cargo test -p zeron-harness --lib crew_inference`: 7 passed. These cover the

@@ -407,6 +407,10 @@ fn answer(host: &ScriptHost, answers: Rc<Answers>) {
     });
 }
 
+/// Crew's words over upstream's catalog (ui/crew/locales).
+#[path = "crew_wording.rs"]
+pub mod wording;
+
 #[cfg(test)]
 #[path = "crew_tests.rs"]
 mod tests;

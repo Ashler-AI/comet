@@ -997,7 +997,8 @@ fn with_catalog(host: ScriptHost, ui: &Path) -> ScriptHost {
     if !locales.join("en.json").exists() {
         return host;
     }
-    host.i18n(locales, "en")
+    // Crew: Crew's words over upstream's (src/crew_wording.rs).
+    host.i18n(crate::crew::wording::catalog_dir(&locales), "en")
 }
 
 /// Zeron's own plugins, shipped beside the app's scripts (`ui/`).

@@ -13,8 +13,9 @@ fn ui() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("ui")
 }
 
-/// A locale file's messages by their dotted keys.
-fn catalog(name: &str) -> BTreeMap<String, String> {
+/// A locale file's messages by their dotted keys. (Crew's wording tests
+/// read them too: src/crew_wording_tests.rs.)
+pub(crate) fn catalog(name: &str) -> BTreeMap<String, String> {
     let path = ui().join("locales").join(name);
     let text = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
     let json: serde_json::Value = serde_json::from_str(&text).unwrap_or_else(|e| panic!("{name}: {e}"));
@@ -52,7 +53,7 @@ fn translations() -> Vec<String> {
 /// The arguments a message names (`{name}`, `{n, plural, …}`), through its
 /// plural and select branches; an error where it doesn't parse. ICU's
 /// quoting: `'{'` is a literal brace, `''` an apostrophe.
-fn arguments(message: &str) -> Result<BTreeSet<String>, String> {
+pub(crate) fn arguments(message: &str) -> Result<BTreeSet<String>, String> {
     let chars: Vec<char> = message.chars().collect();
     let mut names = BTreeSet::new();
     let mut i = 0;

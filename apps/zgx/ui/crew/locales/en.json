@@ -1,0 +1,270 @@
+{
+  "ds": {
+    "working": {
+      "words": {
+        "zeroning": "Crewing"
+      }
+    },
+    "tool_detail": {
+      "whole_update": "Update Crew on the device that ran this command to see all of its output."
+    },
+    "provider_card": {
+      "unavailable_hint": "Agents already set up keep working. Crew will look again when it can.",
+      "reset_why": {
+        "offline": "Crew can't reach the device this account is on."
+      },
+      "resets_unlisted": "Crew couldn't list them just now. Close this and try again in a moment.",
+      "key_offline": "Crew's engine isn't answering — try again in a moment."
+    }
+  },
+  "settings": {
+    "general": {
+      "language": {
+        "chosen": "The menu bar changes the next time Crew opens."
+      },
+      "worktrees": {
+        "in_zeron": "New worktrees go in Crew's folder."
+      },
+      "keep_running": {
+        "label": "Keep Crew running after you quit",
+        "off": "When you quit, Crew stops once its chats are done."
+      }
+    },
+    "engine": {
+      "outdated": "Update Crew on this computer to change this.",
+      "offline": "Crew isn't running on this computer."
+    },
+    "appearance": {
+      "description": "How Crew looks on this computer.",
+      "wallpaper": {
+        "couldnt_keep": "Crew couldn't keep that picture. Try again."
+      }
+    },
+    "notifications": {
+      "background_only": {
+        "description": "None while Crew is the app you're in."
+      },
+      "unread": {
+        "body": "Banners follow what Crew last saved. Try again in a moment."
+      }
+    },
+    "shortcuts": {
+      "empty_body": "Crew's shortcuts show here as they're added."
+    },
+    "appshots": {
+      "permissions_description": "macOS asks for these for the app that opened Crew: Crew itself, or, run from a terminal or an editor, that app. Grant them there in System Settings → Privacy & Security, then quit and reopen it once.",
+      "changed": "Changed a permission? Check again after returning to Crew.",
+      "capture": {
+        "description": "Screen Recording lets Crew capture the frontmost window. macOS may request one restart."
+      }
+    },
+    "providers": {
+      "cant_reach": "Crew can't reach {device}.",
+      "add": {
+        "offline": "Crew can't reach the registry right now: this is the list from earlier.",
+        "unavailable_hint": "Crew can't reach it right now. Try again in a moment.",
+        "failed_offline": "Crew can't reach {device}. Nothing was changed."
+      }
+    },
+    "devices": {
+      "remove_online": "Online now. Quit Crew on it first.",
+      "remove_body": "It disappears from your devices everywhere. Its sessions and projects stay, so you can still read them, and nothing on the computer itself is deleted. If Crew opens on it again, it comes back.",
+      "online_now": "It's online now. Quit Crew on it, then try again."
+    },
+    "projects": {
+      "remove_keeps_folder": "The folder {path} stays on {device} with all its files. Crew just forgets it."
+    },
+    "about": {
+      "state": {
+        "updating_line": "Downloading Crew {version} and putting it in place.",
+        "updated": "Updated to Crew {version}",
+        "unmanaged": "Update from the Crew app",
+        "unmanaged_line": "This computer's engine came with the Crew app, which updates it: open Crew and choose Check for Updates.",
+        "not_connected_line": "Crew's version shows once the engine is running.",
+        "available": "Crew {version} is available",
+        "up_to_date": "Crew is up to date",
+        "downloading": "Downloading Crew {version}…",
+        "ready": "Crew {version} is ready",
+        "ready_line": "Restart to finish. If you don't, it installs when you quit Crew.",
+        "download_failed": "Couldn't download Crew {version}",
+        "held": "Crew {version} can't be installed yet",
+        "available_stable": "Crew {version} (Stable) is available"
+      },
+      "description": "Which Crew this is, and keeping it up to date.",
+      "beta": {
+        "off": "Try the next Crew early. Needs macOS {version} or later.",
+        "off_any": "Try the next Crew early."
+      },
+      "updates_self_description": "Crew updates itself: a new version downloads in the background and installs when you restart.",
+      "updates_description": "Updates go to the engine on this computer, as the Crew app's do. This app isn't packaged yet, so it isn't updated here."
+    }
+  },
+  "shell": {
+    "sidebar": {
+      "menu": {
+        "zeron_link": "Crew conversation link"
+      },
+      "project": {
+        "edit": {
+          "error": {
+            "save_outdated": "Crew on this computer needs an update to save project icons. Update it, then save again.",
+            "save_offline": "Crew on this computer isn't responding. Try again in a moment."
+          }
+        }
+      }
+    },
+    "keys": {
+      "title": {
+        "shell_reload": "Reload Crew"
+      }
+    },
+    "palette": {
+      "reload_zeron": "Reload Crew"
+    },
+    "add_project": {
+      "repos_offline": "Crew can't be reached right now"
+    },
+    "updates": {
+      "not_applied": "Crew didn't update",
+      "plan_here": "Downloads Crew for this device, then asks you to restart"
+    },
+    "activity": {
+      "sleep": {
+        "needs_update": "Crew on this chat's device needs an update for Sleep."
+      }
+    }
+  },
+  "onboarding": {
+    "done": {
+      "open_zeron": "Open Crew"
+    },
+    "providers": {
+      "unavailable": "Crew runs the coding agents you already use."
+    }
+  },
+  "chat": {
+    "session": {
+      "offline_body": "Crew will show it as soon as it can reach your agents again."
+    },
+    "zeron_commands": {
+      "model": "Crew: choose agent, model, and reasoning",
+      "new": "Crew: start a new conversation",
+      "resume": "Crew: search and open conversations",
+      "settings": "Crew: open settings",
+      "files": "Crew: open project files",
+      "terminal": "Crew: open a terminal",
+      "rename": "Crew: rename this conversation",
+      "stop": "Crew: stop the active run"
+    }
+  },
+  "panel": {
+    "terminal": {
+      "offline": "Crew can't reach this session's device right now.",
+      "update": "Update Crew to use terminals here."
+    }
+  },
+  "files": {
+    "unreadable": {
+      "body": "Crew couldn't list this folder."
+    },
+    "workspace": {
+      "offline": "Crew can't reach this session's device right now.",
+      "unreadable_text": "It isn't text Crew can read.",
+      "read_only": "Crew can show this file but not write it."
+    }
+  },
+  "engine": {
+    "update": {
+      "out_of_date": "Crew's engine is out of date",
+      "restart_tip": "Crew updated in the background. Restarting its engine ends what's running in it.",
+      "old": "This Crew needs a newer engine"
+    }
+  },
+  "account": {
+    "api": {
+      "says": {
+        "offline": "Crew can't be reached right now."
+      }
+    },
+    "auth": {
+      "says": {
+        "offline": "Crew can't be reached. Check your connection and try again."
+      }
+    }
+  },
+  "plugins": {
+    "words": {
+      "place": {
+        "zeron": "part of Crew",
+        "zeron_parts": "parts of Crew"
+      },
+      "permission": {
+        "ui_add": {
+          "title": "Add things to Crew's interface"
+        },
+        "ui_replace": {
+          "detail": "Its code runs as part of Crew: it can do anything you can."
+        }
+      },
+      "details": {
+        "changes": "Parts of Crew it changes"
+      }
+    },
+    "page": {
+      "description": "What plugins add to Crew on each of your computers, and the tools they give your agents.",
+      "builtin": "{name} is part of Crew",
+      "remove_body": "It stops everywhere in Crew at once. Its folder goes to the plugins folder's removed items, in case you want it back.",
+      "install_dialog_body": "Paste a link to a .zeron-plugin file, a GitHub release or a repository, or choose a file. Crew checks who signed it, and you allow what it asks before it runs.",
+      "offline_body": "The ones you've allowed come back when Crew is running again.",
+      "device_offline_body": "Its plugins show here once it's online again, with Crew running.",
+      "remove_body_device": "It stops everywhere in Crew on {device} at once. Its folder goes to the removed items in that computer's plugins folder, in case you want it back.",
+      "install_dialog_body_device": "Paste a link to a .zeron-plugin file, a GitHub release or a repository, or choose a file on this computer. Crew checks who signed it, and you allow what it asks before it runs there."
+    },
+    "consent": {
+      "unknown_why": "Crew can't tell who made it. Allow it only if you trust where it came from.",
+      "unverified_why": "Crew can't confirm who made this. Allow it only if you trust where it came from.",
+      "unverified_why_from": "Crew can't confirm who made this. Allow it only if you trust where it came from: {where}.",
+      "mine_confirm": "Sign {name} as your own? Only if you wrote it yourself: Crew will treat it as yours from now on, on this computer."
+    },
+    "permissions": {
+      "screen_recording": {
+        "description": "Lets {name} capture the window in front. macOS may ask you to reopen Crew once."
+      },
+      "note": "macOS asks for these for the app that opened Crew: Crew itself, or, run from a terminal or an editor, that app. Grant them in System Settings → Privacy & Security, then quit and reopen it once."
+    },
+    "init": {
+      "failed_body": "Crew keeps working without it until it's updated or fixed."
+    },
+    "failure": {
+      "bad_file": "It has a file Crew won't write.",
+      "rate_limited": "GitHub is turning away requests from this device for now. Try again later, or sign in with GitHub's command-line tool (gh auth login) so Crew asks as you.",
+      "no_package": "That release has no file Crew can install."
+    }
+  },
+  "templates": {
+    "page": {
+      "description": "Whole interfaces for Crew. Anything a template leaves out comes from the default interface.",
+      "about": {
+        "out_of_date": "Made for Crew {version}. Crew has updated since.",
+        "out_of_date_unversioned": "Made for an earlier Crew. Crew has updated since."
+      },
+      "delete_body": "It's set aside in the templates folder, so you can get it back. If it's in use, Crew switches to the default interface.",
+      "install_dialog_body": "Paste a link to a .zeron-template file, a GitHub release or a repository, or choose a file. Crew checks who signed it, and you allow it before it's used."
+    },
+    "consent": {
+      "keep_body": "An agent made, changed or switched to this template, or it hasn't been kept since it changed. Until you keep it, it's a preview. Kept, it runs with everything Crew can do.",
+      "keep_files_detail": "If they change again, Crew asks again.",
+      "trust_body": "A template runs as part of Crew: it replaces Crew's interface and can do anything Crew can, with your chats, files, accounts and agents.",
+      "unknown_body": "Crew can't tell whose key signed it. Install it only if you trust where it came from.",
+      "files_made_for": "{n, plural, one {# file} other {# files}} · made for Crew {version}",
+      "left_out_detail": "Templates can't replace these, so Crew keeps its versions: {files}",
+      "unverified_body": "Crew can't confirm who made this. Install it only if you trust where it came from.",
+      "unverified_body_from": "Crew can't confirm who made this. Install it only if you trust where it came from: {where}."
+    }
+  },
+  "themes": {
+    "page": {
+      "description": "Colours for Crew. Your theme is worn with any template."
+    }
+  }
+}

@@ -1,0 +1,265 @@
+{
+  "ds": {
+    "tool_detail": {
+      "whole_update": "请在运行此命令的设备上更新 Crew，以查看全部输出。"
+    },
+    "provider_card": {
+      "unavailable_hint": "已设置的智能体会继续运行。Crew 会在可以时再次查找。",
+      "reset_why": {
+        "offline": "Crew 无法连接到此账户所在的设备。"
+      },
+      "resets_unlisted": "Crew 暂时无法列出它们。请关闭后稍后再试。",
+      "key_offline": "Crew 引擎没有响应——请稍后再试。"
+    }
+  },
+  "settings": {
+    "general": {
+      "language": {
+        "chosen": "菜单栏将在下次打开 Crew 时更改。"
+      },
+      "worktrees": {
+        "in_zeron": "新工作树将放在 Crew 的文件夹中。"
+      },
+      "keep_running": {
+        "label": "退出后让 Crew 继续运行",
+        "off": "退出时，Crew 会在对话完成后停止。"
+      }
+    },
+    "engine": {
+      "outdated": "更新此电脑上的 Crew 以更改此设置。",
+      "offline": "Crew 未在此电脑上运行。"
+    },
+    "appearance": {
+      "description": "此电脑上 Crew 的外观。",
+      "wallpaper": {
+        "couldnt_keep": "Crew 无法保存该图片。请重试。"
+      }
+    },
+    "notifications": {
+      "background_only": {
+        "description": "使用 Crew 时不显示通知。"
+      },
+      "unread": {
+        "body": "横幅使用 Crew 上次保存的设置。请稍后重试。"
+      }
+    },
+    "shortcuts": {
+      "empty_body": "添加的 Crew 快捷键会显示在此处。"
+    },
+    "appshots": {
+      "permissions_description": "macOS 会向打开 Crew 的 App 请求这些权限：可能是 Crew 本身，也可能是启动它的终端或编辑器。请在“系统设置”→“隐私与安全性”中为该 App 授权，然后退出并重新打开一次。",
+      "changed": "更改了权限？返回 Crew 后再次检查。",
+      "capture": {
+        "description": "屏幕录制允许 Crew 截取最前方的窗口。macOS 可能要求重新启动一次。"
+      }
+    },
+    "providers": {
+      "cant_reach": "Crew 无法连接到 {device}。",
+      "add": {
+        "offline": "Crew 目前无法连接到注册表：以下是之前的列表。",
+        "unavailable_hint": "Crew 目前无法连接到它。请稍后重试。",
+        "failed_offline": "Crew 无法连接到 {device}。未做任何更改。"
+      }
+    },
+    "devices": {
+      "remove_online": "当前在线。请先在该设备上退出 Crew。",
+      "remove_body": "它会从你所有设备的列表中消失。它的会话和项目会保留，你仍可查看，该电脑上的任何内容都不会被删除。如果再次在它上面打开 Crew，它会重新出现。",
+      "online_now": "它当前在线。请在该设备上退出 Crew 后重试。"
+    },
+    "projects": {
+      "remove_keeps_folder": "文件夹 {path} 及其中所有文件会保留在 {device} 上，Crew 只是不再记录它。"
+    },
+    "about": {
+      "state": {
+        "updating_line": "正在下载并安装 Crew {version}。",
+        "updated": "已更新到 Crew {version}",
+        "unmanaged": "从 Crew App 更新",
+        "unmanaged_line": "此电脑的引擎随 Crew App 安装，由该 App 更新：打开 Crew 并选择“检查更新”。",
+        "not_connected_line": "引擎运行后会显示 Crew 版本。",
+        "available": "Crew {version} 可用",
+        "up_to_date": "Crew 已是最新版本",
+        "downloading": "正在下载 Crew {version}…",
+        "ready": "Crew {version} 已准备好",
+        "ready_line": "重新启动即可完成。如果不重新启动，退出 Crew 时会自动安装。",
+        "download_failed": "无法下载 Crew {version}",
+        "held": "暂时无法安装 Crew {version}",
+        "available_stable": "Crew {version}（稳定版）可用"
+      },
+      "description": "查看 Crew 的版本并保持更新。",
+      "beta": {
+        "off": "抢先试用下一版 Crew。需要 macOS {version} 或更高版本。",
+        "off_any": "抢先试用下一版 Crew。"
+      },
+      "updates_self_description": "Crew 会自动更新：新版本在后台下载，重新启动时安装。",
+      "updates_description": "更新会应用到此电脑上的引擎，与 Crew App 的更新一样。此 App 尚未打包，因此不会在此更新。"
+    }
+  },
+  "shell": {
+    "sidebar": {
+      "menu": {
+        "zeron_link": "Crew 对话链接"
+      },
+      "project": {
+        "edit": {
+          "error": {
+            "save_outdated": "这台电脑上的 Crew 需要更新才能保存项目图标。更新后再保存。",
+            "save_offline": "这台电脑上的 Crew 没有响应，请稍后再试。"
+          }
+        }
+      }
+    },
+    "keys": {
+      "title": {
+        "shell_reload": "重新启动 Crew"
+      }
+    },
+    "palette": {
+      "reload_zeron": "重新启动 Crew"
+    },
+    "add_project": {
+      "repos_offline": "现在无法连接 Crew"
+    },
+    "updates": {
+      "not_applied": "Crew 未更新",
+      "plan_here": "为此设备下载 Crew，然后请你重新启动"
+    },
+    "activity": {
+      "sleep": {
+        "needs_update": "此会话所在设备上的 Crew 需要更新才能使用休眠。"
+      }
+    }
+  },
+  "onboarding": {
+    "done": {
+      "open_zeron": "打开 Crew"
+    },
+    "providers": {
+      "unavailable": "Crew 运行你已经使用的编码智能体。"
+    }
+  },
+  "chat": {
+    "session": {
+      "offline_body": "Crew 重新连接到智能体后将立即显示。"
+    },
+    "zeron_commands": {
+      "model": "Crew：选择智能体、模型和推理强度",
+      "new": "Crew：开始新对话",
+      "resume": "Crew：搜索并打开对话",
+      "settings": "Crew：打开设置",
+      "files": "Crew：打开项目文件",
+      "terminal": "Crew：打开终端",
+      "rename": "Crew：重命名此对话",
+      "stop": "Crew：停止当前运行"
+    }
+  },
+  "panel": {
+    "terminal": {
+      "offline": "Crew 暂时无法连接到此会话的设备。",
+      "update": "更新 Crew 以在此使用终端。"
+    }
+  },
+  "files": {
+    "unreadable": {
+      "body": "Crew 无法列出此文件夹。"
+    },
+    "workspace": {
+      "offline": "Crew 暂时无法连接到此会话的设备。",
+      "unreadable_text": "这不是 Crew 可读取的文本。",
+      "read_only": "Crew 可以显示此文件，但无法写入。"
+    }
+  },
+  "engine": {
+    "update": {
+      "out_of_date": "Crew 引擎版本过旧",
+      "restart_tip": "Crew 已在后台更新。重新启动引擎会结束其中正在运行的任务。",
+      "old": "此版本 Crew 需要更新的引擎"
+    }
+  },
+  "account": {
+    "api": {
+      "says": {
+        "offline": "暂时无法连接到 Crew。"
+      }
+    },
+    "auth": {
+      "says": {
+        "offline": "无法连接到 Crew。请检查连接，然后重试。"
+      }
+    }
+  },
+  "plugins": {
+    "words": {
+      "place": {
+        "zeron": "Crew 的一部分",
+        "zeron_parts": "Crew 的部分内容"
+      },
+      "permission": {
+        "ui_add": {
+          "title": "向 Crew 界面添加内容"
+        },
+        "ui_replace": {
+          "detail": "它的代码作为 Crew 的一部分运行：可以做你能做的任何事。"
+        }
+      },
+      "details": {
+        "changes": "它更改的 Crew 部分"
+      }
+    },
+    "page": {
+      "description": "插件在你每台电脑上为 Crew 添加的功能，以及为智能体提供的工具。",
+      "builtin": "{name}是 Crew 的一部分",
+      "remove_body": "它会立即在 Crew 的所有位置停止运行。其文件夹会移到插件文件夹的已移除项目中，以便日后恢复。",
+      "install_dialog_body": "粘贴 .zeron-plugin 文件、GitHub 发布版本或仓库的链接，或选择文件。Crew 会检查签名者，你需要在插件运行前允许其请求的权限。",
+      "offline_body": "Crew 重新运行后，你已允许的插件会恢复。",
+      "device_offline_body": "等它重新上线并运行 Crew 后，它的插件会显示在这里。",
+      "remove_body_device": "它会立即在 {device} 上的 Crew 各处停止。它的文件夹会移到那台电脑插件文件夹的已移除项目中，以便你想找回。",
+      "install_dialog_body_device": "粘贴 .zeron-plugin 文件、GitHub 发布版或代码仓库的链接，或选择这台电脑上的文件。Crew 会检查是谁签名的，在它在那里运行前，由你允许它请求的权限。"
+    },
+    "consent": {
+      "unknown_why": "Crew 无法确定制作者。仅在信任来源时允许。",
+      "unverified_why": "Crew 无法确认它的作者。只有在你信任它的来源时才允许。",
+      "unverified_why_from": "Crew 无法确认它的作者。只有在你信任它的来源时才允许：{where}。",
+      "mine_confirm": "将{name}签名为你自己的插件？仅当它是你亲自编写的：从现在起，Crew 会在这台电脑上把它当作你的插件。"
+    },
+    "permissions": {
+      "screen_recording": {
+        "description": "允许 {name} 截取最前方的窗口。macOS 可能要求重新打开 Crew 一次。"
+      },
+      "note": "macOS 会向打开 Crew 的 App 请求这些权限：可能是 Crew 本身，也可能是启动它的终端或编辑器。请在“系统设置”→“隐私与安全性”中为该 App 授权，然后退出并重新打开一次。"
+    },
+    "init": {
+      "failed_body": "在插件更新或修复前，Crew 会在不使用它的情况下继续运行。"
+    },
+    "failure": {
+      "bad_file": "它包含 Crew 不会写入的文件。",
+      "rate_limited": "GitHub 暂时拒绝了来自此设备的请求。请稍后再试，或使用 GitHub 命令行工具登录（gh auth login），让 Crew 以你的身份请求。",
+      "no_package": "该发布版本中没有 Crew 可以安装的文件。"
+    }
+  },
+  "templates": {
+    "page": {
+      "description": "Crew 的完整界面。模板未包含的部分使用默认界面。",
+      "about": {
+        "out_of_date": "为 Crew {version} 制作。此后 Crew 已更新。",
+        "out_of_date_unversioned": "为较早版本的 Crew 制作。此后 Crew 已更新。"
+      },
+      "delete_body": "模板会保留在模板文件夹中，以便日后恢复。如果正在使用，Crew 会切换到默认界面。",
+      "install_dialog_body": "粘贴 .zeron-template 文件、GitHub 发布版或代码仓库的链接，或选择一个文件。Crew 会检查是谁签名的，在使用前由你允许。"
+    },
+    "consent": {
+      "keep_body": "这个模板由代理创建、修改或切换而来，或在你上次保留后又有改动。保留之前它只是预览。保留后，它将拥有 Crew 的全部能力。",
+      "keep_files_detail": "如果它们再次改动，Crew 会再次询问。",
+      "trust_body": "模板作为 Crew 的一部分运行：它会替换 Crew 的界面，并能做 Crew 能做的一切，可访问你的对话、文件、账户和智能体。",
+      "unknown_body": "Crew 无法确定签名所用密钥的所有者。仅在信任来源时安装。",
+      "files_made_for": "{n, plural, other {# 个文件}} · 为 Crew {version} 制作",
+      "left_out_detail": "模板不能替换这些文件，因此 Crew 会保留自己的版本：{files}",
+      "unverified_body": "Crew 无法确认它的作者。只有在你信任它的来源时才安装。",
+      "unverified_body_from": "Crew 无法确认它的作者。只有在你信任它的来源时才安装：{where}。"
+    }
+  },
+  "themes": {
+    "page": {
+      "description": "Crew 的配色。你的主题可与任何模板搭配使用。"
+    }
+  }
+}
