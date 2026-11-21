@@ -45,10 +45,13 @@ pub struct ScaffoldConfig {
     pub project_scope: String,
     pub oauth_scopes: String,
     pub deployment_id: Option<String>,
+    /// Crew zgx port: the sandbox region whose Edge is this one
+    /// (`crew-runtime.json` `sandboxRegion`); none, no sandbox is created.
+    pub sandbox_region: Option<String>,
 }
 impl ScaffoldConfig {
     pub fn new(control_origin: impl Into<String>, edge_origin: impl Into<String>, project_scope: impl Into<String>) -> Self {
-        Self { control_origin: control_origin.into(), edge_origin: edge_origin.into(), project_scope: project_scope.into(), oauth_scopes: DEFAULT_OAUTH_SCOPES.into(), deployment_id: None }
+        Self { control_origin: control_origin.into(), edge_origin: edge_origin.into(), project_scope: project_scope.into(), oauth_scopes: DEFAULT_OAUTH_SCOPES.into(), deployment_id: None, sandbox_region: None }
     }
 }
 

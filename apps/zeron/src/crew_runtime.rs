@@ -4,8 +4,12 @@
 //!
 //! ```json
 //! { "edgeUrl": "http://127.0.0.1:8787", "scaffoldUrl": "https://scaffold.example",
-//!   "projectScope": "project", "deploymentId": "optional" }
+//!   "projectScope": "project", "deploymentId": "optional", "sandboxRegion": "optional" }
 //! ```
+//!
+//! `sandboxRegion` (this port's own) names the Scaffold region whose Edge is
+//! `edgeUrl`: the only region this engine creates sandboxes in. Without it,
+//! it creates none (crew_cloud.rs).
 //!
 //! That file, in the data dir `zeron_cli::crew` resolved and allowed, is the
 //! only source: no environment variable names the authority or its Edge
@@ -84,6 +88,16 @@ pub fn load(data_dir: &Path) -> Result<Option<CrewRuntime>, String> {
     }
     let mut scaffold = ScaffoldConfig::new(origin("scaffoldUrl")?, &edge_url, required("projectScope")?);
     scaffold.deployment_id = text("deploymentId")?;
+    // Platform's region names (`^[a-z0-9][a-z0-9-]{0,62}$`).
+    scaffold.sandbox_region = text("sandboxRegion")?;
+    if scaffold.sandbox_region.as_deref().is_some_and(|region| {
+        region.len() > 63
+            || !region.bytes().enumerate().all(|(index, byte)| {
+                byte.is_ascii_lowercase() || byte.is_ascii_digit() || (index > 0 && byte == b'-')
+            })
+    }) {
+        return Err(invalid("sandboxRegion must be a Scaffold region name"));
+    }
     Ok(Some(CrewRuntime { edge_url, scaffold }))
 }
 
@@ -155,7 +169,7 @@ mod tests {
             dir.path(),
             r#"{"edgeUrl":"http://127.0.0.1:8787/","scaffoldUrl":"https://scaffold.example",
                 "projectScope":" project-a ","deploymentId":"deployment-1","ipcPort":27957,
-                "scaffoldRuntimeArtifact":{"unknown":"ignored"}}"#,
+                "sandboxRegion":"harness-zgx","scaffoldRuntimeArtifact":{"unknown":"ignored"}}"#,
         );
         let mut resolved = config(dir.path());
         apply(&mut resolved).unwrap();
@@ -165,6 +179,7 @@ mod tests {
         assert_eq!(scaffold.edge_origin, "http://127.0.0.1:8787");
         assert_eq!(scaffold.project_scope, "project-a");
         assert_eq!(scaffold.deployment_id.as_deref(), Some("deployment-1"));
+        assert_eq!(scaffold.sandbox_region.as_deref(), Some("harness-zgx"));
         assert!(resolved.workos_client_id.is_none() && resolved.org_id.is_none());
         assert!(resolved.edge_token.is_none() && resolved.device.is_none());
         // The data dir and port are slice 1's, whatever the file says.
@@ -185,6 +200,10 @@ mod tests {
             ("scaffoldUrl", serde_json::json!(" ")),
             ("projectScope", serde_json::json!(7)),
             ("deploymentId", serde_json::json!("")),
+            // A region is Platform's name for one, nothing else.
+            ("sandboxRegion", serde_json::json!("Harness ZGX")),
+            ("sandboxRegion", serde_json::json!("-harness")),
+            ("sandboxRegion", serde_json::json!(["harness-zgx"])),
             // Only https origins (or loopback http) are authority configuration.
             ("edgeUrl", serde_json::json!("http://edge.example")),
             ("scaffoldUrl", serde_json::json!("https://scaffold.example/oauth")),
