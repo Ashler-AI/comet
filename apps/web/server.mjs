@@ -10,6 +10,12 @@ const JSON_LIMIT = 256 * 1024;
 const UPLOAD_LIMIT = 16 * 1024 * 1024;
 const CAP_CHAT = 'session.chat';
 const CAP_CONTROL = 'session.control';
+// A session opens only in the Crew app signed in to its project, and that app alone
+// registers the scheme (apps/zeron/src/environment.rs; the engine's HostChannel maps
+// projects to channels the same way).
+const NATIVE_OPEN_SCHEMES = new Map([
+  ['ashler-production', 'comet'], ['ashler-staging', 'comet-staging'], ['crew-upstream-canary', 'crew-upstream-canary'],
+]);
 
 export class HttpError extends Error {
   constructor(status, message) { super(message); this.status = status; }
@@ -531,10 +537,11 @@ export async function createServer(config, viewport = new Viewport(config)) {
         const authority = await viewport.readAuthority();
         const scope = authority.scope;
         const segments = [scope?.projectId, scope?.deploymentId, scope?.sessionId, config.sandboxId];
-        requireValue(segments.every(value => typeof value === 'string' && /^[A-Za-z0-9._-]{1,256}$/.test(value))
+        const scheme = NATIVE_OPEN_SCHEMES.get(scope?.projectId);
+        requireValue(scheme && segments.every(value => typeof value === 'string' && /^[A-Za-z0-9._-]{1,256}$/.test(value))
           && scope.sessionId === config.sessionId && authority.sandboxId === config.sandboxId,
         'Crew native session binding unavailable', 503);
-        return respond(res, 200, { url: `comet-staging://scaffold/${segments.join('/')}` });
+        return respond(res, 200, { url: `${scheme}://scaffold/${segments.join('/')}` });
       }
       if (req.method === 'GET' && path === '/api/models') {
         await viewport.readAuthority();
