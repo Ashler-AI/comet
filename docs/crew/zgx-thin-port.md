@@ -509,6 +509,125 @@ The harness release (a StatefulSet, volume and HTTPRoute, applied with Helm as t
 canary harness was) and the push to the shared `scaffold-staging` Worker each need the
 owner's word before they're applied.
 
+**Built: pieces 1 and 2 (2026-11-20).** Tested on this Mac only. Nothing has run on Linux or
+against staging yet.
+
+- **Launch** (`crates/cli/src/crew_args.rs`; one seam each in `crates/cli/src/lib.rs`,
+  `paths.rs` and `env.rs`). The command line takes exactly the native runner's argv
+  (`native-crew-runner.mjs`). Its options are global, so they may come before or after the
+  subcommand.
+  - `--data-dir` (made absolute) and `--ipc-port` replace `ZERON_DATA_DIR`, `ZERON_IPC_PORT`
+    and the flavour's defaults across the process, logs included. The refusals still
+    apply, and a headless engine now meets them before it opens its log.
+  - `--edge-url`, `--scaffold-url`, `--project-scope` and `--deployment-id` name a Scaffold
+    authority. `headless --device-bootstrap-file` names a sandbox host
+    (`apps/zeron/src/crew_cli.rs`, one call in `engine_config_from_env`).
+  - An authority on the command line must be complete. Its origins are https (or loopback
+    http), never another Crew's Edge, never beside `ZERON_EDGE_TOKEN`, and never different
+    from the data dir's `crew-runtime.json`.
+  - The runner's `COMET_DATA_DIR`, `COMET_EDGE_URL` and `COMET_SCAFFOLD_URL` may only
+    restate the command line (else exit 78). They never name an authority or a data dir
+    themselves (isolation rule 1). The supervisor's own launch (Platform's other path, when
+    no native runner is on), which passes the Edge only in `COMET_EDGE_URL`, is refused.
+- **Bootstrap** (`crew_cli::configure_device`, Crew's, made stricter):
+  - opened without following links: a regular file of 1 B to 16 KiB, private (`0600` or
+    tighter) and the user's;
+  - Crew's fields only: `deviceJoinGrant`, `projectId`, `deploymentId`, `sessionId`,
+    `deviceId`, `lifecycleEpoch`, `sandboxId`, and an optional `edgeUrl`;
+  - Scaffold's id pattern, `deviceId` = `comet-scaffold-{sandboxId}-e{lifecycleEpoch}`,
+    and a `cg1.<32 hex>.<secret>` grant;
+  - bound to the command line's project, deployment and Edge.
+
+  A host's default agent is OMP.
+- **Engine** (`crates/engine/src/crew_sandbox.rs`).
+  - `EngineConfig.device` is now a `DeviceLaunch`: the grant and the file it came in.
+  - `build_auth` exchanges the grant at the Edge (slice 2's code) and removes the bootstrap
+    only once that grant is the verified authority.
+  - The `cs1.` token lives in `scaffold-device-session.json`: 0600, in Crew's shape, which
+    the runner's restart check reads field by field. It's refreshed at every start and
+    before it expires. A rejection leaves the tombstone `{}`.
+  - The engine runs as the grant's device.
+- **Probe**: the hidden `scaffold-authority` calls `ScaffoldHostAuthority` over local IPC.
+  It prints the grant as one line, in Crew's key order: `grantId`, `expiresAt`,
+  `principalSubject`, `scope` (`projectId`, `deploymentId`, `sessionId`), `sandboxId`,
+  `deviceId`, `lifecycleEpoch`, `capabilities`. Logs go to stderr.
+  - Crew's binary keeps JSON maps in order (gpui turns on `preserve_order`); this one's sort
+    them, so the command re-serializes the typed grant.
+  - The RPC answers this device's local IPC only: never a relayed call or an agent's.
+- **Guard** (`crew_sandbox::admit`, one seam at the top of `EngineRpc::handle`). On a host:
+  - a `chatId` must be its session's. `UploadChunk` and `UploadCommit` need that session and
+    `session.files`.
+  - this device's credentials and agent installs are refused: Crew's list, plus upstream's
+    API keys, ACP agents and harness updates.
+  - a relayed call must carry the Edge's `__crewAuthority` for the host's owner, project and
+    deployment. A scoped one must also name this device and session, be unexpired and carry
+    a grant id, and may not delegate. A peer's may only `DeliverPeerMessage` or
+    `LocalDevice`. The envelope is removed before any handler, sign-in changes stay local,
+    and an envelope supplied locally is refused.
+- **OMP**: `OmpHarness::scaffold_host()`, registered on a host by `crew_inference::install`.
+  It runs `--profile scaffold-host --no-extensions --no-skills --no-rules` with `CI=true`,
+  without the sandbox's provider keys, `CLAUDE_CONFIG_DIR`, `CODEX_HOME` or broker token,
+  and keeps its journals under that profile.
+- **Inference**: a host is always managed (the local switch is ignored). Agent Auth is asked
+  with the device's own `cs1.` token, through the profile's `ProfileTokens`. Only the host's
+  own session runs, on OMP, Claude Code or Codex; titles and other chats are refused. A host
+  lists no shared accounts, since Platform binds its route.
+- **Lifecycle**:
+  - `Engine::run` installs its SIGINT and SIGTERM handlers before the exchange, so a stop
+    during startup ends cleanly once the credential is durable.
+  - After the engine drains, the headless command gives its runtime's blocking work 2 s.
+  - The runner's words appear on an auth failure: "Crew sandbox authentication failed…" for
+    a grant refused or unreachable at start, and "headless authentication revoked; stopping
+    synced runtime" for one revoked while running.
+  - `engine.lock` is unchanged.
+- **Archive**: `scripts/crew/package-linux-sandbox <version> [--binary path]`, with versions
+  like `0.3.9-zgx.1`. It writes `<target>/package-crew-zgx-linux/comet-<version>-linux-x86_64.tar.gz`
+  and `scaffold-manifest.json`. The manifest has schema 2, `scaffold`,
+  `scaffold.comet-runtime.v2`, the version, `source` (the commit and crew-web's `origin/main`
+  commit) and `files`.
+  - `comet` is `zeron`, built in release as upstream's Linux release builds it (fat LTO,
+    `LUAU_CXXFLAGS=-DNDEBUG`), in the canary flavour.
+  - `crew-web/` is the seven assets from `git archive origin/main apps/web`.
+  - `scripts/crew/check-native-crew-archive.mjs` ports `install-native-crew.mjs`'s checks
+    and the image builder's manifest gate, and runs after packaging. Platform's own
+    installer and validator, run from `scaffold-staging` on a stand-in archive, accepted it.
+- **CI**: `.github/workflows/crew-zgx-linux.yml`, on `crew-zgx-linux-<version>` tags
+  (`crew-zgx-linux-0.3.9-zgx.1`). On ubuntu-24.04 it installs Crew's apt list, runs the
+  checks' own tests, builds and packages, shows `file` and `ldd`, runs `comet --help` and
+  `comet headless --help` from the archive, and runs the archive checks. The archive and
+  manifest are the artifact (14 days). `actionlint` is clean. Not run yet.
+- **What the desktop must match** (Crew main's `scaffold.rs`):
+  - write the bootstrap as Crew does: Crew's seven fields and nothing else (an eighth,
+    `edgeUrl`, may be added), in the workspace as `.comet-device-bootstrap-<uuid>.json`,
+    mode 0600 (`put_file`, then `chmod 600`);
+  - exec the runner's 16-element argv in `background` mode, `timeoutMs: 0`, no `env` or
+    `cwd`;
+  - probe with `.scaffold/crew/bin/comet --data-dir .scaffold/crew-data --ipc-port 39400
+    scaffold-authority` (inline, 10 s), until it confirms within 30 s, and compare the
+    parsed fields. A host that isn't up yet, or has no verified grant, exits non-zero;
+  - mint the join grant with Crew's seven capabilities in Crew's order (the host echoes
+    the Edge's);
+  - host the session's chat on the grant's device, its id the session id, on `omp`
+    (crew-web also wants an absolute `cwd` and `roomGen` 2);
+  - send only the owner's calls through the relay, any `chatId` the session's.
+- **Open**:
+  - The first tagged run is the first Linux build and the first Linux run.
+  - Device-token Agent Auth is untested against Platform. There, a `cs1.` authority is
+    bound to the session's `agentRoute` (provider, model, account), whatever the chat
+    asks for. Its answer's `authorityId` is optional, while the client requires one.
+  - Piece 4 must also teach Platform's `crewDeviceSession` (`crew-device-authority.ts`) the
+    region's Edge. It verifies a `cs1.` bearer only at `SCAFFOLD_CREW_EDGE_URL` and
+    `SCAFFOLD_CREW_CHAT2_EDGE_URL`, while a zgx host's token is this branch's Edge's: Agent
+    Auth would answer 403 `crew_device_authority_unavailable`. The Edge's `/auth/session`
+    answer for a device has every field that check reads.
+  - Not ported: original-epoch history, Crew's command ledger (crew-web sends through
+    `ReadCommand`), the OMP supervisor and Scaffold's own OMP inference profile, Antigravity.
+  - As in Crew, a transient Edge failure at enrollment or restart ends the epoch: the
+    runner reads "Crew sandbox authentication failed" either way.
+  - A host doesn't advertise upstream's `cloud-session` capability (the earlier notes'
+    plan). Whether its registry row should look like a Cloud session machine's is the
+    desktop adapter's call (piece 3).
+
 Earlier notes:
 
 - Treat a sandbox host as an ordinary peer device (`comet-scaffold-{sandbox}-e{epoch}`)
@@ -755,7 +874,38 @@ Decided by the owner on 2026-11-20:
         model picker; the UI test covers the menu → dialog step.
     - Not done: completing a real sign-in or removing a real account (both change
       staging's shared pool).
-- [ ] 6. Scaffold
+- [ ] 6. Scaffold: pieces 1 and 2 built and tested on this Mac, 2026-11-20 ("Scaffold
+  sandboxes", "Built"). Pieces 3 (the desktop) and 4 (Platform) are next.
+  - `cargo test -p zeron --test crew_sandbox_host`: 3 passed. The real binary, started with
+    the native runner's argv and variables against a fake Edge and authority:
+    - it enrolls and removes the bootstrap, leaving the restart credential;
+    - it runs as the grant's device, and the probe prints Crew's exact line;
+    - it refuses what a host refuses;
+    - SIGTERM ends it with 0 (in 55 ms here);
+    - the runner's restart refreshes the credential and serves the same grant;
+    - a refused grant ends it with the runner's words, the bootstrap kept.
+  - `cargo test -p zeron --lib crew`: 11 passed. `-p zeron-cli --lib`: 28. `-p zeron --test
+    cli`: 3.
+  - `cargo test -p zeron-engine --lib -- crew_sandbox crew_inference crew_accounts rpc::tests`:
+    73 passed. Among them are `crew_sandbox`'s 6: the guard, the probe, and a host's
+    enrollment and device-token inference against a fake Scaffold. `--test scaffold_auth`: 24.
+  - `cargo test -p zeron-harness --lib crew_omp`: 15 passed.
+  - `node --test scripts/crew/check-native-crew-archive.test.mjs`: 6 passed. A stand-in archive
+    passed Platform's own `install-native-crew.mjs` and `validate-comet-release-contract.mjs`.
+  - `check --locked --workspace --all-targets` shows no new warnings. `actionlint` is clean.
+  - Wider runs, with other agents' builds loading the Mac:
+    - `-p zeron` (all targets): 26 passed.
+    - `-p zeron-harness --lib`: 589 of 590. The miss,
+      `process::unexpected_descendants_tests::a_child_that_is_no_configured_mcp_server_is_reported`,
+      passes alone. Its orphaned `sleep`s held `local-cargo.py`'s build lock, which cargo's
+      children inherit, until they were killed.
+    - `-p zeron-engine --test local_first`: 12 of 12 once the load fell (earlier, under
+      load, its two headless tests missed their 5 s IPC window).
+    - `-p zeron-engine --lib`: 1247 passed, 2 failed, 10 ignored.
+      `doc_host::publication_eviction_tests::failed_disk_writes_pin_edits_and_resume_admission_after_recovery`
+      passes alone. `chat_persistence::tests::a_kill_mid_save_loses_and_doubles_nothing`
+      fails alone too: it kills its re-run test binary after 40 ms, and that binary takes
+      about 420 ms here to write its first file. Neither file is in this change.
 - [ ] 7. Packaging
   - Local half: `scripts/crew/package-zgx-app` (ad-hoc signed, no updater) and
     `scripts/crew/local-backend`; see "Testing an installed build".
