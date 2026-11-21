@@ -16,11 +16,16 @@
 //!   own configuration.
 //! - A resume opens the exact journal: the one whose session header carries
 //!   the id.
+//! - A Scaffold sandbox host's OMP ([`OmpHarness::scaffold_host`], Crew's):
+//!   OMP's `scaffold-host` profile (the one Scaffold's supervisor writes), with
+//!   no extensions, skills or rules found on its own, `CI=true`, and no
+//!   inherited provider key, Claude or Codex home, or broker token.
 //!
 //! Left out of Crew's driver for now: its hidden supervisor (upstream's
 //! process registry reaps agents), the journal writer check and takeover,
-//! fork, Google, the Scaffold sandbox profile, the credential broker
-//! (`OMP_AUTH_BROKER_*`) and the session-search prompt.
+//! fork, Google, Scaffold's own inference profile (a host's runs are on
+//! Crew's managed route), the credential broker (`OMP_AUTH_BROKER_*`) and the
+//! session-search prompt.
 
 mod rpc;
 
@@ -69,6 +74,19 @@ const INHERITED: [&str; 5] = [
 ];
 /// The managed run's providers, on the relay (see the module docs).
 const AUTH_GATEWAY: &str = include_str!("auth_gateway.ts");
+/// The OMP profile a Scaffold sandbox host runs under (Crew's).
+const SCAFFOLD_PROFILE: &str = "scaffold-host";
+/// What a sandbox host's OMP never inherits from the sandbox (Crew's list):
+/// the broker's token, provider keys and other agents' homes.
+const SCAFFOLD_HOST_STRIPPED: [&str; 7] = [
+    "OMP_AUTH_BROKER_TOKEN",
+    "OMP_AUTH_BROKER_TOKEN_FILE",
+    "ANTHROPIC_API_KEY",
+    "OPENAI_API_KEY",
+    "CODEX_API_KEY",
+    "CLAUDE_CONFIG_DIR",
+    "CODEX_HOME",
+];
 /// Every role OMP may pick a model for, pinned on a managed run: OMP's
 /// roles as Crew pins them. A request outside the route ends the process.
 const MODEL_ROLES: [&str; 12] = [
@@ -122,6 +140,8 @@ pub(crate) fn resolve_executable(executable: Option<PathBuf>) -> Result<PathBuf,
 pub struct OmpHarness {
     executable: Option<PathBuf>,
     agent_dir: Option<PathBuf>,
+    /// A Scaffold sandbox host's (module docs).
+    scaffold_host: bool,
     interrupt_grace: Duration,
     kill_grace: Duration,
     models_cache: crate::catalog::Catalog,
@@ -133,6 +153,7 @@ impl Default for OmpHarness {
         Self {
             executable: None,
             agent_dir: None,
+            scaffold_host: false,
             interrupt_grace: Duration::from_secs(2),
             kill_grace: Duration::from_secs(3),
             models_cache: Default::default(),
@@ -144,6 +165,11 @@ impl Default for OmpHarness {
 impl OmpHarness {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// A Scaffold sandbox host's OMP (module docs).
+    pub fn scaffold_host() -> Self {
+        Self { scaffold_host: true, ..Self::default() }
     }
 
     /// A given `omp`, not the one found; its version is not checked.
@@ -194,7 +220,21 @@ impl OmpHarness {
     fn session_dirs(&self) -> Vec<PathBuf> {
         match &self.agent_dir {
             Some(dir) => vec![dir.join("sessions")],
-            None => omp_session_dirs(),
+            None => omp_session_dirs(self.profile()),
+        }
+    }
+
+    /// The OMP profile it runs under: a sandbox host's, else the environment's.
+    fn profile(&self) -> Option<String> {
+        if self.scaffold_host { Some(SCAFFOLD_PROFILE.into()) } else { profile() }
+    }
+
+    /// RPC mode, and a sandbox host's profile without what OMP would find on
+    /// its own (Crew's `configure_rpc_mode`).
+    fn rpc_mode(&self, cmd: &mut Command) {
+        cmd.args(["--mode", "rpc", "--approval-mode", "yolo"]);
+        if self.scaffold_host {
+            cmd.args(["--profile", SCAFFOLD_PROFILE, "--no-extensions", "--no-skills", "--no-rules"]);
         }
     }
 
@@ -212,9 +252,16 @@ impl OmpHarness {
         }
         // OMP sets CI for its tools whatever it is launched with: Ashler's
         // repository wrappers read this marker to run as they do locally.
-        cmd.env("CI", "false")
-            .env("COMET_LOCAL_AGENT_RUNTIME", "1")
-            .env("ASHLER_INCREMENTAL_TSC_CHECKS", "false");
+        // A sandbox host's is Scaffold's, and stays CI (Crew's).
+        if self.scaffold_host {
+            for key in SCAFFOLD_HOST_STRIPPED {
+                cmd.env_remove(key);
+            }
+            cmd.env("CI", "true").env_remove("COMET_LOCAL_AGENT_RUNTIME");
+        } else {
+            cmd.env("CI", "false").env("COMET_LOCAL_AGENT_RUNTIME", "1");
+        }
+        cmd.env("ASHLER_INCREMENTAL_TSC_CHECKS", "false");
         cmd.stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -237,7 +284,7 @@ impl OmpHarness {
         crate::apply_run_env(&mut cmd, &request.env);
         // The relay's token reaches OMP only as the gateway's own.
         cmd.env_remove(crate::crew_inference::TOKEN_ENV).env_remove(PI_CONFIG_FILES);
-        cmd.args(["--mode", "rpc", "--approval-mode", "yolo"]);
+        self.rpc_mode(&mut cmd);
         if let Some(journal) = resume {
             cmd.arg("--resume").arg(journal);
         }
@@ -285,6 +332,9 @@ impl OmpHarness {
     async fn discover_models(&self) -> Result<Vec<Model>, HarnessError> {
         let exe = self.launchable().await?;
         let mut cmd = self.command(&exe);
+        if self.scaffold_host {
+            cmd.args(["--profile", SCAFFOLD_PROFILE]);
+        }
         cmd.args(["models", "--json", "--no-extensions"]).stdin(Stdio::null());
         // Crew: a managed engine lists what a managed launch would run.
         crate::crew_inference::managed_probe(HarnessId::Omp, &mut cmd)?;
@@ -323,9 +373,8 @@ impl OmpHarness {
         std::fs::write(&config, COMMAND_CATALOG_CONFIG)?;
         let mut cmd = self.command(&exe);
         crate::crew_inference::managed_probe(HarnessId::Omp, &mut cmd)?;
-        cmd.args(["--mode", "rpc", "--approval-mode", "yolo", "--no-session", "--comet-command-catalog"])
-            .arg("--extension")
-            .arg(&guard);
+        self.rpc_mode(&mut cmd);
+        cmd.args(["--no-session", "--comet-command-catalog"]).arg("--extension").arg(&guard);
         for path in config_overlay_paths(std::env::var_os(PI_CONFIG_FILES).as_deref(), &config) {
             cmd.arg("--config").arg(path);
         }
@@ -506,12 +555,12 @@ fn agent_dir(home: &Path, profile: Option<&str>) -> PathBuf {
     }
 }
 
-/// Where OMP keeps its session journals, as Crew's driver looks for them.
-fn omp_session_dirs() -> Vec<PathBuf> {
+/// Where OMP keeps its session journals under `profile`, as Crew's driver
+/// looks for them.
+fn omp_session_dirs(profile: Option<String>) -> Vec<PathBuf> {
     let Some(home) = crate::executable::home_dir() else {
         return Vec::new();
     };
-    let profile = profile();
     let mut dirs = Vec::with_capacity(2);
     if let Some(xdg) = env_path("XDG_DATA_HOME") {
         let root = xdg.join("omp");
@@ -694,7 +743,7 @@ impl Harness for OmpHarness {
         let files: Vec<PathBuf> = self
             .agent_dir
             .clone()
-            .or_else(|| crate::executable::home_dir().map(|home| agent_dir(&home, profile().as_deref())))
+            .or_else(|| crate::executable::home_dir().map(|home| agent_dir(&home, self.profile().as_deref())))
             .into_iter()
             .flat_map(|dir| ["config.yml", "models.yml", "models.json", "settings.json", "auth.json"].map(|name| dir.join(name)))
             .collect();
@@ -944,6 +993,39 @@ mod tests {
         // A broken route never launches.
         run.env.remove(crate::crew_inference::URL_ENV);
         assert!(managed(&run).is_err());
+    }
+
+    /// A Scaffold sandbox host's OMP (Crew's `OmpHarness::scaffold_host`): its
+    /// profile, nothing it would find on its own, CI, and nothing the sandbox
+    /// carries for other agents; its managed route as anywhere else.
+    #[test]
+    fn a_sandbox_host_s_omp_runs_scaffold_s_profile() {
+        let harness = OmpHarness::scaffold_host();
+        let scratch = crate::scratch::ScratchDir::new("omp-test").unwrap();
+        let mut run = request(Some("claude-opus-5-5"));
+        run.env = route(Provider::Anthropic);
+        let launch = managed(&run).unwrap().unwrap();
+        let cmd = harness.run_command(Path::new("omp"), &run, None, Some(&launch), &scratch).unwrap();
+        let argv = args(&cmd);
+        assert_eq!(
+            &argv[..9],
+            ["--mode", "rpc", "--approval-mode", "yolo", "--profile", "scaffold-host", "--no-extensions", "--no-skills", "--no-rules"]
+        );
+        assert_eq!(after(&argv, "--model"), ["comet-anthropic/claude-opus-5-5"]);
+        assert_eq!(after(&argv, "--extension").len(), 1, "the gateway is named, not found");
+        let env = envs(&cmd);
+        assert_eq!(env["CI"].as_deref(), Some("true"));
+        assert_eq!(env.get("COMET_LOCAL_AGENT_RUNTIME"), Some(&None));
+        for gone in SCAFFOLD_HOST_STRIPPED {
+            assert_eq!(env.get(gone), Some(&None), "{gone} must be removed");
+        }
+        assert_eq!(harness.profile().as_deref(), Some("scaffold-host"));
+        assert!(harness.session_dirs().iter().all(|dir| dir.ends_with("profiles/scaffold-host/agent/sessions")
+            || dir.ends_with("profiles/scaffold-host/sessions")));
+        // A desktop's OMP is unchanged.
+        let desktop = OmpHarness::new().run_command(Path::new("omp"), &run, None, Some(&launch), &scratch).unwrap();
+        assert!(!args(&desktop).iter().any(|arg| arg == "--profile"));
+        assert_eq!(envs(&desktop)["CI"].as_deref(), Some("false"));
     }
 
     #[test]
