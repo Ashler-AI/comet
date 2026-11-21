@@ -244,6 +244,24 @@ Deferred:
 - **Tests:** `npm run test:unit`, `npm run test:workerd` (upstream's tier) and
   `npm run test:crew-workerd` (Crew's), each through `scripts/crew/clean-env`.
 
+### Staging Edge
+
+- This branch's Edge runs as its own Worker, `crew-zgx-edge-staging`, at
+  `https://crew-zgx-edge-staging.cgoggins.workers.dev` (first deployed by run 44861439161
+  on 2026-11-20). It has its own Durable Objects (migration `crew-zgx-staging-v1`) and its
+  own bucket (`crew-zgx-staging-blobs`), with no routes or crons, on Crew Staging's Scaffold
+  authority (project and deployment `ashler-staging`).
+- **Config:** `edge/wrangler.crew-zgx-staging.jsonc`, standalone, because an environment
+  would inherit upstream's account, routes and migrations.
+- **Deploy:** push a `crew-zgx-edge-staging-*` tag. `.github/workflows/crew-zgx-edge-staging.yml`
+  runs in the `comet-staging` environment: the Edge's unit and Crew workerd tests on
+  Node 24, `scripts/crew-zgx-staging-guard.mjs`, `wrangler deploy`, then a `/health` check.
+  The token can replace any Worker in Crew's account, so the guard refuses any config that
+  names anything else.
+- **Pointing a build at it:** set `crew-runtime.json`'s `edgeUrl` to the origin. A
+  `scaffold-session.json` is tied to its Edge, so sign in again, in a fresh data dir: rooms
+  don't carry over from a local Edge.
+
 ### Agent Auth
 
 - Use `RunEnvironment::prepare(harness, chat_id, &mut RunRequest)` (`crates/engine/src/registry.rs`).
@@ -458,6 +476,40 @@ Settings → Providers.
     `accountUuid`, Agent Auth's key for it.
 
 ### Scaffold sandboxes
+
+**Plan (2026-11-20, owner-approved staging deploys).** Staging Platform pins one Crew Edge
+and one engine image per harness: a request picks only a region. So the port runs its own
+staging harness region, `harness-zgx`, whose image carries this branch's engine and whose
+Edge is this branch's (`https://crew-zgx-edge-staging.cgoggins.workers.dev`, deployed:
+"Staging Edge"). The pieces:
+
+1. **Linux archive** of this branch's engine, as Platform installs Crew's
+   (`comet-<v>-linux-x86_64.tar.gz`: `comet` with the engine linked in, Crew main's
+   `apps/web` files as `crew-web/`, `crew-web-contract.json` with `crew.native.web.v1`,
+   and a `scaffold-manifest.json`, `schemaVersion` 2, `scaffold.comet-runtime.v2`).
+2. **Sandbox host** in the engine: `comet --data-dir .scaffold/crew-data --ipc-port 39400
+   headless --device-bootstrap-file F --edge-url E --scaffold-url S --project-scope P
+   --deployment-id D` (the harness's native runner accepts exactly this), the bootstrap
+   (`cg1.` grant to a `cs1.` token), `scaffold-device-session.json`, `scaffold-authority`
+   for the desktop's probe, the device guard, OMP as the sandbox host, managed inference on
+   the device token, and exit 0 on SIGTERM within 30 s.
+3. **Desktop**: a Crew Platform client (create with `region: "harness-zgx"`, list,
+   inspect, exec, files, the Edge's device grant, attach), a command ledger for Create and
+   Attach (a create is idempotent by session id; reconcile only observes), a Crew adapter
+   behind upstream's Cloud RPCs (`CloudStatus`, `CloudSessions`, `ListGithubRepos`,
+   `ListCloudBranches`, `cloud_chat_host`), and the relay pre-filter (one refused frame
+   ends the whole device link). The zgx composer passes the chat's config to the Cloud
+   create.
+4. **Platform** (a task branch, then `scaffold-staging`): the control plane picks a
+   region's own Edge on staging only (`SCAFFOLD_CREW_REGION_EDGE_URLS`); a second harness
+   release for `harness-zgx` (from `scaffold-harness-canary.yml`); an overlay of the live
+   session image with this branch's archive.
+
+The harness release (a StatefulSet, volume and HTTPRoute, applied with Helm as the old
+canary harness was) and the push to the shared `scaffold-staging` Worker each need the
+owner's word before they're applied.
+
+Earlier notes:
 
 - Treat a sandbox host as an ordinary peer device (`comet-scaffold-{sandbox}-e{epoch}`)
   carrying the `cloud-session` capability. A Crew adapter sits behind upstream's Cloud
