@@ -1,0 +1,103 @@
+name: Crew zgx Linux archive
+
+# This branch's engine as the Linux archive Platform installs for a Scaffold
+# sandbox's Crew runtime (docs/crew/zgx-thin-port.md, "Scaffold sandboxes"):
+# comet-<version>-linux-x86_64.tar.gz and its scaffold-manifest.json
+# (scripts/crew/package-linux-sandbox). Built only when a `crew-zgx-linux-*`
+# tag is pushed, the tag naming the version, the workspace's with `-zgx.<n>`:
+#
+#   git tag crew-zgx-linux-0.3.9-zgx.1 <commit> && git push origin crew-zgx-linux-0.3.9-zgx.1
+#
+# Never published: the archive and manifest are this run's artifact, for the
+# staging image overlay to take by hand. The archive is checked as Platform's
+# installer and image builder check one (scripts/crew/check-native-crew-archive.mjs,
+# ported: their repository is private), `comet --help` and
+# `comet headless --help` included.
+on:
+  push:
+    tags: ['crew-zgx-linux-*']
+
+permissions:
+  contents: read
+
+concurrency:
+  group: crew-zgx-linux
+  cancel-in-progress: false
+
+jobs:
+  linux-x86_64:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    env:
+      CREW_ZGX_PACKAGE_DIR: ${{ github.workspace }}/target/package-crew-zgx-linux
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - name: The version the tag names
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          version="${TAG#crew-zgx-linux-}"
+          workspace="$(sed -n '/^\[workspace.package\]/,/^\[/s/^version = "\([^"]*\)"/\1/p' Cargo.toml)"
+          if [[ ! "$version" =~ ^${workspace//./\\.}-zgx\.[0-9]+$ ]]; then
+            echo "::error::Tag $TAG names $version, not the workspace's $workspace with -zgx.<n>"
+            exit 1
+          fi
+          echo "CREW_ZGX_LINUX_VERSION=$version" >> "$GITHUB_ENV"
+      # crew-web is Crew main's apps/web (git archive origin/main apps/web).
+      - name: Fetch Crew main for its browser viewport
+        run: git fetch --no-tags --depth=1 origin +refs/heads/main:refs/remotes/origin/main
+      # As Crew's release.yml linux job installs them.
+      - name: Install native build dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq \
+            libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev \
+            libx11-dev libxcb1-dev libx11-xcb-dev \
+            libfontconfig1-dev libfreetype-dev libasound2-dev \
+            libvulkan-dev pkg-config cmake libwebkit2gtk-4.1-dev libjson-glib-dev
+      - name: Select checked-in Rust toolchain
+        run: rustup show active-toolchain || rustup toolchain install
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 22
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: crew-zgx-linux
+          # (Kept when a later step fails: the release build is most of the run.)
+          cache-on-failure: true
+      - name: The archive checks' own tests
+        run: node --test scripts/crew/check-native-crew-archive.test.mjs
+      - name: Build and package
+        run: scripts/crew/package-linux-sandbox "$CREW_ZGX_LINUX_VERSION"
+      - name: One glibc executable, from the archive
+        run: |
+          archive="$CREW_ZGX_PACKAGE_DIR/comet-$CREW_ZGX_LINUX_VERSION-linux-x86_64.tar.gz"
+          unpacked="$(mktemp -d)"
+          tar -xzf "$archive" -C "$unpacked"
+          comet="$unpacked/comet-$CREW_ZGX_LINUX_VERSION-linux-x86_64/comet"
+          file "$comet"
+          file "$comet" | grep -q 'ELF 64-bit LSB .*x86-64'
+          ldd "$comet"
+          "$comet" --version
+          "$comet" --help
+          "$comet" headless --help
+          ls -la "$CREW_ZGX_PACKAGE_DIR"
+      - name: Check it as Scaffold installs it
+        run: |
+          archive="$CREW_ZGX_PACKAGE_DIR/comet-$CREW_ZGX_LINUX_VERSION-linux-x86_64.tar.gz"
+          node scripts/crew/check-native-crew-archive.mjs "$archive" "$CREW_ZGX_LINUX_VERSION" \
+            "$(sha256sum "$archive" | cut -d' ' -f1)" --manifest "$CREW_ZGX_PACKAGE_DIR/scaffold-manifest.json"
+          {
+            echo "### comet-$CREW_ZGX_LINUX_VERSION-linux-x86_64.tar.gz"
+            echo '```json'
+            cat "$CREW_ZGX_PACKAGE_DIR/scaffold-manifest.json"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: crew-zgx-linux-x86_64
+          path: |
+            target/package-crew-zgx-linux/comet-*-linux-x86_64.tar.gz
+            target/package-crew-zgx-linux/scaffold-manifest.json
+          if-no-files-found: error
+          retention-days: 14

@@ -1,0 +1,133 @@
+#!/usr/bin/env bash
+# The Linux archive Platform installs as a Scaffold sandbox's Crew runtime
+# (docs/crew/zgx-thin-port.md, "Scaffold sandboxes", piece 1), as Crew's
+# release packages it (scripts/package-linux.sh there):
+#
+#   <out>/comet-<version>-linux-x86_64.tar.gz
+#     comet-<version>-linux-x86_64/
+#       comet                    this branch's `zeron`, the engine linked in
+#       crew-web/                Crew main's apps/web: contract.json, server.mjs,
+#                                rpc.mjs, package.json, public/{index.html,app.js,style.css}
+#       crew-web-contract.json   crew-web/contract.json again (crew.native.web.v1)
+#   <out>/scaffold-manifest.json
+#     {schemaVersion: 2, releaseSurface: "scaffold",
+#      scaffoldRuntimeVersion: "scaffold.comet-runtime.v2", version, source,
+#      files: {"comet-<version>-linux-x86_64.tar.gz": {sha256}}}
+#
+# then checks both as Platform's installer and image builder do
+# (scripts/crew/check-native-crew-archive.mjs).
+#
+#   scripts/crew/package-linux-sandbox <version>
+#       builds `zeron` in release here (Linux x86_64 only): the canary
+#       flavour, Luau without its asserts, fat LTO, as upstream's Linux release
+#   scripts/crew/package-linux-sandbox <version> --binary <path>
+#       packages a `zeron` built elsewhere (or a stand-in, to try the layout)
+#
+# <version> is the workspace's with a `-zgx.<n>` suffix: 0.3.9-zgx.1.
+#
+#   CREW_WEB_REF=origin/main        where crew-web comes from (`git archive`)
+#   CREW_ZGX_PACKAGE_DIR=<path>     <out>; default <target>/package-crew-zgx-linux
+#   CREW_ZGX_TARGET_DIR=<path>      the build's target dir; default <worktree>/target
+set -euo pipefail
+export ASHLER_INCREMENTAL_TSC_CHECKS=false
+
+root="$(cd "$(dirname "$0")/../.." && pwd)"
+die() { echo "package-linux-sandbox: $*" >&2; exit 1; }
+
+version="${1:-}"
+shift || true
+binary=""
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --binary) binary="${2:-}"; shift 2 || die "--binary needs a path" ;;
+    *) die "unknown argument: $1" ;;
+  esac
+done
+workspace="$(sed -n '/^\[workspace.package\]/,/^\[/s/^version = "\([^"]*\)"/\1/p' "$root/Cargo.toml")"
+[[ -n "$workspace" ]] || die "no workspace version in Cargo.toml"
+[[ "$version" =~ ^${workspace//./\\.}-zgx\.[0-9]+$ ]] ||
+  die "the version is the workspace's with -zgx.<n> ($workspace-zgx.1), not '$version'"
+
+target="${CREW_ZGX_TARGET_DIR:-$root/target}"
+out="${CREW_ZGX_PACKAGE_DIR:-$target/package-crew-zgx-linux}"
+web_ref="${CREW_WEB_REF:-origin/main}"
+name="comet-$version-linux-x86_64"
+archive="$out/$name.tar.gz"
+manifest="$out/scaffold-manifest.json"
+runtime_version="scaffold.comet-runtime.v2"
+
+linux_x86_64=false
+[[ "$(uname -s)" == Linux && "$(uname -m)" == x86_64 ]] && linux_x86_64=true
+
+if [[ -z "$binary" ]]; then
+  $linux_x86_64 || die "build on Linux x86_64 (CI does), or pass --binary"
+  # Upstream's Linux release build (scripts/package-linux.sh): fat LTO in one
+  # codegen unit, Luau without its asserts; the packaged canary's flavour.
+  CARGO_PROFILE_RELEASE_LTO=fat CARGO_PROFILE_RELEASE_CODEGEN_UNITS=1 LUAU_CXXFLAGS=-DNDEBUG CREW_FLAVOR=zgx-canary \
+    python3 "$root/scripts/local-cargo.py" build --release --locked -p zeron --bin zeron --target-dir "$target"
+  binary="$target/release/zeron"
+fi
+[[ -f "$binary" && -x "$binary" ]] || die "no executable at '$binary'"
+if $linux_x86_64; then
+  # One executable, the engine in it: what install-native-crew.mjs admits.
+  "$binary" --help >/dev/null || die "$binary --help failed"
+  "$binary" headless --help >/dev/null || die "$binary headless --help failed"
+fi
+
+# Crew main's browser viewport, exactly its files, from this repository.
+web="$(mktemp -d)"
+stage_root="$(mktemp -d)"
+trap 'rm -rf "$web" "$stage_root"' EXIT
+web_commit="$(git -C "$root" rev-parse --verify "$web_ref^{commit}")" || die "no $web_ref here (git fetch origin main)"
+git -C "$root" archive "$web_commit" apps/web | tar -x -C "$web"
+
+stage="$stage_root/$name"
+mkdir -p "$stage/crew-web/public"
+install -m 755 "$binary" "$stage/comet"
+for asset in server.mjs rpc.mjs package.json contract.json public/index.html public/app.js public/style.css; do
+  [[ -s "$web/apps/web/$asset" ]] || die "$web_ref has no apps/web/$asset"
+  install -m 644 "$web/apps/web/$asset" "$stage/crew-web/$asset"
+done
+install -m 644 "$stage/crew-web/contract.json" "$stage/crew-web-contract.json"
+
+mkdir -p "$out"
+rm -f "$archive" "$manifest"
+if tar --version 2>/dev/null | grep -q 'GNU tar'; then
+  GZIP=-n tar --sort=name --mtime="@${SOURCE_DATE_EPOCH:-0}" --owner=0 --group=0 --numeric-owner \
+    -czf "$archive" -C "$stage_root" "$name"
+else
+  # (bsdtar, trying the layout on a Mac: no AppleDouble or extended attributes.)
+  COPYFILE_DISABLE=1 tar --no-mac-metadata --no-xattrs --uid 0 --gid 0 --uname root --gname root \
+    -czf "$archive" -C "$stage_root" "$name"
+fi
+if command -v sha256sum >/dev/null; then
+  sha256="$(sha256sum "$archive" | cut -d' ' -f1)"
+else
+  sha256="$(shasum -a 256 "$archive" | cut -d' ' -f1)"
+fi
+
+commit="$(git -C "$root" rev-parse HEAD)"
+run=""
+if [[ -n "${GITHUB_RUN_ID:-}" ]]; then
+  run="${GITHUB_SERVER_URL:-https://github.com}/${GITHUB_REPOSITORY:-}/actions/runs/$GITHUB_RUN_ID"
+fi
+jq -n \
+  --arg version "$version" \
+  --arg runtime "$runtime_version" \
+  --arg file "$name.tar.gz" \
+  --arg sha256 "$sha256" \
+  --arg repository "${GITHUB_REPOSITORY:-Ashler-AI/comet}" \
+  --arg commit "$commit" \
+  --arg run "$run" \
+  --arg webRef "$web_ref" \
+  --arg webCommit "$web_commit" \
+  '{schemaVersion: 2, releaseSurface: "scaffold", scaffoldRuntimeVersion: $runtime, version: $version,
+    source: ({repository: $repository, commit: $commit, crewWeb: {ref: $webRef, commit: $webCommit}}
+      + (if $run == "" then {} else {workflowRun: $run} end)),
+    files: {($file): {sha256: $sha256}}}' > "$manifest"
+
+check=(node "$root/scripts/crew/check-native-crew-archive.mjs" "$archive" "$version" "$sha256" --manifest "$manifest")
+$linux_x86_64 || check+=(--no-exec)
+"${check[@]}"
+echo "packaged: $archive ($sha256)"
+echo "manifest: $manifest"
