@@ -116,6 +116,9 @@ pub struct CrewInference {
     registry: OnceLock<Weak<HarnessRegistry>>,
     /// Each harness's own default model, from its last catalog.
     defaults: Mutex<HashMap<HarnessId, String>>,
+    /// A Scaffold sandbox host's authority: its runs are its own session's
+    /// alone, on its device token (crew_sandbox.rs).
+    host: Option<crate::Auth>,
 }
 
 impl CrewInference {
@@ -130,7 +133,8 @@ impl CrewInference {
         if !auth.scaffold_enabled() {
             return None;
         }
-        if local_inference() {
+        // A sandbox host is always managed (Crew's `configure_device`).
+        if local_inference() && !auth.device_mode() {
             tracing::warn!("crew: inference mode local: agents run on this device's own logins");
             return None;
         }
@@ -139,7 +143,10 @@ impl CrewInference {
             return Some(Arc::new(Self::closed()));
         };
         match Self::start(&scaffold.control_origin, tokens) {
-            Ok(crew) => Some(Arc::new(crew)),
+            Ok(mut crew) => {
+                crew.host = auth.device_mode().then(|| auth.clone());
+                Some(Arc::new(crew))
+            }
             Err(error) => {
                 tracing::error!(%error, "crew: Agent Auth relay unavailable; agent runs are refused");
                 Some(Arc::new(Self::closed()))
@@ -171,6 +178,7 @@ impl CrewInference {
             shared: SharedLogins::default(),
             registry: OnceLock::new(),
             defaults: Mutex::new(HashMap::new()),
+            host: None,
         }
     }
 
@@ -285,6 +293,11 @@ impl CrewInference {
     /// revocation lists them again); on a failure the last ones known (or
     /// none: the choice is then Automatic alone).
     async fn accounts(&self) -> Vec<RemoteAgentAccount> {
+        // A sandbox host's route is its session's, as Platform bound it: it
+        // chooses no account.
+        if self.host.is_some() {
+            return Vec::new();
+        }
         match tokio::time::timeout(ACCOUNTS_DEADLINE, self.list_accounts(Some(ACCOUNTS_FRESH))).await {
             Ok(Ok(accounts)) => accounts,
             failed => {
@@ -309,6 +322,9 @@ impl RunEnvironment for CrewInference {
     ) -> Result<(), String> {
         if !Provider::managed_harness(harness) {
             return Err(unsupported(harness));
+        }
+        if let Some(host) = &self.host {
+            crate::crew_sandbox::inference_allowed(host, chat_id, harness)?;
         }
         let relay = self.relay.as_ref().ok_or_else(|| NOT_CONFIGURED.to_owned())?;
         let (session, account) = match chat_id {
@@ -507,6 +523,8 @@ pub(crate) fn install(
     tokens: Arc<dyn zeron_rpc::TokenSource>,
     registry: &Arc<HarnessRegistry>,
 ) -> Option<Arc<CrewInference>> {
+    // A sandbox host's OMP is Scaffold's host (crew_sandbox.rs).
+    crate::crew_sandbox::install(auth, registry);
     let crew = CrewInference::for_engine(config, auth, tokens)?;
     let _ = crew.registry.set(Arc::downgrade(registry));
     // Its harnesses' model probes run as its managed runs launch.

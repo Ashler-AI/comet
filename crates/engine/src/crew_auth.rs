@@ -39,8 +39,8 @@ use crate::EngineError;
 
 /// A user's Scaffold credential, in the data dir (0600).
 pub(super) const SESSION_FILE: &str = "scaffold-session.json";
-/// A sandbox host's rotating device credential, or its sign-out tombstone.
-const DEVICE_SESSION_FILE: &str = "scaffold-device-session.json";
+// A sandbox host's rotating device credential, or its sign-out tombstone.
+use crate::crew_sandbox::DEVICE_SESSION_FILE;
 
 /// What an account RPC answers in Scaffold mode when Scaffold has no part in
 /// it (`RpcError::Capability`): `AccessToken` (the `sc_rc_` bearer stays in

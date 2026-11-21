@@ -3448,6 +3448,12 @@ impl RpcService for EngineRpc {
         // An agent's chats: capped at its own access, runs as the chat is
         // set, attributed by Zeron (rpc/agent_gate.rs). Before forwarding.
         let params = self.agent_gate(method, params)?;
+        // Crew: a Scaffold sandbox host's attach probe, and what it serves
+        // and refuses (crew_sandbox.rs).
+        let params = match crate::crew_sandbox::admit(self.auth.as_ref(), self.doc_host.device_id(), method, params) {
+            std::ops::ControlFlow::Continue(params) => params,
+            std::ops::ControlFlow::Break(answer) => return answer,
+        };
         // Machine stats: answered here, or asked of another of the
         // account's devices with its own deadline and error words.
         if method == methods::DEVICE_STATS {

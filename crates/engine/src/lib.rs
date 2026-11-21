@@ -49,6 +49,7 @@ pub mod commit_credit;
 pub mod credentials;
 /// Crew: managed inference on Agent Auth (slice 5).
 pub mod crew_inference;
+pub mod crew_sandbox;
 pub mod deferred;
 pub mod desktop_notify;
 pub mod device_stats;
@@ -183,8 +184,9 @@ pub struct EngineConfig {
     /// Crew: the Scaffold authority (`<data_dir>/crew-runtime.json`), which
     /// replaces WorkOS and dev mode.
     pub scaffold: Option<scaffold_auth::ScaffoldConfig>,
-    /// Crew: a sandbox host's one-use device grant (never a user credential).
-    pub device: Option<scaffold_auth::DeviceConfig>,
+    /// Crew: a sandbox host's one-use device grant (never a user credential),
+    /// and the bootstrap file it came in (crew_sandbox.rs).
+    pub device: Option<crew_sandbox::DeviceLaunch>,
 }
 
 /// The assembled engine core — also constructible without the IPC server for tests
@@ -984,7 +986,7 @@ impl Engine {
         let mut auth_config = AuthConfig::new(config.edge_url.clone(), config.data_dir.clone());
         auth_config.workos_client_id = config.workos_client_id.clone();
         auth_config.scaffold = config.scaffold.clone();
-        auth_config.device = config.device.clone();
+        auth_config.device = config.device.as_ref().map(|launch| launch.grant.clone());
         // Crew: dev mode only with an explicit development bearer.
         auth_config.allow_dev_auth = config
             .edge_token
@@ -1010,8 +1012,10 @@ impl Engine {
         }
         let auth = Auth::new(auth_config);
         // Crew: a retained Scaffold credential is verified before a profile
-        // is chosen (no network otherwise).
+        // is chosen (no network otherwise), and a sandbox host's bootstrap
+        // is gone once its grant is.
         auth.verify_retained_scaffold().await;
+        crew_sandbox::consume_bootstrap(&auth, config.device.as_ref());
         auth
     }
 
@@ -1494,14 +1498,17 @@ impl Engine {
             runner::set_session(session);
             wake_update::arm();
         }
+        // Kept across verification and assembly, so a stop meanwhile is heard.
+        // Crew: from here, before a sandbox host's device grant is exchanged:
+        // a stop while the engine starts then ends it cleanly once its
+        // credential is durable, never by the signal's default.
+        let shutdown = shutdown_signal();
+        tokio::pin!(shutdown);
         let auth = Self::build_auth(&config).await;
         let mut auth_state = auth.watch_state();
         let workspace_scope = Self::initial_workspace_scope(&auth);
         let mut profile = Self::resolve_profile(&config, &auth, workspace_scope)?;
         let _refresh_loop = auth.spawn_refresh_loop();
-        // Kept across verification and assembly, so a stop meanwhile is heard.
-        let shutdown = shutdown_signal();
-        tokio::pin!(shutdown);
 
         // Crew: a retained Scaffold credential is workspace intent, not
         // authorization. While an outage holds up its verification, the
@@ -1660,19 +1667,25 @@ async fn wait_for_signed_out(state: &mut tokio::sync::watch::Receiver<AuthState>
 /// Ctrl-C or SIGTERM. systemd/launchd stop (and the auto-updater's service
 /// restart) deliver SIGTERM — without catching it the daemon dies mid-write
 /// and every stop takes the crash-recovery path instead of the graceful drain.
-async fn shutdown_signal() -> std::io::Result<()> {
+/// Crew: the handlers are installed when this is called, not when it's first
+/// polled, so a signal that comes in between is the future's to report
+/// (Scaffold's runner stops a sandbox host with SIGTERM, and wants exit 0).
+fn shutdown_signal() -> impl std::future::Future<Output = std::io::Result<()>> {
     #[cfg(unix)]
     {
-        let mut sigterm =
-            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
-        tokio::select! {
-            result = tokio::signal::ctrl_c() => result,
-            _ = sigterm.recv() => Ok(()),
+        use tokio::signal::unix::{SignalKind, signal};
+        let handlers = signal(SignalKind::terminate()).and_then(|term| Ok((term, signal(SignalKind::interrupt())?)));
+        async move {
+            let (mut sigterm, mut sigint) = handlers?;
+            tokio::select! {
+                _ = sigint.recv() => Ok(()),
+                _ = sigterm.recv() => Ok(()),
+            }
         }
     }
     #[cfg(not(unix))]
     {
-        tokio::signal::ctrl_c().await
+        tokio::signal::ctrl_c()
     }
 }
 
