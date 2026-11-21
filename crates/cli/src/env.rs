@@ -31,8 +31,10 @@ pub fn workos_client_id_from_env(edge_token: &Option<String>) -> Option<String> 
 }
 
 /// The engine's IPC port: `ZERON_IPC_PORT`, else [`DEFAULT_IPC_PORT`].
+/// Crew: `--ipc-port` first (crate::crew_args).
 pub fn ipc_port_from_env() -> u16 {
-    ipc_port_from(std::env::var("ZERON_IPC_PORT").ok().as_deref())
+    crate::crew_args::ipc_port()
+        .unwrap_or_else(|| ipc_port_from(std::env::var("ZERON_IPC_PORT").ok().as_deref()))
 }
 
 /// [`ipc_port_from_env`] from the variable's value.

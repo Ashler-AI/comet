@@ -111,7 +111,7 @@ pub fn apply(config: &mut EngineConfig) -> Result<(), String> {
     config.workos_client_id = None;
     config.org_id = None;
     config.scaffold = Some(runtime.scaffold);
-    config.device = None;
+    // (A sandbox host's device is the command line's: crew_cli.rs.)
     Ok(())
 }
 

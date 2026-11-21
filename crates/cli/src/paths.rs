@@ -4,7 +4,8 @@ use std::ffi::OsString;
 use std::path::PathBuf;
 
 pub fn data_dir() -> PathBuf {
-    resolve_data_dir(|name| std::env::var_os(name))
+    // Crew: `--data-dir` first (crate::crew_args).
+    crate::crew_args::data_dir().unwrap_or_else(|| resolve_data_dir(|name| std::env::var_os(name)))
 }
 
 /// [`data_dir`] from `env` (`ZERON_DATA_DIR`, `HOME`, and on Windows

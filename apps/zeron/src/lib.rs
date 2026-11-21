@@ -8,6 +8,7 @@
 pub mod allocator;
 pub mod auth_cli;
 pub mod background;
+pub mod crew_cli;
 pub mod crew_runtime;
 pub mod engine_commands;
 pub mod ipc_cli;
@@ -63,6 +64,12 @@ pub fn engine_config_from_env() -> zeron_engine::EngineConfig {
     // Crew: the Scaffold authority the data dir names, if it names one
     // (crew_runtime.rs); a file it can't use stops it, as a refusal does.
     if let Err(why) = crew_runtime::apply(&mut config) {
+        eprintln!("refusing to start: {why} (docs/crew/zgx-thin-port.md)");
+        std::process::exit(78);
+    }
+    // Crew: what the command line names, a sandbox host's authority and
+    // device bootstrap (crew_cli.rs); a launch it can't use stops it too.
+    if let Err(why) = crew_cli::apply(&mut config, &zeron_cli::crew_args::launch()) {
         eprintln!("refusing to start: {why} (docs/crew/zgx-thin-port.md)");
         std::process::exit(78);
     }

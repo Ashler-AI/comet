@@ -11,10 +11,19 @@ pub fn run_engine_command(command: EngineCommand) -> anyhow::Result<()> {
     match command {
         EngineCommand::Headless => {
             let runtime = tokio::runtime::Runtime::new()?;
-            runtime.block_on(async {
+            let result = runtime.block_on(async {
                 let engine = zeron_engine::Engine::new(engine_config_from_env());
                 engine.run().await
-            })
+            });
+            // Crew: the engine has drained; blocking work still going (a
+            // stuck read) doesn't hold the exit Scaffold's runner waits on.
+            runtime.shutdown_timeout(std::time::Duration::from_secs(2));
+            result
+        }
+        EngineCommand::ScaffoldAuthority => {
+            let runtime = tokio::runtime::Runtime::new()?;
+            let config = engine_config_from_env();
+            runtime.block_on(crate::crew_cli::scaffold_authority(config.ipc_port, &config.data_dir))
         }
         EngineCommand::Login => {
             let runtime = tokio::runtime::Runtime::new()?;

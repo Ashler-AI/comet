@@ -16,6 +16,7 @@
 //!     in a macOS bundle), which replaces this process and runs it there.
 
 pub mod crew;
+pub mod crew_args;
 pub mod daemon;
 mod env;
 pub mod logging;
@@ -46,6 +47,9 @@ struct Cli {
     /// holding Alt, or ⌥ on a Mac, as Zeron opens does).
     #[arg(long)]
     safe_mode: bool,
+    /// Crew: the runtime a command acts on (crew_args.rs).
+    #[command(flatten)]
+    crew: crew_args::RuntimeArgs,
     #[cfg(windows)]
     #[arg(long, hide = true)]
     wait_for_exit: Option<u32>,
@@ -54,7 +58,7 @@ struct Cli {
 #[derive(Subcommand)]
 enum Command {
     /// Run the engine without a UI (local-only unless a saved session enables sync).
-    Headless,
+    Headless(crew_args::HeadlessArgs),
     /// The desktop app's background engine (`zeron-engine` where it ships
     /// separately): started by the app, it keeps sessions running with the
     /// app closed.
@@ -108,6 +112,10 @@ enum Command {
     /// the old version just before it hands over.
     #[command(name = "update-watchdog", hide = true)]
     UpdateWatchdog,
+    /// Crew: the running engine's verified sandbox authority, as one line of
+    /// JSON (the desktop's attach probe).
+    #[command(name = "scaffold-authority", hide = true)]
+    ScaffoldAuthority,
 }
 
 #[derive(Subcommand)]
@@ -196,6 +204,8 @@ pub enum TemplateCommand {
 pub enum EngineCommand {
     Headless,
     Engine,
+    /// Crew: `scaffold-authority`.
+    ScaffoldAuthority,
     Login,
     Logout,
     Status,
@@ -249,6 +259,8 @@ pub fn run(version: &'static str, engines: Engines) -> Launch {
         Ok(cli) => cli,
         Err(error) => error.exit(),
     };
+    // Crew: the runtime the command line names (crew_args.rs).
+    crew_args::install(launch_of(&cli));
     if engines == Engines::Helper && cli.command.as_ref().is_some_and(Command::runs_engine) {
         // The helper parses the same arguments and does all of the below
         // itself (logging, the command). Windows' image cleanup is this
@@ -256,7 +268,7 @@ pub fn run(version: &'static str, engines: Engines) -> Launch {
         // install that's only ever run headless must lose the image an update
         // set aside too.
         #[cfg(windows)]
-        if matches!(&cli.command, Some(Command::Headless) | Some(Command::Engine)) {
+        if matches!(&cli.command, Some(Command::Headless(_)) | Some(Command::Engine)) {
             zeron_update::windows::cleanup_previous_image();
         }
         let exe = match std::env::current_exe() {
@@ -273,11 +285,16 @@ pub fn run(version: &'static str, engines: Engines) -> Launch {
         }
     } else if matches!(
         &cli.command,
-        None | Some(Command::Headless) | Some(Command::Engine)
+        None | Some(Command::Headless(_)) | Some(Command::Engine)
     ) {
         zeron_update::windows::cleanup_previous_image();
     }
-    let long_running = matches!(&cli.command, None | Some(Command::Headless));
+    let long_running = matches!(&cli.command, None | Some(Command::Headless(_)));
+    // Crew: another install's data dir or port is refused before a headless
+    // engine opens its log there.
+    if matches!(&cli.command, Some(Command::Headless(_))) {
+        crew::exit_if_refused(&paths::data_dir(), ipc_port_from_env());
+    }
     let mode = if cli.command.is_some() {
         "headless"
     } else {
@@ -290,7 +307,11 @@ pub fn run(version: &'static str, engines: Engines) -> Launch {
         init_logging(
             long_running,
             mode,
-            matches!(&cli.command, Some(Command::Mcp | Command::Plugin { .. } | Command::Template { .. })),
+            matches!(
+                &cli.command,
+                // (Crew: the probe's stdout is its one line of JSON.)
+                Some(Command::Mcp | Command::Plugin { .. } | Command::Template { .. } | Command::ScaffoldAuthority)
+            ),
         );
     }
     if long_running {
@@ -303,7 +324,7 @@ pub fn run(version: &'static str, engines: Engines) -> Launch {
         Engines::Helper => unreachable!("engine commands run in the helper"),
     };
     match cli.command {
-        Some(Command::Headless) => engine(EngineCommand::Headless),
+        Some(Command::Headless(_)) => engine(EngineCommand::Headless),
         Some(Command::Engine) => engine(EngineCommand::Engine),
         Some(Command::Login) => engine(EngineCommand::Login),
         Some(Command::Logout) => engine(EngineCommand::Logout),
@@ -313,6 +334,7 @@ pub fn run(version: &'static str, engines: Engines) -> Launch {
         Some(Command::Mcp) => engine(EngineCommand::Mcp),
         Some(Command::Plugin { command }) => engine(EngineCommand::Plugin(command)),
         Some(Command::Template { command }) => engine(EngineCommand::Template(command)),
+        Some(Command::ScaffoldAuthority) => engine(EngineCommand::ScaffoldAuthority),
         #[cfg(target_os = "linux")]
         Some(Command::Appshot) => Launch::Appshot,
         Some(Command::Update { check }) => Launch::Done(
@@ -336,12 +358,24 @@ pub fn run(version: &'static str, engines: Engines) -> Launch {
     }
 }
 
+/// Crew: the runtime `cli` names ([`crew_args::Launch`]).
+fn launch_of(cli: &Cli) -> crew_args::Launch {
+    crew_args::Launch {
+        runtime: cli.crew.clone(),
+        device_bootstrap_file: match &cli.command {
+            Some(Command::Headless(args)) => args.device_bootstrap_file.clone(),
+            _ => None,
+        },
+    }
+}
+
 impl Command {
     /// Whether it runs the engine's code ([`EngineCommand`]).
     fn runs_engine(&self) -> bool {
         match self {
-            Self::Headless
+            Self::Headless(_)
             | Self::Engine
+            | Self::ScaffoldAuthority
             | Self::Login
             | Self::Logout
             | Self::Status
@@ -441,6 +475,7 @@ mod tests {
             &["template", "use"],
             &["daemon", "install"],
             &["update"],
+            &["scaffold-authority"],
         ] {
             assert!(
                 paths.iter().any(|path| path == expected),
@@ -471,6 +506,7 @@ mod tests {
             &["plugin", "list"],
             &["plugin", "export", "focus"],
             &["template", "list"],
+            &["scaffold-authority"],
         ] {
             assert!(parse(args).unwrap().runs_engine(), "{args:?}");
         }
