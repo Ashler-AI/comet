@@ -628,6 +628,111 @@ against staging yet.
     plan). Whether its registry row should look like a Cloud session machine's is the
     desktop adapter's call (piece 3).
 
+**Built: piece 3, the desktop (2026-11-21).** Tested on this Mac against a fake Platform and
+a fake Edge only; nothing has created a sandbox on staging yet.
+
+- **Files.** Crew's code is in `crates/engine/src/crew_cloud.rs` (the adapter), with
+  `crew_scaffold.rs` (Platform's client, the Edge's device grants, Attach) and
+  `crew_ledger.rs` (the command record) as its child modules, `crew_workspace.rs` (a child
+  of `workspace_host`) and zeron-doc's `registry/crew.rs`. Seams:
+  - `rpc.rs`: one field and builder; the Cloud RPCs handed to the adapter before
+    upstream's; `cloud_chat_host`'s first lines; `answer_for_cloud` (OMP's agents, never
+    the Edge's model list, and a sandbox host's catalog answered here too); and the
+    pre-filter at the top of `forward` and `remote_terminal`.
+  - `lib.rs`: the module, an `EngineCore` slot, its install in `assemble_runtime` (a synced
+    Scaffold desktop, never a host), `rpc_service` and shutdown.
+  - `crates/rpc` `device_room.rs`: a `comet-scaffold-…` host is dialed with `LocalDevice {}`
+    as its readiness probe, as Crew's are (the Edge refuses `ListHarnesses` there, which
+    would end the link it was proving). Every other device keeps upstream's probe.
+  - `ScaffoldConfig.sandbox_region`, read by `apps/zeron/src/crew_runtime.rs` from
+    `crew-runtime.json`'s optional `sandboxRegion` (a Platform region name).
+- **Create** (`POST /api/code-sandboxes`, the `sc_rc_` bearer, no redirects): `region` (the
+  configured `sandboxRegion`, and nothing is created without one), `databaseEnvironment:
+  local`, `agentRoute` from the chat's config, and `cometRuntimeProfile` `{version:
+  scaffold.comet-runtime.v1, projectId, deploymentId, sessionId: <chat id>}`.
+  - The route: OMP's own model ids (`anthropic/…`, `openai/…`, `openai-codex/…`; Claude Code's
+    and Codex's ids map to their providers), hosted on OMP (no `harness`); the chat's
+    `crewAccountId` makes it `pinned`.
+  - Platform derives the sandbox from the profile, so a create is idempotent by session: the
+    same session and route answer the same sandbox (200); another route is a 409.
+  - An answer is used only once it passes Crew's checks (`into_environment`: a
+    `remote_code`/`comet_remote` sandbox, a verified owner, valid times, the exact v1
+    profile) and is this controller's, in this region, with an epoch.
+  - Branches: only `master` (the deployment's default, sent as no `source`).
+- **Ledger** (`<profile store>/crew-commands.sqlite3`, Crew's `crew_commands` table): `create:<session>`
+  and `attach:<sandbox>:e<epoch>` are claimed before anything is sent and settled once,
+  `confirmed` or `rejected`. A 4xx (not 408 or 429), a refused lifecycle or a contract
+  mismatch is a rejection; anything else stays unknown. Every 30 s once the registry has
+  synced (and on the next ask), unknown commands are only observed: a Create is looked for
+  by listing for its session, never sent again; an Attach by probing its host, never minted
+  or launched again; a sandbox gone terminal or to another epoch retires it.
+- **Attach** (Crew main's, less resume): inspect (a paused, stopped or failed sandbox is
+  refused); probe `scaffold-authority` inline and reuse an exact host; else mint a grant at
+  this engine's Edge (`POST /auth/device-grants`, Crew's seven capabilities in Crew's order,
+  15 minutes), upload Crew's seven bootstrap fields as `.comet-device-bootstrap-<uuid>.json`
+  and `chmod 600` it, launch the native runner's 16-element argv in `background` with
+  `timeoutMs: 0` (no `env` or `cwd`; `--edge-url` this engine's Edge, `--scaffold-url` the
+  authority without a trailing `/`), and probe until it confirms within 30 s. The probe is
+  compared field by field (grant id, unexpired, owner, scope, sandbox, device, epoch, the
+  capabilities in order). The file is removed afterwards whatever happened. A probe waits
+  while Platform says that epoch's runtime is starting.
+- **Adapter** (a signed-in, synced Scaffold desktop):
+  - `CloudStatus` `{state: ready, deviceId: "cloud", available}`, available only signed in
+    with a sandbox region. `CloudEnable` answers the same.
+  - `ListGithubRepos`: `Ashler-AI/ashler-platform` (default `master`). `ListCloudBranches`:
+    `master`.
+  - `CloudSessions`: Platform's list now, this region's only: Creating (and restoring)
+    provisioning, Starting (and resuming) starting, Ready (and agent running) ready, Paused
+    sleeping, Failed error, Stopped off. Listing refreshes the sandboxes' chat rows.
+  - Wake, retry, sleep, delete, sizes, reach, usage and billing refuse with a sentence;
+    vault and GitHub calls stay upstream's (unavailable).
+  - `cloud_chat_host` (`Mutate createChat` with `cloud`, local IPC only): a UUID chat id, a
+    model, the registry synced; then create, publish, attach in the background, and answer
+    `{deviceId: comet-scaffold-<sandbox>-e<epoch>, cwd: /workspace/ashler-platform}` with
+    the row written. The same chat again answers the same host.
+- **The chat row** (Crew's `publish_crew_environment`, less Start and original-epoch
+  history; published at create, attach and every refresh, for every epoch): device
+  `comet-scaffold-<sandbox>-e<epoch>`, no project, `cwd` `/workspace/ashler-platform`,
+  `roomGen` 2, OMP config from the route (`danger-full-access`, `crewAccountId`), and Crew's
+  `crew` field beside the typed row: `ownerSubject`, `sessionId`, `scope`, `agentRoute` and
+  `environment` (`ownerPrincipal` the verified subject, `source {kind: scaffold, sandbox_id,
+  lifecycle, lifecycle_epoch, region, links}`). It never re-homes another device's chat,
+  binds another sandbox, or goes back an epoch. The host's device row is written when
+  missing (`linux`, `cloud-session`). That is what `bindingMatches` admits the host by.
+- **Pre-filter** (`guard_scaffold_target`): a call forwarded to a `comet-scaffold-…` device
+  goes only if a chat row binds that host and the call is one the Edge relays to it: its
+  session's `chatId`, and `WatchDocMessages`, `WatchQueue`, `FocusChat`, uploads, Crew's
+  annotations, `QueueCommand` and `RelayCommand` of a typed kind, the queue (`QueueMessage`,
+  `UpdateQueuedMessage`, the edit lease calls, `Move`/`Remove`, `Send`/`SteerQueuedMessageNow`),
+  `StopWaiting` and `StopBackgroundTask`. Anything else is refused here, in a sentence.
+- **Edge** (`edge/src/crew/authority.ts`, `scopedRpcAllowed`): grown with the queue
+  (`session.chat`), `StopWaiting` and `StopBackgroundTask` (`session.control`), and
+  `RelayCommand` (the typed kinds, as `QueueCommand`): the desktop's command escort relays
+  one when rows are slow, and zgx routes the queue's edits to the chat's host. Needs a new
+  `crew-zgx-edge-staging-*` deploy.
+- **zgx**: the composer's send goes with a Cloud create (`request`), and the host makes the
+  chat's config from it (`chat::merged_config`: agent, model, account). In Crew mode the
+  Cloud row shows whenever `CloudStatus` is available and a project's GitHub repository is
+  Ashler-AI/ashler-platform; the Cloud and Billing pages and Providers' Cloud choice don't;
+  `comet-scaffold-…` devices are Cloud machines, never computers to pick.
+- **Pointing a build at it**: `scripts/crew/local-backend staging-edge [canary|dev]` writes
+  `crew-runtime.json` for `https://crew-zgx-edge-staging.cgoggins.workers.dev` with
+  `"sandboxRegion": "harness-zgx"`, and exits.
+- **Open**:
+  - Nothing has run against staging: no create in `harness-zgx`, no grant from the staging
+    Edge, no host attached, and no send, stream or interrupt through one. That is the exit
+    gate, after piece 4 and the Edge's redeploy.
+  - Platform's own launch mints a grant at the region's Edge and writes the chat row (its
+    clock-0 upsert, which the desktop's row outranks). With that host already serving, the
+    desktop's Attach only probes and reuses it; only without it does the desktop mint and
+    launch.
+  - Attachments to a sandbox host don't work yet: upstream's uploads and the doc host's
+    attachment escort send no `chatId`, so the pre-filter refuses them (the escort's, sent
+    straight on a link, the Edge refuses).
+  - Not here yet: titles for sandbox chats, a new epoch's Attach (its row is published; its
+    host comes from Platform's launch), resume/pause/stop, changing a chat's model after
+    create (Platform binds the host's inference to the create's route), and the machine tray.
+
 Earlier notes:
 
 - Treat a sandbox host as an ordinary peer device (`comet-scaffold-{sandbox}-e{epoch}`)
@@ -875,7 +980,23 @@ Decided by the owner on 2026-11-20:
     - Not done: completing a real sign-in or removing a real account (both change
       staging's shared pool).
 - [ ] 6. Scaffold: pieces 1 and 2 built and tested on this Mac, 2026-11-20 ("Scaffold
-  sandboxes", "Built"). Pieces 3 (the desktop) and 4 (Platform) are next.
+  sandboxes", "Built"); piece 3, the desktop, built and tested on this Mac against fakes,
+  2026-11-21 ("Built: piece 3"). Piece 4 (Platform) and the Edge's redeploy are next, then
+  the exit gate on staging.
+  - Piece 3, 2026-11-21:
+    - `cargo test -p zeron-engine --lib -- crew_cloud crew_sandbox crew_inference crew_accounts
+      rpc::tests`: 98 passed, 1 ignored. `crew_cloud`'s 25: Crew main's mocked-Platform tests
+      against a fake Platform and Edge (15), the ledger (1), and the adapter (9: create,
+      publish and attach; no region; a lost create found by listing; a rejection settled;
+      reconcile observing only; the Cloud RPCs; the row's epochs; the pre-filter; the
+      `rpc.rs` seams).
+    - `-p zeron-doc --lib registry::crew`: 1. `-p zeron --lib crew`: 11 (`sandboxRegion`
+      among them).
+    - zgx `cargo test --bin zeron-zgx -- crew sessions chat`: 179 passed, 2 ignored, with the
+      new `crew::` tests for the Cloud row and the Settings pages. Luau UI
+      (`scripts/ci/test-zgx.sh ui`): 1,470 tests, 0 failed.
+    - Edge `npx vitest run`: 459 passed (42 files).
+    - `check --locked --workspace --all-targets`: no warnings in the files changed.
   - `cargo test -p zeron --test crew_sandbox_host`: 3 passed. The real binary, started with
     the native runner's argv and variables against a fake Edge and authority:
     - it enrolls and removes the bootstrap, leaving the restart credential;
