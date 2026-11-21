@@ -14,11 +14,11 @@ const profile = {
 const message = { requestId: 'request-a', text: 'Continue', model: 'openai-codex/gpt-example', reasoning: 'high', attachments: [] };
 const entry = (id, text = 'hello') => ({ id, role: 'assistant', createdAt: 1000, status: 'complete', parts: [{ id: `${id}:text`, kind: 'text', text }] });
 
-async function fixture(t, publish = true) {
+async function fixture(t, publish = true, p = profile) {
   const root = await mkdtemp(join(tmpdir(), 'crew-native-web-'));
   t.after(() => rm(root, { recursive: true, force: true }));
   const env = {
-    SCAFFOLD_CREW_SYNC_GENERATION: 'chat2', SCAFFOLD_COMET_RUNTIME_PROFILE_JSON: JSON.stringify(profile),
+    SCAFFOLD_CREW_SYNC_GENERATION: 'chat2', SCAFFOLD_COMET_RUNTIME_PROFILE_JSON: JSON.stringify(p),
     CREW_WEB_AUTH_TOKEN: 'private-token-'.repeat(4), COMET_IPC_PORT: '39400',
     COMET_DATA_DIR: join(root, '.scaffold/crew-data'), SCAFFOLD_RUNTIME_DIR: root,
   };
@@ -26,15 +26,15 @@ async function fixture(t, publish = true) {
   await mkdir(join(env.SCAFFOLD_RUNTIME_DIR, 'omp-inference'), { recursive: true });
   await writeFile(join(env.SCAFFOLD_RUNTIME_DIR, 'omp-inference/profile.json'), JSON.stringify({ profile: 'scaffold-host', model: 'scaffold-openai/gpt-example' }));
   const authority = {
-    scope: { projectId: profile.projectId, deploymentId: profile.deploymentId, sessionId: profile.sessionId },
-    sandboxId: profile.sandboxId, deviceId: profile.targetDeviceId, lifecycleEpoch: 1,
-    principalSubject: profile.actor.sub, grantId: 'private-grant', expiresAt: Date.now() + 60000,
+    scope: { projectId: p.projectId, deploymentId: p.deploymentId, sessionId: p.sessionId },
+    sandboxId: p.sandboxId, deviceId: p.targetDeviceId, lifecycleEpoch: 1,
+    principalSubject: p.actor.sub, grantId: 'private-grant', expiresAt: Date.now() + 60000,
     capabilities: ['session.read', 'session.chat', 'session.control', 'session.files'],
   };
   const context = {
-    id: profile.sessionId, deviceId: profile.targetDeviceId, roomGen: 2, cwd: '/workspace', title: 'Assigned chat',
+    id: p.sessionId, deviceId: p.targetDeviceId, roomGen: 2, cwd: '/workspace', title: 'Assigned chat',
     config: { harness: 'omp', model: message.model, reasoning: message.reasoning, sandbox: 'workspace-write', modelOptions: { trusted: true } },
-    crew: { ownerSubject: 'opaque-edge-owner', sessionId: profile.sessionId, scope: authority.scope },
+    crew: { ownerSubject: 'opaque-edge-owner', sessionId: p.sessionId, scope: authority.scope },
   };
   const commands = new Map();
   const calls = [];
@@ -114,6 +114,19 @@ test('real health requires authority and all native snapshots; private native op
   assert.equal((await f.get('/health')).status, 503);
   f.authority.scope.sessionId = 'other-session';
   assert.equal((await f.get('/api/native-open')).status, 503);
+});
+
+// Failure mode (2026-11-21): production sessions linked to comet-staging://, which opens
+// Crew Staging, an app signed in to another project that cannot show them.
+test('native opening targets the Crew app signed in to the session project', async t => {
+  for (const [project, protocol] of [['ashler-production', 'comet:'], ['ashler-staging', 'comet-staging:']]) {
+    const f = await fixture(t, true, { ...profile, projectId: project, deploymentId: project });
+    const native = new URL((await (await f.get('/api/native-open')).json()).url);
+    assert.equal(native.protocol, protocol);
+    assert.equal(native.pathname, `/${project}/${project}/session-a/sandbox-a`);
+  }
+  const unknown = await fixture(t, true, { ...profile, projectId: 'other-project', deploymentId: 'other-project' });
+  assert.equal((await unknown.get('/api/native-open')).status, 503);
 });
 
 test('proxy authentication, mutation origin, bounded bodies and exact grant binding fail closed', async t => {
