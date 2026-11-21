@@ -121,6 +121,12 @@ impl Desktop {
     /// The app's own updater, in an install that updates itself (a macOS
     /// app bundle); none in a development build.
     fn start() -> Option<Rc<Self>> {
+        // Crew: no release feed yet (Crew's update channels are deferred:
+        // docs/crew/zgx-thin-port.md), so nothing asks the Edge for Zeron's
+        // releases; About says how a canary is updated instead.
+        if crate::crew::MODE {
+            return None;
+        }
         let install = zeron_update::detect_install();
         if !install.supports_desktop_update() {
             return None;
@@ -562,6 +568,12 @@ impl About {
             ("switch", Value::Bool(false)),
             ("flow", Value::from("idle")),
         ];
+        // Crew: a canary is an app bundle that doesn't update itself (no
+        // updater: `Desktop::start`), packaged all the same.
+        if crate::crew::MODE {
+            let packaged = matches!(zeron_update::detect_install(), InstallKind::MacApp { .. });
+            fields.push(("packaged", Value::Bool(packaged)));
+        }
         if let Some(desktop) = &desktop {
             fields.retain(|(key, _)| !matches!(*key, "self_updating" | "channels" | "switch" | "flow"));
             desktop.fields(&mut fields);

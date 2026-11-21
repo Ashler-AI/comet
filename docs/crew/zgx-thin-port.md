@@ -161,6 +161,19 @@ Deferred:
   - Settings swaps Profile for `settings/crew_account.luau` (same id) and
     drops Members, from the index too.
   - Window titles and About read "Crew (zgx dev)".
+- **Updates:** no release feed yet (update channels are deferred), so a Crew build
+  starts no updater (`about.rs` `Desktop::start`): nothing asks an Edge for Zeron's
+  releases from the app. About says a canary is updated by installing a newer build,
+  shows no check, beta channel, release notes or website, and still calls a canary
+  packaged. The engine's own updater still asks its Edge (the local one refuses,
+  401).
+- **Links:** a Crew build's links are in its own scheme (`zeron_cli::crew::URL_SCHEME`,
+  `crew-zgx-canary` for the canary, which its bundle registers). The app and the
+  engine call `zeron_notify::set_scheme` as they start, so a chat's "Copy link", a
+  clicked banner and an opened link all use it. A `zeron://` link isn't followed.
+  The app takes links from macOS under its own id (`zeron_cli::crew::BUNDLE_ID`; only
+  upstream's beta did before). Checked in the canary: a `crew-zgx-canary://` link
+  opened its chat, and a `zeron://` one was refused.
 - **Pointing at an Edge:** use the engine's `crew-runtime.json`; `scripts/crew/dev-zgx`
   passes no Edge. `ZERON_ZGX_PRIVATE_SIGNIN=1 scripts/crew/dev-zgx` signs in in
   a private Chrome window. The script passes that variable through `clean-env`.
@@ -702,8 +715,8 @@ Decided by the owner on 2026-11-20:
   - With shared accounts: `crew-zgx-canary-20261120-5` (run 44828398975, from
     `c0856a4f5`, 38 minutes). An 86 MB zip; `spctl` "accepted, source=Notarized
     Developer ID", the staple valid, `CrewSourceCommit` the tag's commit.
-  - No updater yet: About's "Crew updates itself" overstates it. The app asks its Edge's
-    `/releases`, which the local Edge refuses.
+  - No updater yet. About now says so (a canary is updated by installing a newer
+    build), and the app no longer asks its Edge's `/releases`.
   - Packaged 2026-11-19 from `9bca77d5c`: 361 MB debug bundle, `zeron` and
     `zeron-engine` 0.3.9, both the canary flavour.
   - Repackaged from `8df181726` (358 MB, without Parallax scenes) and driven again:

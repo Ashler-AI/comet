@@ -31,7 +31,7 @@ M.TITLE = "About & updates"
 M.RELEASES = "https://github.com/zeronsh/comet/releases"
 M.WEBSITE = "https://zeron.sh"
 
-search.index(M.ID, ui.t("settings.about.title"), ui.t("settings.about.terms"), {
+local rows = {
 	{ key = "version", title = ui.t("settings.about.version.label"), terms = ui.t("settings.about.version.terms") },
 	{
 		key = "updates",
@@ -53,7 +53,19 @@ search.index(M.ID, ui.t("settings.about.title"), ui.t("settings.about.terms"), {
 	},
 	{ key = "website", title = ui.t("settings.about.website.label"), section = ui.t("settings.about.links_section"), terms = ui.t("settings.about.website.terms") },
 	{ key = "copy_version", title = ui.t("settings.about.copy_version.label"), terms = ui.t("settings.about.copy_version.terms") },
-})
+}
+-- (A Crew build has no release channel, and no release notes or website of
+-- Zeron's to open: nothing of them to find. ui/account/crew.luau)
+if crew.on then
+	local kept = {}
+	for _, r in rows do
+		if r.key ~= "beta" and r.key ~= "release_notes" and r.key ~= "website" then
+			table.insert(kept, r)
+		end
+	end
+	rows = kept
+end
+search.index(M.ID, ui.t("settings.about.title"), ui.t("settings.about.terms"), rows)
 
 export type About = {
 	app_version: string,
@@ -166,6 +178,11 @@ end
 export type Update = { title: string, line: string, action: string?, accent: boolean? }
 
 function M.describe(a: About, doing: string): Update
+	-- Crew: no release feed yet (docs/crew/zgx-thin-port.md): a newer build
+	-- is installed by hand, and there's nothing to check.
+	if crew.on then
+		return { title = ui.t("crew.about.updates"):get(), line = ui.t("crew.about.updates_line"):get() }
+	end
 	local current = a.engine_version
 	local checked = ago(a.checked_at)
 	local function s(key: string, args: { [string]: any }?): string
@@ -294,7 +311,9 @@ function M.view(): Node
 					label = ui.t("settings.about.app.label"),
 					description = function(): string
 						local built = M.build(M.now:get().app_build)
-						if M.now:get().self_updating and built then
+						-- (Crew: a canary is packaged, though it doesn't update itself.)
+						local packaged = M.now:get().self_updating or (crew.on and (M.now:get() :: any).packaged == true)
+						if packaged and built then
 							return ui.t("settings.about.app.packaged", { built = built }):get()
 						end
 						return if built
@@ -391,7 +410,8 @@ function M.view(): Node
 				},
 			},
 		},
-		ds.Settings.Section {
+		-- (Zeron's release notes and website: none of Crew's to show.)
+		if crew.on then nil else ds.Settings.Section {
 			title = ui.t("settings.about.links_section"),
 			ds.Settings.Group {
 				row("release_notes", {

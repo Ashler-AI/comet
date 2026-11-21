@@ -96,7 +96,7 @@
         "off_any": "Try the next Crew early."
       },
       "updates_self_description": "Crew updates itself: a new version downloads in the background and installs when you restart.",
-      "updates_description": "Updates go to the engine on this computer, as the Crew app's do. This app isn't packaged yet, so it isn't updated here."
+      "updates_description": "Crew's canary builds don't update themselves yet."
     }
   },
   "shell": {

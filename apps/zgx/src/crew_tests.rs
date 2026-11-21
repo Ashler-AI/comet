@@ -388,6 +388,12 @@ fn settings_have_no_members_and_no_profile_edits() {
     app.click("#settings-nav >> role:tab \"About & updates\"");
     app.frames(30);
     assert!(shows(&mut app, "#settings-page >> \"Crew (zgx dev)\""), "{}", app.tree());
+    // A canary is updated by installing a newer one: nothing to check, no
+    // channel, and no Zeron release notes or website.
+    assert!(shows(&mut app, "#settings-page >> \"Updated by installing a newer build\""), "{}", app.tree());
+    for gone in ["Check for updates", "Get beta updates", "Release notes", "Website", "zeron.sh"] {
+        assert!(!shows(&mut app, &format!("#settings-page >> \"{gone}\"")), "{gone} shows:\n{}", app.tree());
+    }
     // General has no "Keep chats on this device": signed in is synced.
     app.click("#settings-nav >> role:tab \"General\"");
     app.frames(30);
@@ -433,6 +439,9 @@ fn settings_without_the_flag_are_zeron_s() {
     app.frames(30);
     assert!(shows(&mut app, "#settings-page >> \"Zeron\""), "{}", app.tree());
     assert!(!app.tree().contains("Crew (zgx dev)"));
+    for kept in ["Release notes", "Website"] {
+        assert!(shows(&mut app, &format!("#settings-page >> \"{kept}\"")), "{kept} is missing:\n{}", app.tree());
+    }
     app.type_text("#settings-nav >> #settings-search", "members");
     app.frames(10);
     assert!(shows(&mut app, "#settings-search-results >> \"Members\""), "{}", app.tree());

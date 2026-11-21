@@ -47,6 +47,21 @@ pub const CANARY_PRODUCT: &str = "Crew zgx Canary";
 /// What this build is called where it says.
 pub const PRODUCT: &str = if CANARY { CANARY_PRODUCT } else { "Crew (zgx dev)" };
 
+/// The packaged canary's bundle id (scripts/crew/package-zgx-app).
+pub const CANARY_BUNDLE_ID: &str = "ai.ashler.crew.zgx-canary";
+
+/// The id this build takes its links under (zgx-desktop's application id):
+/// the packaged canary's bundle id.
+pub const BUNDLE_ID: &str = if CANARY { CANARY_BUNDLE_ID } else { "ai.ashler.crew.zgx-dev" };
+
+/// The scheme the packaged canary registers (scripts/crew/package-zgx-app).
+pub const CANARY_URL_SCHEME: &str = "crew-zgx-canary";
+
+/// The scheme of this build's links (a chat's "Copy link", a clicked
+/// banner): no link meant for another Crew, or for Zeron, opens here, and
+/// none of this build's opens there.
+pub const URL_SCHEME: &str = if CANARY { CANARY_URL_SCHEME } else { "crew-zgx-dev" };
+
 /// No Edge until Crew's sign-in lands: a loopback port nothing serves
 /// (discard), so an engine of this build stays signed out and local and
 /// never reaches Zeron's servers. `ZERON_EDGE_URL` names a real one (a local
@@ -203,7 +218,24 @@ mod tests {
         let script = include_str!("../../../scripts/crew/package-zgx-app");
         assert!(script.contains(&format!("APP_NAME=\"{CANARY_PRODUCT}\"")), "the bundle's name");
         assert!(script.contains("FLAVOR=zgx-canary"), "built as the canary");
+        assert!(script.contains(&format!("BUNDLE_ID=\"{CANARY_BUNDLE_ID}\"")), "the bundle's id");
+        assert!(script.contains(&format!("URL_SCHEME=\"{CANARY_URL_SCHEME}\"")), "the links' scheme registered");
         assert!(script.contains("--exclude '/parallax-scenes/'"), "no member-card scenes");
+    }
+
+    /// The ids this build's links come under are reverse-DNS, as
+    /// zgx-desktop's `application_id` requires (else the app wouldn't start).
+    #[test]
+    fn the_links_id_is_reverse_dns() {
+        for id in [BUNDLE_ID, CANARY_BUNDLE_ID] {
+            let pieces: Vec<&str> = id.split('.').collect();
+            assert!(pieces.len() >= 2, "{id}");
+            assert!(
+                pieces.iter().all(|p| p.starts_with(|c: char| c.is_ascii_alphabetic())
+                    && p.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'_' || c == b'-')),
+                "{id}"
+            );
+        }
     }
 
     #[test]

@@ -91,7 +91,7 @@
         "off_any": "抢先试用下一版 Crew。"
       },
       "updates_self_description": "Crew 会自动更新：新版本在后台下载，重新启动时安装。",
-      "updates_description": "更新会应用到此电脑上的引擎，与 Crew App 的更新一样。此 App 尚未打包，因此不会在此更新。"
+      "updates_description": "Crew 的 canary 版本暂不能自动更新。"
     }
   },
   "shell": {

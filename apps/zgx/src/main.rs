@@ -239,6 +239,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // fixture, --inspect) and its bare launch, which would otherwise log as
     // the Zeron app does (in ~/.zeron).
     let mut open_url = None;
+    // Crew: its links (a chat's "Copy link", those it opens, a clicked
+    // banner's) are in this flavour's own scheme, before any is made.
+    if crew::MODE {
+        zeron_notify::set_scheme(zeron_cli::crew::URL_SCHEME);
+    }
     // (This app's own version for crates/update, before `zeron update` or
     // the app's updater compares releases with it: a beta's isn't the
     // workspace's.)
@@ -350,10 +355,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         application = application.font(font?);
     }
     // The Zeron app's links (`zeron://`: a clicked banner, a chat's link),
-    // delivered to the app as Zeron.app's are (src/links.rs).
-    if cfg!(feature = "beta") {
+    // delivered to the app as Zeron.app's are (src/links.rs). Crew: a Crew
+    // build's, in its own scheme, under its own id.
+    let links_id = if cfg!(feature = "beta") {
+        Some("sh.zeron.app")
+    } else if crew::MODE {
+        Some(zeron_cli::crew::BUNDLE_ID)
+    } else {
+        None
+    };
+    if let Some(id) = links_id {
         application = application
-            .application_id("sh.zeron.app")?
+            .application_id(id)?
             .on_application_event(|event, _| {
                 if let zgx_desktop::ApplicationEvent::OpenUrls(urls) = event {
                     for url in urls {

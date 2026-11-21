@@ -3988,6 +3988,10 @@
       "remove": "Remove",
       "couldnt_remove": "Couldn't remove the account",
       "no_usage": "Usage unavailable"
+    },
+    "about": {
+      "updates": "Updated by installing a newer build",
+      "updates_line": "Download the newest Crew canary and put it in Applications in place of this one."
     }
   }
 }

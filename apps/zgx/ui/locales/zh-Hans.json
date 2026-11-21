@@ -3988,6 +3988,10 @@
       "remove": "移除",
       "couldnt_remove": "无法移除该账户",
       "no_usage": "暂无用量"
+    },
+    "about": {
+      "updates": "通过安装新版本来更新",
+      "updates_line": "下载最新的 Crew canary 版本，并在“应用程序”中替换当前版本。"
     }
   }
 }

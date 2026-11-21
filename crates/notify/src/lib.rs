@@ -44,14 +44,39 @@ pub const AGENT_UPDATES_TARGET: &str = "__zeron_agent_updates__";
 /// its own process: `zeron://notification/<target>`.
 pub const LINK_PREFIX: &str = "zeron://notification/";
 
-/// `zeron://notification/<target>` for a banner's target.
+// Crew: this build's links are in its flavour's own scheme
+// (`zeron_cli::crew::URL_SCHEME`), set once as the app or the engine starts
+// ([`set_scheme`]), so none opens Zeron or another Crew; Zeron's until then.
+static SCHEME: std::sync::OnceLock<&'static str> = std::sync::OnceLock::new();
+
+/// Make and open every link of this process in `scheme` (the first call
+/// wins).
+pub fn set_scheme(scheme: &'static str) {
+    let _ = SCHEME.set(scheme);
+}
+
+/// The scheme this process's links are in: the one set, else `zeron`.
+pub fn scheme() -> &'static str {
+    SCHEME.get().copied().unwrap_or("zeron")
+}
+
+/// `<scheme>://notification/<target>` for a banner's target.
 pub fn link(target: &str) -> String {
-    format!("{LINK_PREFIX}{target}")
+    link_in(scheme(), target)
 }
 
 /// The target a [`link`] carries, or `None` for any other URL.
 pub fn link_target(url: &str) -> Option<&str> {
-    url.strip_prefix(LINK_PREFIX)
+    link_target_in(scheme(), url)
+}
+
+fn link_in(scheme: &str, target: &str) -> String {
+    format!("{scheme}://notification/{target}")
+}
+
+fn link_target_in<'a>(scheme: &str, url: &'a str) -> Option<&'a str> {
+    url.strip_prefix(scheme)?
+        .strip_prefix("://notification/")
         .filter(|target| !target.is_empty())
 }
 
@@ -481,6 +506,13 @@ mod tests {
     fn links_round_trip_their_target() {
         assert_eq!(link("chat-1"), "zeron://notification/chat-1");
         assert_eq!(link_target(&link("chat-1")), Some("chat-1"));
+        // Crew: a flavour's own scheme, and no other's.
+        let crew = link_in("crew-zgx-canary", "chat-1");
+        assert_eq!(crew, "crew-zgx-canary://notification/chat-1");
+        assert_eq!(link_target_in("crew-zgx-canary", &crew), Some("chat-1"));
+        assert_eq!(link_target_in("crew-zgx-canary", "zeron://notification/chat-1"), None);
+        assert_eq!(link_target_in("crew-zgx-canary", "crew-zgx-canary-x://notification/chat-1"), None);
+        assert_eq!(link_target_in("zeron", &crew), None);
         assert_eq!(link_target(LINK_PREFIX), None);
         assert_eq!(link_target("zeron://chat/x"), None);
     }

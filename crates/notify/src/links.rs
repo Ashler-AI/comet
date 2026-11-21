@@ -26,16 +26,26 @@ pub fn workspace_locator_of(scope: &str, identity: &str) -> String {
 }
 
 pub fn conversation_link(chat_id: &str, workspace: &str) -> String {
+    conversation_link_in(super::scheme(), chat_id, workspace)
+}
+
+pub fn parse_conversation_link(url: &str) -> Result<ConversationDeepLink, &'static str> {
+    parse_conversation_link_in(super::scheme(), url)
+}
+
+/// Crew: a conversation link in `scheme` (its flavour's: [`super::set_scheme`]).
+fn conversation_link_in(scheme: &str, chat_id: &str, workspace: &str) -> String {
     format!(
-        "zeron://open/chat/{}?workspace={}",
+        "{scheme}://open/chat/{}?workspace={}",
         encode_component(chat_id),
         encode_component(workspace)
     )
 }
 
-pub fn parse_conversation_link(url: &str) -> Result<ConversationDeepLink, &'static str> {
+fn parse_conversation_link_in(scheme: &str, url: &str) -> Result<ConversationDeepLink, &'static str> {
     let rest = url
-        .strip_prefix("zeron://open/chat/")
+        .strip_prefix(scheme)
+        .and_then(|rest| rest.strip_prefix("://open/chat/"))
         .ok_or("not a Zeron conversation link")?;
     let (chat_id, query) = rest.split_once('?').ok_or("missing workspace locator")?;
     if chat_id.is_empty() || chat_id.contains('/') {
@@ -99,6 +109,18 @@ mod tests {
                 workspace: "workspace:one".into(),
             }
         );
+    }
+
+    /// Crew: a flavour's links are in its own scheme, and another's (Zeron's)
+    /// aren't its.
+    #[test]
+    fn a_flavour_s_links_are_in_its_own_scheme() {
+        let link = conversation_link_in("crew-zgx-canary", "c 1", "abc");
+        assert_eq!(link, "crew-zgx-canary://open/chat/c%201?workspace=abc");
+        let parsed = parse_conversation_link_in("crew-zgx-canary", &link).unwrap();
+        assert_eq!((parsed.chat_id.as_str(), parsed.workspace.as_str()), ("c 1", "abc"));
+        assert!(parse_conversation_link_in("crew-zgx-canary", "zeron://open/chat/c?workspace=abc").is_err());
+        assert!(parse_conversation_link_in("zeron", &link).is_err());
     }
 
     #[test]
