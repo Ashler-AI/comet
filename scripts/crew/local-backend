@@ -1,41 +1,68 @@
 #!/usr/bin/env bash
 # What a Crew zgx build is tested against (docs/crew/zgx-thin-port.md):
 # sign-in, and later Agent Auth, from a real Scaffold authority, with every
-# room on a local Edge built from this branch. Never a shared Crew Edge: a
+# room on an Edge built from this branch. Never a shared Crew Edge: a
 # v0.3 engine there would be a second writer in rooms that 0.2.x Crews use
 # (isolation rule 5).
 #
-#   scripts/crew/local-backend [staging] [canary|dev]
-#     staging   Crew Staging's authority (scaffold-staging, ashler-staging)
-#     canary    the packaged app's data dir (~/.crew-zgx-canary); dev is
-#               scripts/crew/dev-zgx's (~/.crew-zgx-dev)
+#   scripts/crew/local-backend [staging|staging-edge] [canary|dev]
+#     staging        Crew Staging's authority (scaffold-staging, ashler-staging),
+#                    with this branch's Edge served here
+#     staging-edge   the same authority on this branch's deployed staging Edge
+#                    (crew-zgx-edge-staging), whose sandbox region is
+#                    harness-zgx: Scaffold sandboxes from the Cloud row
+#     canary         the packaged app's data dir (~/.crew-zgx-canary); dev is
+#                    scripts/crew/dev-zgx's (~/.crew-zgx-dev)
 #
-# Writes two files, then serves the Edge (http://127.0.0.1:27961) in the
-# foreground until stopped:
+# staging writes two files, then serves the Edge (http://127.0.0.1:27961) in
+# the foreground until stopped:
 #   ~/.crew-zgx-<flavour>/crew-runtime.json   the engine's Edge and authority
 #   edge/.dev.vars.crew-zgx-local              the Edge's authority (git-ignored)
 # Start it before the app, or sign-in can't verify the Edge's half.
+#
+# staging-edge writes crew-runtime.json alone and exits. A session kept from
+# another Edge isn't this one's: sign in again, in a fresh data dir.
 set -euo pipefail
 root="$(cd "$(dirname "$0")/../.." && pwd)"
 die() { echo "$*" >&2; exit 1; }
 
 authority="${1:-staging}"
 flavour="${2:-canary}"
+region=""
 case "$authority" in
   staging)
     scaffold="https://scaffold-staging.internal.ashler.com"
     project="ashler-staging"
     deployment="ashler-staging"
+    edge="http://127.0.0.1:27961"
     ;;
-  *) die "unknown authority '$authority' (staging)" ;;
+  staging-edge)
+    scaffold="https://scaffold-staging.internal.ashler.com"
+    project="ashler-staging"
+    deployment="ashler-staging"
+    edge="https://crew-zgx-edge-staging.cgoggins.workers.dev"
+    # The staging harness region whose Crew Edge is this one (Platform's
+    # SCAFFOLD_CREW_REGION_EDGE_URLS): the only region the engine creates in.
+    region="harness-zgx"
+    ;;
+  *) die "unknown authority '$authority' (staging or staging-edge)" ;;
 esac
 case "$flavour" in
   canary|dev) data="$HOME/.crew-zgx-$flavour" ;;
   *) die "unknown flavour '$flavour' (canary or dev)" ;;
 esac
-edge="http://127.0.0.1:27961"
 
 mkdir -p "$data"
+if [[ -n "$region" ]]; then
+  cat >"$data/crew-runtime.json" <<JSON
+{ "edgeUrl": "$edge", "scaffoldUrl": "$scaffold", "projectScope": "$project", "deploymentId": "$deployment", "sandboxRegion": "$region" }
+JSON
+  echo "engine: $data/crew-runtime.json -> Edge $edge, authority $scaffold ($project), sandboxes in $region"
+  if [[ -f "$data/scaffold-session.json" ]]; then
+    echo "note:   $data keeps a Scaffold session; one from another Edge won't verify here (sign in again)"
+  fi
+  exit 0
+fi
 cat >"$data/crew-runtime.json" <<JSON
 { "edgeUrl": "$edge", "scaffoldUrl": "$scaffold", "projectScope": "$project", "deploymentId": "$deployment" }
 JSON
