@@ -1,9 +1,11 @@
 # Native Crew production cutover
 
-Production still runs legacy Crew 0.1.156 (`scaffold.comet-runtime.v1`) on the
-legacy Edge Worker `ashler-comet-edge-production` at `comet.internal.ashler.com`.
-Staging runs native Crew. This is the plan for moving production to native without
-breaking legacy Scaffold sessions that are still in use.
+Production desktop and production Scaffold run native Crew (0.2.152 since 2026-11-21)
+against `crew.internal.ashler.com`. Before the cutover, production ran legacy Crew 0.1.156
+(`scaffold.comet-runtime.v1`) on the legacy Edge Worker `ashler-comet-edge-production` at
+`comet.internal.ashler.com`, which keeps serving legacy sessions until step 7 retires it.
+This is the plan for moving production to native without breaking legacy Scaffold
+sessions that are still in use, and the record of how it went.
 
 ## Who uses production (measured 2026-11-12, read-only)
 
@@ -263,5 +265,37 @@ the same Scaffold runtime contract:
 Production `desktop` and `scaffold` channels moved to 0.2.150 (from 0.2.148 and
 0.1.156). Scaffold's own template pins are still 0.2.149, which is compatible; bump them
 with the next primary build.
+
+## 2026-11-21: 0.2.152 on production desktop and Scaffold
+
+0.2.152 is `main` at `a38d901c0` (#228).
+
+| Time (UTC) | Step |
+| --- | --- |
+| 04:36 | Staging release (run 44864433045). |
+| 04:41 | Production candidate (run 44866994966). |
+| 05:33 | Every provider pod serves template `scaffold-ashler-platform-e2b-6551-57600fcfb2a0`, with Crew 0.2.152 (template-only primary run 44867406839). The pins are 0.2.152 / `2920cd3d…` in the repository and the `staging` environment. |
+| 06:18 | Production promotion (run 44874323443): `desktop` and `scaffold` channels moved from 0.2.150 to 0.2.152. |
+| 07:04 | Every provider pod serves template `scaffold-ashler-platform-e2b-6552-309f76fe56be`, which adds ashler-platform #15620 (template-only primary run 44875421409). |
+
+A new web-UI session became ready on 0.2.152. A turn queued from the local production
+Crew app reached the sandbox's engine and replied, and crew-web in the browser showed it.
+
+Two bugs surfaced:
+
+- **Browser sends failed** with `503 Crew engine request failed` on every `chat2` sandbox.
+  Before each send, crew-web checks the model route the host authorized in
+  `<SCAFFOLD_RUNTIME_DIR>/omp-inference/profile.json`. The supervisor writes that file under
+  its own runtime directory, but gave crew-web the Crew runtime directory. ashler-platform
+  #15620 fixes it. On the 07:04 template, a new web-UI session was ready in about a minute,
+  a send from the browser replied, and a turn from the local Crew app replied in the same
+  chat. Staging's `scaffold-staging` branch still has the bug.
+- **crew-web's "Open in Crew" opened Crew Staging.** It hard-coded `comet-staging://`.
+  #229 takes the scheme from the session's project and ships with the next Crew release.
+  Scaffold's own "Open in Crew" links were already right.
+
+Browser sends on Antigravity-routed sandboxes remain unsupported. The supervisor writes no
+profile for Antigravity routes, and crew-web admits only `openai-codex/` and `anthropic/`
+models. No production native session has used an Antigravity route so far.
 
 Remaining: retire the legacy Worker (step 7) after the last legacy session stops.
