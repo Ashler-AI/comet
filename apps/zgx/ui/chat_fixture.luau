@@ -1171,6 +1171,10 @@ sessions_stub.create = function(req: any)
 	local id = req.id or `new{made_chats}`
 	note(`create:{req.project or "none"}:{req.config and req.config.model or ""}`)
 	note(`made:{req.project or "-"}|{req.device or "-"}|{req.branch or "-"}|{req.cwd or "-"}{if req.cloud then "|cloud" else ""}`)
+	-- (Crew: a Cloud chat's send goes with it, its route made from that.)
+	if req.cloud and req.request then
+		note(`cloud_request:{req.request.model or "-"}`)
+	end
 	META[id] = { title = "New chat", project = req.project, model = req.config and req.config.model }
 	-- (On Cloud, its machine's device, as the engine's list will say.)
 	if req.cloud then

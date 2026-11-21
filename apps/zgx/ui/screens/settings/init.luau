@@ -99,9 +99,13 @@ settings.add {
 
 -- Cloud and Billing, only while the account has Cloud (the shipping app's
 -- `cloud_offered`): listed ahead of Zeron's own, and found by the search
--- only then.
+-- only then. (Crew: its Cloud is its Scaffold sandboxes, with no sizes,
+-- reach, GitHub logins or billing to set: neither page.)
+local function cloud_pages(): boolean
+	return cloud.offered() and not crew.on
+end
 settings.extra("cloud", function(): { any }
-	if not cloud.offered() then
+	if not cloud_pages() then
 		return {}
 	end
 	return {
@@ -110,7 +114,7 @@ settings.extra("cloud", function(): { any }
 	}
 end)
 ui.effect(function()
-	if cloud.offered() then
+	if cloud_pages() then
 		search.index(cloud_page.ID, ui.t("settings.cloud.title"), cloud_page.TERMS, cloud_page.ROWS)
 		search.index(billing_page.ID, ui.t("settings.billing.title"), billing_page.TERMS, billing_page.ROWS)
 	else

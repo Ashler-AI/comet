@@ -124,7 +124,8 @@ local function on_cloud(): boolean
 	return now().target == CLOUD
 end
 local function cloud_choice(): { any }
-	if cloud.on() or on_cloud() then
+	-- (Crew: its sandboxes run on the shared accounts, with no vault.)
+	if (cloud.on() or on_cloud()) and not crew.on then
 		return { { value = CLOUD, label = ui.t("settings.providers.cloud"):get(), icon = "cloud" } }
 	end
 	return {}

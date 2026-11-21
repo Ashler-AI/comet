@@ -1563,6 +1563,18 @@ impl Sessions {
             .and_then(|c| serde_json::from_str::<Json>(&c.to_json()).ok())
         {
             params["config"] = config;
+        } else if let Some(request) = args.field("request").filter(|r| !matches!(r, Value::Nil)) {
+            // Crew: the composer's send's agent, model and account, as the
+            // chat's first message will set them: a Crew sandbox's agent route
+            // is made from them (crates/engine/src/crew_cloud.rs). Its effort
+            // and modes go with that message.
+            let config = crate::chat::merged_config(&Json::Null, &request);
+            if config["harness"].is_string() {
+                params["config"] = json!({
+                    "harness": config["harness"], "model": config["model"], "reasoning": null,
+                    "modelOptions": config["modelOptions"], "sandbox": config["sandbox"],
+                });
+            }
         }
         let made = engine::get().call("Mutate", params).await.map_err(|error| {
             eprintln!("zeron-zgx: sessions: no Cloud session: {error}");
@@ -1664,6 +1676,8 @@ pub(crate) fn is_cloud(d: &Json) -> bool {
     let platform = d["platform"].as_str().unwrap_or_default();
     platform == "cloud"
         || id.starts_with("cloud-")
+        // Crew: a Scaffold sandbox's host.
+        || crate::crew::sandbox_host(id)
         || d["capabilities"]
             .as_array()
             .is_some_and(|c| c.iter().any(|c| matches!(c.as_str(), Some("cloud-session" | "cloud-account"))))

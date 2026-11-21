@@ -3798,7 +3798,8 @@ fn runs_otherwise(chat: &Json, run: &Json) -> bool {
     })
 }
 
-fn merged_config(config: &Json, args: &Value) -> Json {
+// (Crew: also a Cloud chat's config as it's made, src/sessions.rs.)
+pub(crate) fn merged_config(config: &Json, args: &Value) -> Json {
     let mut c = if config.is_object() { config.clone() } else { json!({}) };
     if c.get("sandbox").is_none() {
         c["sandbox"] = json!("workspace-write");

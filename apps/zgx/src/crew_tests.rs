@@ -654,3 +654,65 @@ fn the_sidebar_has_no_star_banner() {
     assert!(shell(true).find("star-banner").is_none());
     assert!(shell(false).find("star-banner").is_some());
 }
+
+/// Crew's Cloud is its Scaffold sandboxes (crates/engine crew_cloud.rs): with
+/// the engine's Cloud on and the project's repository one it can open
+/// (ui/cloud_stub.luau answers as the engine does), a new chat's Work in
+/// offers Cloud beside this computer, and a send makes the chat there,
+/// with the composer's agent and model for its sandbox's route.
+#[test]
+fn the_work_in_row_offers_crew_s_cloud() {
+    let mut app = mount("chat_fixture.luau", true, (960., 760.));
+    assert!(app.host.run_command("go_home"));
+    app.frames(30);
+    // (The place panel opens from the chip; closed, its rows stay, hidden.)
+    let open_devices = |app: &mut TestApp| {
+        app.click("role:button \"Branch\"");
+        app.frames(30);
+        app.click("role:menuitem \"Device\"");
+        app.frames(30);
+    };
+    let close = |app: &mut TestApp| {
+        app.keys("Escape");
+        app.keys("Escape");
+        app.frames(30);
+    };
+    // Off (no sandbox region, or signed out): this computer alone.
+    open_devices(&mut app);
+    assert!(!shows(&mut app, "role:option ~\"Cloud\""), "{}", app.tree());
+    close(&mut app);
+    assert!(app.host.run_command("cloud_stub.offer"));
+    app.frames(30);
+    open_devices(&mut app);
+    assert!(app.shown("role:option ~\"Cloud\""), "{}", app.tree());
+    app.click("role:option ~\"Cloud\"");
+    app.frames(30);
+    close(&mut app);
+    app.type_text("role:textbox \"Message\"", "Fix the flaky test");
+    app.keys("Enter");
+    app.frames(30);
+    assert_eq!(app.error(), None);
+    // (The fixture's `calls`: what it was asked, comma-joined.)
+    let said = state(&app, "calls").map(|v| json_of(&v)).unwrap_or_default();
+    let calls: Vec<&str> = said.as_str().unwrap_or_default().split(',').collect();
+    assert!(calls.iter().any(|call| call.ends_with("|cloud")), "{calls:#?}");
+    let request = calls.iter().find(|call| call.starts_with("cloud_request:")).unwrap_or_else(|| panic!("{calls:#?}"));
+    assert_ne!(*request, "cloud_request:-", "the composer's model went with it");
+}
+
+/// Crew's Settings have no Cloud or Billing pages, nor a Cloud account to
+/// pick on Providers, even with its Cloud on: its sandboxes have no sizes,
+/// reach, logins or billing to set.
+#[test]
+fn crew_s_cloud_has_no_settings_pages() {
+    let mut app = settings(true);
+    assert!(app.host.run_command("cloud_stub.offer"));
+    app.frames(30);
+    for gone in ["Cloud", "Billing"] {
+        assert!(!shows(&mut app, &format!("#settings-nav >> role:tab \"{gone}\"")), "{gone} shows:\n{}", app.tree());
+    }
+    let mut zeron = settings(false);
+    assert!(zeron.host.run_command("cloud_stub.offer"));
+    zeron.frames(30);
+    assert!(shows(&mut zeron, "#settings-nav >> role:tab \"Cloud\""), "{}", zeron.tree());
+}

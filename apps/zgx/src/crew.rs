@@ -124,6 +124,15 @@ pub fn scaffold_session_kept(data_dir: &Path) -> bool {
     data_dir.join(SCAFFOLD_SESSION).is_file()
 }
 
+/// A Crew Scaffold sandbox's host (`comet-scaffold-{sandbox}-e{epoch}`): a
+/// Cloud machine of Crew's, never a computer to pick or list.
+pub fn sandbox_host(device_id: &str) -> bool {
+    MODE && device_id
+        .strip_prefix("comet-scaffold-")
+        .and_then(|rest| rest.rsplit_once("-e"))
+        .is_some_and(|(sandbox, epoch)| !sandbox.is_empty() && !epoch.is_empty() && epoch.bytes().all(|b| b.is_ascii_digit()))
+}
+
 /// Whether a sign-in page the engine returns may be opened: Scaffold's
 /// authorize page (https), or a loopback test authority's (plain http on
 /// 127.0.0.1, localhost or [::1], which the engine's Scaffold mode returns
