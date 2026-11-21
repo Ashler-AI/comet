@@ -81,6 +81,31 @@ describe("scoped transport authority", () => {
     expect(scopedRpcAllowed("rpc", payload("ApplyCrewAnnotation"), annotator)).toBe(true);
     expect(scopedRpcAllowed("rpc", payload("ApplyCrewAnnotation", "other"), annotator)).toBe(false);
   });
+  it("admits a session's queue, its controls and relayed commands, each on its own capability", () => {
+    const authority = requestAuthority(trustedRequest(req("/device/device-a/ws"), device))!;
+    const controller = { ...authority, capabilities: [...authority.capabilities, "session.control"] };
+    const call = (method: string, params: Record<string, unknown>) =>
+      new TextEncoder().encode(JSON.stringify({ method, params: { chatId: "session-a", ...params } }));
+    for (const method of ["QueueMessage", "UpdateQueuedMessage", "BeginQueuedMessageEdit", "RenewQueuedMessageEdit",
+      "FinishQueuedMessageEdit", "MoveQueuedMessage", "RemoveQueuedMessage", "SendQueuedMessageNow", "SteerQueuedMessageNow"]) {
+      expect(scopedRpcAllowed("rpc", call(method, { id: "q1", text: "next" }), authority), method).toBe(true);
+      expect(scopedRpcAllowed("rpc", call(method, { chatId: "other" }), authority), method).toBe(false);
+      expect(scopedRpcAllowed("rpc", call(method, {}), { ...authority, capabilities: ["session.read"] }), method).toBe(false);
+    }
+    for (const method of ["StopWaiting", "StopBackgroundTask"]) {
+      expect(scopedRpcAllowed("rpc", call(method, { taskId: "t" }), authority), method).toBe(false);
+      expect(scopedRpcAllowed("rpc", call(method, { taskId: "t" }), controller), method).toBe(true);
+      expect(scopedRpcAllowed("rpc", call(method, { chatId: "other" }), controller), method).toBe(false);
+    }
+    const relayed = (kind: string, chatId = "session-a") =>
+      call("RelayCommand", { chatId, entry: { id: "c1", payload: { kind }, issuedBy: "desktop", issuedAt: 1, status: "pending" } });
+    expect(scopedRpcAllowed("rpc", relayed("run"), authority)).toBe(true);
+    expect(scopedRpcAllowed("rpc", relayed("interrupt"), authority)).toBe(false);
+    expect(scopedRpcAllowed("rpc", relayed("interrupt"), controller)).toBe(true);
+    expect(scopedRpcAllowed("rpc", relayed("run", "other"), controller)).toBe(false);
+    expect(scopedRpcAllowed("rpc", relayed("reset"), controller)).toBe(false);
+    expect(scopedRpcAllowed("rpc", call("RelayCommand", {}), controller)).toBe(false);
+  });
   it("admits empty liveness probes without granting a data channel or extra capability", () => {
     const authority = requestAuthority(trustedRequest(req("/device/device-a/ws"), device))!;
     expect(scopedRpcAllowed("echo", new Uint8Array(), authority)).toBe(true);

@@ -179,6 +179,17 @@ export const sendAuthorized = (env: Env, ctx: DurableObjectState, ws: WebSocket,
   })());
 };
 
+/** A session's queued messages, as the host keeps them in its chat doc: send
+ * while a turn runs, and the queue's edits (zgx routes these to the host). */
+const QUEUE_METHODS = [
+  "QueueMessage", "UpdateQueuedMessage", "BeginQueuedMessageEdit", "RenewQueuedMessageEdit",
+  "FinishQueuedMessageEdit", "MoveQueuedMessage", "RemoveQueuedMessage", "SendQueuedMessageNow",
+  "SteerQueuedMessageNow",
+];
+const COMMAND_KINDS = ["run", "steer", "interrupt", "respondInput"];
+const commandCapability = (kind: unknown): string | undefined =>
+  typeof kind === "string" && COMMAND_KINDS.includes(kind) ? (kind === "interrupt" ? "session.control" : "session.chat") : undefined;
+
 /** Restricted peers use typed host commands; never raw terminal/filesystem RPC or opaque row mutation. */
 export const scopedRpcAllowed = (kind: string, payload: Uint8Array, authority?: SocketAuthority): boolean => {
   if (kind === "echo") return payload.length === 0 && (!authority?.sessionId || authority.capabilities.includes("session.read"));
@@ -200,10 +211,15 @@ export const scopedRpcAllowed = (kind: string, payload: Uint8Array, authority?: 
       return authority.capabilities.includes("session.read");
     }
     if (value.method === "ApplyCrewAnnotation") return authority.capabilities.includes("session.annotate");
-    if (value.method !== "QueueCommand") return false;
-    const command = params.command;
-    if (!command || !["run", "steer", "interrupt", "respondInput"].includes(command.kind)) return false;
-    return authority.capabilities.includes(command.kind === "interrupt" ? "session.control" : "session.chat");
+    if (QUEUE_METHODS.includes(value.method)) return authority.capabilities.includes("session.chat");
+    if (["StopWaiting", "StopBackgroundTask"].includes(value.method)) return authority.capabilities.includes("session.control");
+    // The typed command itself (QueueCommand), or its relayed delivery when the
+    // chat's rows haven't reached the host yet (RelayCommand: the same entry,
+    // deduplicated by the host's command ledger).
+    const command = value.method === "QueueCommand" ? params.command
+      : value.method === "RelayCommand" ? params.entry?.payload : undefined;
+    const capability = commandCapability(command?.kind);
+    return capability !== undefined && authority.capabilities.includes(capability);
   } catch {
     return false;
   }
