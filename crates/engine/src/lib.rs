@@ -47,6 +47,8 @@ pub mod cloud_disk;
 pub mod commands;
 pub mod commit_credit;
 pub mod credentials;
+/// Crew: Scaffold sandboxes behind the Cloud RPCs (slice 6).
+pub mod crew_cloud;
 /// Crew: managed inference on Agent Auth (slice 5).
 pub mod crew_inference;
 pub mod crew_sandbox;
@@ -230,6 +232,8 @@ pub struct EngineCore {
     updater_wake: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
     /// Cloud runner only: credential broker + heartbeat (dropped on shutdown).
     cloud: std::sync::Mutex<Option<runner::CloudRunner>>,
+    /// Crew: a Scaffold desktop's sandboxes behind the Cloud RPCs.
+    crew_cloud: std::sync::OnceLock<Arc<crew_cloud::CrewCloud>>,
     /// Exclusive data-dir lock — held for the engine's lifetime (single-instance).
     /// This process's agents, recorded in the data dir so that whatever
     /// a killed engine leaves running is ended by the next one.
@@ -547,6 +551,7 @@ impl EngineCore {
             updater: std::sync::Mutex::new(None),
             updater_wake: std::sync::Mutex::new(None),
             cloud: std::sync::Mutex::new(None),
+            crew_cloud: std::sync::OnceLock::new(),
             viewport_focus,
             _agent_ledger: agent_ledger,
             _instance_lock: lock,
@@ -728,7 +733,19 @@ impl EngineCore {
         if let Some(broker) = self.credentials() {
             rpc = rpc.with_credentials(broker);
         }
+        // Crew: a Scaffold desktop's Cloud is its sandboxes.
+        if let Some(crew) = self.crew_cloud.get() {
+            rpc = rpc.with_crew_cloud(crew.clone());
+        }
         Arc::new(rpc)
+    }
+
+    /// Crew: attach a Scaffold desktop's sandboxes (before the RPC service is
+    /// built), once.
+    pub fn set_crew_cloud(&self, crew: Arc<crew_cloud::CrewCloud>) {
+        if self.crew_cloud.set(crew.clone()).is_ok() {
+            crew.start();
+        }
     }
 
     /// Revoke every account-scoped transport before any slower graceful
@@ -797,8 +814,12 @@ impl EngineCore {
             self.sessions.forgo_revival();
         }
         self.sessions.shutdown().await;
-        // Crew: managed inference's routes end with the runs.
+        // Crew: managed inference's routes end with the runs; sandbox
+        // observation and attaches stop.
         crew_inference::shutdown(&self.registry);
+        if let Some(crew) = self.crew_cloud.get() {
+            crew.shutdown();
+        }
         self.terminals.shutdown();
         self.commands.shutdown().await;
         self.sessions.stop_activity_projection().await;
@@ -1205,6 +1226,7 @@ impl Engine {
 
         let preview_org = profile.org_id().to_string();
         let device_root = profile.device_root().to_path_buf();
+        let store_root = profile.store_root().to_path_buf();
         let registry = Arc::new(default_registry());
         // Crew: a Scaffold engine's agents run on Agent Auth only, from the
         // first spawn on (boot recovery's too).
@@ -1232,6 +1254,14 @@ impl Engine {
         core.set_auth(auth.clone());
         if let Some(crew) = &crew {
             crew.follow_workspace(core.workspace.clone());
+        }
+        // Crew: a Scaffold desktop's Cloud is its sandboxes (crew_cloud.rs).
+        let sandbox_tokens: Arc<dyn zeron_rpc::TokenSource> = tokens.clone();
+        if edge_enabled
+            && let Some(sandboxes) =
+                crew_cloud::CrewCloud::install(config, &auth, sandbox_tokens, core.workspace.clone(), &store_root)
+        {
+            core.set_crew_cloud(sandboxes);
         }
         // Agents' commits credit Zeron (always on Cloud, else per the
         // device's setting).

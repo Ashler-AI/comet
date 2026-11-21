@@ -940,6 +940,8 @@ pub struct EngineRpc {
     viewport_focus: crate::desktop_notify::ViewportFocus,
     /// The plugins service (absent in bare test assemblies).
     plugins: Option<crate::plugins::Plugins>,
+    /// Crew: a Scaffold desktop's sandboxes behind the Cloud RPCs.
+    crew_cloud: Option<std::sync::Arc<crate::crew_cloud::CrewCloud>>,
     engine_info: EngineInfo,
 }
 
@@ -1002,8 +1004,15 @@ impl EngineRpc {
             credentials: None,
             viewport_focus: Default::default(),
             plugins: None,
+            crew_cloud: None,
             engine_info,
         }
+    }
+
+    /// Crew: attach a Scaffold desktop's sandboxes (crew_cloud.rs).
+    pub fn with_crew_cloud(mut self, crew: std::sync::Arc<crate::crew_cloud::CrewCloud>) -> Self {
+        self.crew_cloud = Some(crew);
+        self
     }
 
     /// Attach the plugins service (the Plugin* methods).
@@ -1198,6 +1207,11 @@ impl EngineRpc {
             }
             params
         };
+        // Crew: a Scaffold sandbox runs OMP, on this engine's own catalog.
+        let harnesses = match self.crew_cloud {
+            Some(_) => crate::crew_cloud::HARNESSES,
+            None => crate::registry::CLOUD_HARNESS_IDS,
+        };
         match method {
             methods::LIST_HARNESSES => {
                 // Enabled = Cloud has an account to run it with (unknown
@@ -1207,7 +1221,7 @@ impl EngineRpc {
                     .registry
                     .descriptors()
                     .into_iter()
-                    .filter(|d| crate::registry::CLOUD_HARNESS_IDS.contains(&d.id))
+                    .filter(|d| harnesses.contains(&d.id))
                     .map(|mut d| {
                         d.installed = true;
                         d.enabled = Some(ready.as_ref().is_none_or(|ready| ready.contains(&d.id)));
@@ -1221,17 +1235,20 @@ impl EngineRpc {
                     Ok(p) => p,
                     Err(e) => return Some(Err(e)),
                 };
-                if !crate::registry::CLOUD_HARNESS_IDS.contains(&p.harness) {
-                    return Some(Err(RpcError::Failed(
-                        "Cloud runs Codex and Claude Code only".into(),
-                    )));
+                if !harnesses.contains(&p.harness) {
+                    return Some(Err(RpcError::Failed(match self.crew_cloud {
+                        Some(_) => "Crew's sandboxes run OMP only".into(),
+                        None => "Cloud runs Codex and Claude Code only".into(),
+                    })));
                 }
                 // What Cloud's machines run: the edge's list (the last one read,
                 // when it's out of reach), as a phone reads it. This computer's
                 // own catalog only before either: it fails where an agent isn't
                 // installed or signed in here, and Cloud's are signed in on the
                 // machine.
-                if let Some(models) = self.cloud_models(p.harness).await {
+                if self.crew_cloud.is_none()
+                    && let Some(models) = self.cloud_models(p.harness).await
+                {
                     return Some(RpcReply::value(&models));
                 }
                 Some(self.handle(method, local(&[])).await)
@@ -1325,6 +1342,12 @@ impl EngineRpc {
         reach: Option<zeron_proto::CloudReach>,
         config: Option<&ChatConfig>,
     ) -> Result<Option<CloudHost>, RpcError> {
+        // Crew: a Scaffold desktop's Cloud chat runs in a sandbox of its own,
+        // its row written on the sandbox's host (crew_cloud.rs).
+        if cloud && let Some(crew) = &self.crew_cloud {
+            let (device_id, cwd) = crew.chat_host(chat_id, branch, config).await?;
+            return Ok(Some(CloudHost { device_id, cwd: Some(cwd), row_written: true }));
+        }
         let failed = |e: crate::EngineError| RpcError::Failed(e.to_string());
         let on_cloud = |device_id: &str| device_id.starts_with(zeron_proto::CLOUD_DEVICE_PREFIX);
         // An agent's chat on another of the person's devices runs there.
@@ -1862,6 +1885,8 @@ impl EngineRpc {
         method: &str,
         params: serde_json::Value,
     ) -> Result<RpcReply, RpcError> {
+        // Crew: only what the Edge relays to a sandbox host goes to one.
+        crate::crew_cloud::guard_scaffold_target(&self.workspace, target, method, &params)?;
         let Some(links) = &self.links else {
             return Err(RpcError::Failed(format!(
                 "cannot reach device {target}: remote routing unavailable (offline)"
@@ -2059,6 +2084,8 @@ impl EngineRpc {
         method: &str,
         params: serde_json::Value,
     ) -> Result<RpcReply, RpcError> {
+        // Crew: no terminal reaches a sandbox host through the relay.
+        crate::crew_cloud::guard_scaffold_target(&self.workspace, target, method, &params)?;
         use crate::remote_terminals::Write;
         let relay: std::sync::Arc<dyn crate::remote_terminals::Relay> =
             std::sync::Arc::new(self.clone());
@@ -3502,8 +3529,10 @@ impl RpcService for EngineRpc {
                 ))
                 .await;
             }
+            // (Crew: a sandbox host's agents and models too, answered here.)
             if (target.starts_with(zeron_proto::CLOUD_DEVICE_PREFIX)
-                || crate::cloud_accounts::is_cloud_accounts_target(&target))
+                || crate::cloud_accounts::is_cloud_accounts_target(&target)
+                || (self.crew_cloud.is_some() && crate::crew_cloud::is_sandbox_host(&target)))
                 && let Some(reply) = self.answer_for_cloud(&target, method, &params).await
             {
                 return reply;
@@ -3598,6 +3627,12 @@ impl RpcService for EngineRpc {
                 params,
             ))
             .await;
+        }
+        // Crew: a Scaffold desktop's Cloud is its sandboxes (crew_cloud.rs).
+        if let Some(crew) = &self.crew_cloud
+            && let Some(reply) = Box::pin(crew.cloud_rpc(method, &params)).await
+        {
+            return reply;
         }
         if crate::cloud_client::handles(method) {
             // The person wakes a chat's machine (a size picked, a fresh one):
