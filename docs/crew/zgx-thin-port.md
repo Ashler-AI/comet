@@ -574,7 +574,7 @@ Open:
    - Option one: staging Platform, for identity and Agent Auth only, with rooms on the local Edge.
      The end-to-end runs use this.
    - Option two: the old canary Scaffold. It answers, but nobody has checked whether its authority is still valid.
-2. Deploying any Edge.
+2. Deploying an Edge to production. (Staging is decided: below.)
 
 Decided by the owner on 2026-11-20:
 
@@ -591,6 +591,12 @@ Decided by the owner on 2026-11-20:
 - **The branch** is pushed to `origin`, and signed canaries are built from
   `crew-zgx-canary-*` tags (`.github/workflows/crew-zgx-canary.yml`).
 - **Next:** finish the Agent Auth phase, OMP included.
+- **Then (later that day):** slice 6, Scaffold sandboxes. Two staging-only deploys are
+  approved: this branch's Edge as its own staging Worker (sharing nothing with Crew's
+  Edges), and a scaffold-staging sandbox image whose Crew engine is built from this
+  branch. Nothing in production.
+- **Default agent:** new chats keep starting on Claude Code; OMP is a choice in the
+  composer.
 
 ## Status
 

@@ -1,0 +1,68 @@
+name: Crew zgx staging Edge
+
+# This branch's Edge as a staging Worker of its own, `crew-zgx-edge-staging`
+# on workers.dev (docs/crew/zgx-thin-port.md, "Staging Edge"; approved by the
+# owner on 2026-11-20, staging only). It shares nothing with Crew's Edges:
+# its own Durable Objects and bucket, no routes. Deployed only when a
+# `crew-zgx-edge-staging-*` tag is pushed:
+#
+#   git tag crew-zgx-edge-staging-YYYYMMDD-N <commit> && git push origin crew-zgx-edge-staging-YYYYMMDD-N
+#
+# The deploy uses the comet-staging environment's Cloudflare token, which can
+# replace any Worker in Crew's account: scripts/crew-zgx-staging-guard.mjs
+# refuses a config that names anything but crew-zgx's own Worker, bucket and
+# migrations, before the token is ever in reach.
+on:
+  push:
+    tags: ['crew-zgx-edge-staging-*']
+
+permissions:
+  contents: read
+
+concurrency:
+  group: crew-zgx-edge-staging
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    environment: comet-staging
+    defaults:
+      run:
+        working-directory: edge
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 22
+      - run: npm ci
+      - name: Unit tests
+        run: npm run test:unit
+      - name: Crew's workerd tests
+        run: npm run test:crew-workerd
+      - name: Guard the config
+        run: node scripts/crew-zgx-staging-guard.mjs wrangler.crew-zgx-staging.jsonc
+      - name: Deploy crew-zgx-edge-staging
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          WRANGLER_SEND_METRICS: 'false'
+        run: |
+          test -n "$CLOUDFLARE_API_TOKEN"
+          test -n "$CLOUDFLARE_ACCOUNT_ID"
+          npx wrangler deploy --config wrangler.crew-zgx-staging.jsonc 2>&1 | tee "$RUNNER_TEMP/deploy.log"
+          # The Worker's origin, as wrangler reports it.
+          origin="$(grep -oE 'https://crew-zgx-edge-staging\.[a-z0-9-]+\.workers\.dev' "$RUNNER_TEMP/deploy.log" | head -1)"
+          test -n "$origin"
+          echo "EDGE_ORIGIN=$origin" >> "$GITHUB_ENV"
+      - name: Check it answers as crew-zgx staging
+        run: |
+          for _ in 1 2 3 4 5 6; do
+            if curl -fsS "$EDGE_ORIGIN/health" | jq -e '.ok and .auth == "scaffold" and .environment == "crew-zgx-staging"'; then
+              echo "### Deployed $EDGE_ORIGIN" >> "$GITHUB_STEP_SUMMARY"
+              exit 0
+            fi
+            sleep 10
+          done
+          exit 1

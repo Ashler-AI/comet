@@ -1,0 +1,56 @@
+// Crew zgx's staging Edge (docs/crew/zgx-thin-port.md, "Staging Edge"): this
+// branch's Edge as a Worker of its own, sharing nothing with Crew's Edges:
+// its own name, Durable Objects (one migration of its own) and bucket, no
+// routes, no crons, services or workflows. Deployed only by
+// .github/workflows/crew-zgx-edge-staging.yml after
+// scripts/crew-zgx-staging-guard.mjs has checked this file.
+//
+// Standalone, not an environment of wrangler.jsonc: an environment inherits
+// the top level's account, routes, crons, assets and migrations (upstream
+// Zeron's). The account is the deploy's CLOUDFLARE_ACCOUNT_ID (Crew's, from
+// the comet-staging environment): none named here, so none overrides it.
+//
+// Migrations are append-only: never edit or remove a tag below, never
+// rename the Worker or a class without a rename step, or its rooms are lost.
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "crew-zgx-edge-staging",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-07-01",
+  "compatibility_flags": ["nodejs_compat"],
+  "workers_dev": true,
+  "preview_urls": false,
+  "routes": [],
+  "triggers": { "crons": [] },
+  "alias": { "loro-crdt": "loro-crdt/base64" },
+  "rules": [{ "type": "Text", "globs": ["**/*.sh"], "fallthrough": true }],
+  "durable_objects": {
+    "bindings": [
+      { "name": "AUTH_GRANTS", "class_name": "AuthGrant" },
+      { "name": "NATIVE_GRANT_EPOCHS", "class_name": "AuthGrant" },
+      { "name": "DEVICE_ROOMS", "class_name": "DeviceRoom" },
+      { "name": "PREVIEW_ROOMS", "class_name": "PreviewRoom" },
+      { "name": "REGISTRY_ROOMS", "class_name": "RegistryRoom" },
+      { "name": "CHAT_ROOMS", "class_name": "ChatRoom" }
+    ]
+  },
+  "migrations": [
+    {
+      "tag": "crew-zgx-staging-v1",
+      "new_sqlite_classes": ["AuthGrant", "DeviceRoom", "PreviewRoom", "RegistryRoom", "ChatRoom"]
+    }
+  ],
+  "r2_buckets": [{ "binding": "BLOBS", "bucket_name": "crew-zgx-staging-blobs" }],
+  "vars": {
+    "AUTH_MODE": "scaffold",
+    "ENVIRONMENT": "crew-zgx-staging",
+    // Crew Staging's authority: staging Platform, project and deployment
+    // ashler-staging (scripts/crew/local-backend's `staging`).
+    "SCAFFOLD_CONTROL_PLANE_URL": "https://scaffold-staging.internal.ashler.com",
+    "SCAFFOLD_PROJECT_SCOPE": "ashler-staging",
+    "SCAFFOLD_DEPLOYMENT_ID": "ashler-staging",
+    "SCAFFOLD_REQUIRED_CAPABILITIES": "session.read session.sync.write session.chat session.control session.annotate session.files session.environment"
+  },
+  // (Off: a log line can carry a `?token=` URL.)
+  "observability": { "enabled": false }
+}
