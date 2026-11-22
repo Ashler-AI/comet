@@ -101,14 +101,16 @@ fn controller() -> Controller {
 struct Fixture {
     cloud: Arc<CrewCloud>,
     workspace: WorkspaceHost,
+    store: Arc<DocsStore>,
     _dir: tempfile::TempDir,
 }
 
 fn fixture(origin: &str, region: Option<&str>) -> Fixture {
     let dir = tempfile::tempdir().unwrap();
     std::fs::create_dir_all(dir.path().join("store")).unwrap();
+    let store = Arc::new(DocsStore::open(&dir.path().join("store")).unwrap());
     let workspace = WorkspaceHost::open(
-        Arc::new(DocsStore::open(&dir.path().join("store")).unwrap()),
+        store.clone(),
         WorkspaceHostConfig {
             device_id: "desktop".into(),
             device_name: "Desktop".into(),
@@ -133,7 +135,7 @@ fn fixture(origin: &str, region: Option<&str>) -> Fixture {
         Some("deployment-a".into()),
         ledger,
     ));
-    Fixture { cloud, workspace, _dir: dir }
+    Fixture { cloud, workspace, store, _dir: dir }
 }
 
 fn omp(model: &str, account: Option<&str>) -> ChatConfig {
@@ -455,6 +457,59 @@ async fn a_failed_sandbox_s_session_says_why_and_the_way_on() {
     );
     let retry = cloud.cloud_rpc(methods::CLOUD_SESSION_RETRY, &json!({})).await.unwrap().err().expect("refused").to_string();
     assert!(retry.contains("Crew's sandboxes") && retry.contains("Start a new chat to try again."), "{retry}");
+}
+
+/// A failed sandbox's host never claims its device again (Crew sends no
+/// Start), so a wake owed to its chat settles with no nudge. Before, the chat
+/// nudged the Edge every few seconds (each a 404) for as long as its message
+/// waited. A working sandbox's chat is still woken.
+#[tokio::test]
+async fn a_failed_sandbox_s_chat_stops_waking_its_host() {
+    use crate::doc_host::{DocHost, DocHostConfig, EdgeConfig};
+    let (origin, requests) = serve(|_, _| (404, "{}".into())).await;
+    let Fixture { cloud, workspace, store, .. } = fixture(&origin, Some("harness-zgx"));
+    let environment = |state: &str| {
+        serde_json::from_value::<scaffold::Sandbox>(sandbox_value(state)).unwrap().into_environment(&controller().scope(SESSION)).unwrap()
+    };
+    let nudge = format!("POST /device/{DEVICE}/nudge ");
+    let nudges = || requests.lock().unwrap().iter().filter(|request| request.starts_with(&nudge)).count();
+    let settled = || async {
+        tokio::time::timeout(Duration::from_secs(30), async {
+            while store.sync_job_version(SESSION, "remote-wake").unwrap().is_some() {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .is_ok()
+    };
+
+    assert!(cloud.publish(&controller(), &environment("ready"), None, None).unwrap());
+    assert!(!sandbox_retired(&workspace, SESSION, DEVICE), "a working sandbox's host");
+    let host = DocHost::new(
+        store.clone(),
+        DocHostConfig { device_id: "desktop".into(), default_harness: HarnessId::Mock, edge: Some(EdgeConfig::with_static_token(&origin, "test")) },
+    );
+    host.set_workspace(workspace.clone());
+    store.schedule_sync_job(SESSION, "remote-wake").unwrap();
+    let woken = tokio::time::timeout(Duration::from_secs(10), async {
+        while nudges() == 0 {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await;
+    assert!(woken.is_ok(), "a working sandbox's host is woken");
+
+    assert!(cloud.publish(&controller(), &environment("failed"), None, None).unwrap());
+    assert!(sandbox_retired(&workspace, SESSION, DEVICE));
+    assert!(!sandbox_retired(&workspace, SESSION, "comet-scaffold-sandbox-a-e2"), "another epoch's host");
+    assert!(!sandbox_retired(&workspace, SESSION, "cloud-machine-1"), "not a sandbox's host");
+    assert!(settled().await, "the wake is settled");
+    let before = nudges();
+    // Owed again (a later send's nudge): settled again, with nothing sent.
+    store.schedule_sync_job(SESSION, "remote-wake").unwrap();
+    assert!(settled().await, "settled again");
+    assert_eq!(nudges(), before, "no nudge for a failed sandbox's host");
+    host.shutdown_workers().await;
 }
 
 /// A row is never re-homed from another device, bound to another sandbox,

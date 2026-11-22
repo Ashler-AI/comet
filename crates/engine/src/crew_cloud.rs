@@ -83,6 +83,25 @@ pub(crate) fn is_sandbox_host(device_id: &str) -> bool {
     parse_device_id(device_id).is_some()
 }
 
+/// Whether `host` is the sandbox host `chat`'s published environment names,
+/// and that sandbox failed or stopped. Crew can't restart one (this port
+/// sends no Start), so the host never claims its device again: a wake for
+/// it is settled, not retried (`doc_host_delivery`'s seam), where every
+/// nudge would answer 404 for as long as its message waits.
+pub(crate) fn sandbox_retired(workspace: &WorkspaceHost, chat: &str, host: &str) -> bool {
+    if !is_sandbox_host(host) {
+        return false;
+    }
+    let Some(metadata) = workspace.crew_chat_metadata(chat) else { return false };
+    let Some(environment) = serde_json::from_value::<Metadata>(metadata).ok().and_then(|metadata| metadata.environment) else {
+        return false;
+    };
+    match environment.sandbox() {
+        Ok((sandbox, lifecycle, Some(epoch))) => lifecycle.terminal() && device_id_for(sandbox, epoch) == host,
+        _ => false,
+    }
+}
+
 /// Crew's chat metadata (`zeron_proto::CrewChatMetadata`), the row's `crew`
 /// field.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

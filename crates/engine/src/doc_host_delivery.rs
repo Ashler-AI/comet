@@ -153,6 +153,13 @@ async fn deliver(weak: std::sync::Weak<DocHostInner>, chat: &str) {
             tokio::time::sleep(backoff).await;
             continue;
         };
+        // Crew: a sandbox that failed or stopped never claims its host again
+        // (crew_cloud::sandbox_retired), so its wake is settled, not retried.
+        if host.workspace().is_some_and(|workspace| crate::crew_cloud::sandbox_retired(workspace, chat, &target)) {
+            tracing::info!(%chat, device = %target, "crew: the chat's sandbox is gone; its wake is settled");
+            let _ = host.inner.store.complete_sync_job(chat, "remote-wake", version);
+            return;
+        }
         let rows_flushed = host.inner.store.has_pending_chat_updates(chat).ok() == Some(false);
         let sent = async {
             let bearer = edge.bearer().await?;
