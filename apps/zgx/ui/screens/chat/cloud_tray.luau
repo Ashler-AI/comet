@@ -129,7 +129,7 @@ function M.bind(c: Bind): any
 			return nil
 		end
 		local put_away = PUT_AWAY:get()
-		return logic.alert(s, {
+		local a = logic.alert(s, {
 			now = HOUR:get() * 3600,
 			failure = b.wake_state().failure,
 			send_failed = sent_failed(),
@@ -140,6 +140,13 @@ function M.bind(c: Bind): any
 				return logic.dismissed(put_away, s.chat, kind, level)
 			end,
 		})
+		-- Crew: a sandbox can't be restarted from here, so its alert offers
+		-- no Try again (its words say the way on: a new chat).
+		if a and a.action == "retry" and crew.sandbox_host(c.device()) then
+			a = table.clone(a)
+			a.action, a.action_label = nil, nil
+		end
+		return a
 	end)
 	b.picker = ui.computed(function(): logic.Picker?
 		local s, a = b.session(), b.alert:get()

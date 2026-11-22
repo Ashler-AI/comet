@@ -53,4 +53,8 @@ return ui.column {
 		local a = machine.alert:get()
 		return if a then a.body else "no alert"
 	end },
+	ui.text { id = "alert-action", literal = true, function(): string
+		local a = machine.alert:get()
+		return if a and a.action_label then a.action_label else "no action"
+	end },
 }
