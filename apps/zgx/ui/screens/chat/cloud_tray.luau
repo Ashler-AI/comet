@@ -9,6 +9,8 @@
 --   LinkNotice.of { cloud = machine.cloud_link(), … }
 
 local cloud = require("@account/cloud")
+-- Crew: its sandboxes' hosts are followed as Cloud's machines are.
+local crew = require("@account/crew")
 local logic = require("@app/screens/chat/cloud_machine")
 local route = require("@app/screens/shell/route")
 local Held = require("@app/screens/chat/held")
@@ -40,11 +42,15 @@ export type Bind = {
 function M.bind(c: Bind): any
 	local b: any = {}
 	-- Is this chat's machine one of Cloud's? Then its sessions are followed.
+	-- (Crew: or one of its sandboxes' hosts.)
+	local function on_machine(): boolean
+		return cloud.on_device(c.device()) or crew.sandbox_host(c.device())
+	end
 	cloud.follow(function(): boolean
-		return c.chat() ~= nil and cloud.on_device(c.device())
+		return c.chat() ~= nil and on_machine()
 	end)
 	ui.effect(function()
-		if not cloud.on_device(c.device()) then
+		if not on_machine() then
 			return
 		end
 		HOUR:set(os.time() // 3600)

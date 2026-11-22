@@ -406,6 +406,57 @@ async fn the_cloud_rpcs_answer_as_crew_s_sandboxes() {
     }
 }
 
+/// A failed sandbox's session says why (Cloud's "Machine failed" alert), in
+/// Platform's words when it recorded some, and the way on; its Try again is
+/// refused saying the same. A working one says nothing.
+#[tokio::test]
+async fn a_failed_sandbox_s_session_says_why_and_the_way_on() {
+    let other = |id: &str, session: &str, status: &str| {
+        let mut value = sandbox_value(status);
+        value["id"] = json!(id);
+        value["cometRuntimeProfile"]["sandboxId"] = json!(id);
+        value["cometRuntimeProfile"]["sessionId"] = json!(session);
+        value
+    };
+    let mut recorded = sandbox_value("failed");
+    recorded["lifecycleError"] = json!({"action": "start", "phase": "prepare", "message": "missing session operation response"});
+    // A launch refused before its runtime ran (omp_inference_access_required): no record.
+    let unrecorded = other("sandbox-b", "9dd173da-fb53-48df-9581-026009c783e2", "failed");
+    let ready = other("sandbox-c", "5f0c1a52-7a3e-4c55-9d1e-7b8f1c2d3e4f", "ready");
+    let (origin, _) = serve(move |request, _| {
+        if request.starts_with("GET /api/code-sandboxes ") {
+            (200, json!({"ok": true, "sandboxes": [recorded.clone(), unrecorded.clone(), ready.clone()]}).to_string())
+        } else {
+            (404, "{}".into())
+        }
+    })
+    .await;
+    let Fixture { cloud, .. } = fixture(&origin, Some("harness-zgx"));
+    let Some(Ok(RpcReply::Value(sessions))) = cloud.cloud_rpc(methods::CLOUD_SESSIONS, &json!({})).await else {
+        panic!("a value");
+    };
+    let said: Vec<_> = sessions["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|session| (session["chatId"].as_str().unwrap().to_owned(), session["state"].clone(), session["error"].clone()))
+        .collect();
+    assert_eq!(
+        said,
+        vec![
+            (
+                SESSION.to_owned(),
+                json!("error"),
+                json!("The sandbox didn't start: missing session operation response. Start a new chat to try again.")
+            ),
+            ("9dd173da-fb53-48df-9581-026009c783e2".to_owned(), json!("error"), json!("Its sandbox failed. Start a new chat to try again.")),
+            ("5f0c1a52-7a3e-4c55-9d1e-7b8f1c2d3e4f".to_owned(), json!("ready"), Value::Null),
+        ]
+    );
+    let retry = cloud.cloud_rpc(methods::CLOUD_SESSION_RETRY, &json!({})).await.unwrap().err().expect("refused").to_string();
+    assert!(retry.contains("Crew's sandboxes") && retry.contains("Start a new chat to try again."), "{retry}");
+}
+
 /// A row is never re-homed from another device, bound to another sandbox,
 /// or moved back to an older epoch.
 #[tokio::test]

@@ -178,6 +178,11 @@ pub(crate) struct SessionEnvironment {
     /// Crew keeps it among the environment's unknown fields, on the same key.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_route: Option<AgentRoute>,
+    /// Why its last start or resume failed, in Platform's words
+    /// (`lifecycleError`), for its chat to say. Shown only: never published
+    /// with the chat nor kept in the ledger, so no part of the binding.
+    #[serde(skip)]
+    pub failure: Option<String>,
 }
 
 impl SessionEnvironment {
@@ -686,6 +691,28 @@ pub(crate) struct Sandbox {
     links: serde_json::Map<String, Value>,
     comet_runtime_profile: Option<RuntimeProfile>,
     agent_route: Option<AgentRoute>,
+    /// Its last failed start or resume (Platform's `SandboxLifecycleError`):
+    /// read loosely, as a shape this build doesn't expect must cost only the
+    /// words, never the sandbox.
+    #[serde(default)]
+    lifecycle_error: Option<Value>,
+}
+
+/// Why a failed sandbox's last start or resume failed, in a sentence: its
+/// action and Platform's own message, bounded. None without a message.
+fn lifecycle_failure(error: Option<&Value>) -> Option<String> {
+    const MAX_CHARS: usize = 300;
+    let message = error?.get("message")?.as_str()?.trim().trim_end_matches('.').trim_end();
+    if message.is_empty() {
+        return None;
+    }
+    let action = match error?.get("action").and_then(Value::as_str) {
+        Some("resume") => "resume",
+        _ => "start",
+    };
+    let words: String = message.chars().take(MAX_CHARS).collect();
+    let end = if message.chars().nth(MAX_CHARS).is_some() { "…" } else { "." };
+    Some(format!("The sandbox didn't {action}: {words}{end}"))
 }
 
 #[derive(Debug, Deserialize)]
@@ -746,6 +773,11 @@ impl Sandbox {
         if let Some(route) = &self.agent_route {
             route.validate().map_err(|why| ScaffoldError::InvalidResponse(why.into()))?;
         }
+        let failure = if self.status == Lifecycle::Failed {
+            lifecycle_failure(self.lifecycle_error.as_ref())
+        } else {
+            None
+        };
         Ok(SessionEnvironment {
             scope: ScaffoldScope {
                 project_id: profile.project_id.clone(),
@@ -765,6 +797,7 @@ impl Sandbox {
             last_activity_at,
             database_environment: Some(self.database_environment),
             agent_route: self.agent_route,
+            failure,
         })
     }
 

@@ -447,6 +447,24 @@ fn settings_without_the_flag_are_zeron_s() {
     assert!(shows(&mut app, "#settings-search-results >> \"Members\""), "{}", app.tree());
 }
 
+/// A chat on one of Crew's sandbox hosts follows its sandbox as a Cloud chat
+/// follows its machine: one that failed says so over the composer, and why
+/// (ui/crew_cloud_tray_fixture.luau). Before, a failed launch said nothing at
+/// all, its message waiting a day. Zeron's build doesn't take the host for
+/// one of Cloud's machines, and reads nothing.
+#[test]
+fn a_failed_sandbox_says_so_on_its_chat() {
+    let mut app = mount("crew_cloud_tray_fixture.luau", true, (600., 300.));
+    assert_eq!(app.text("#alert-title"), "Machine failed");
+    assert_eq!(
+        app.text("#alert-body"),
+        "The sandbox didn't start: missing session operation response. Start a new chat to try again."
+    );
+    let mut app = mount("crew_cloud_tray_fixture.luau", false, (600., 300.));
+    assert_eq!(app.text("#alert-title"), "no alert");
+    assert_eq!(state(&app, "crew_cloud_tray_reads").map(|reads| json_of(&reads)), Some(json!(0)));
+}
+
 /// Crew's Settings → Providers: the agents it runs, each signed in by Crew
 /// (no account of its own to connect, no key to type), then Crew's shared
 /// accounts, and no more agents to add.

@@ -327,7 +327,9 @@ impl CrewCloud {
                 let default = RepoRef { name: DEFAULT_BRANCH.into(), current: true, worktree_path: None };
                 return Some(RpcReply::value(&[default]));
             }
-            methods::CLOUD_SESSION_WAKE | methods::CLOUD_SESSION_RETRY => "Crew's sandboxes can't be woken or restarted from here yet.",
+            methods::CLOUD_SESSION_WAKE => "Crew's sandboxes can't be woken from here yet.",
+            // (A failed sandbox's alert offers it: the way on, said again.)
+            methods::CLOUD_SESSION_RETRY => "Crew's sandboxes can't be restarted from here yet. Start a new chat to try again.",
             methods::CLOUD_SESSION_SLEEP => "Crew's sandboxes can't be put to sleep from here yet.",
             methods::CLOUD_SESSION_DELETE | methods::CLOUD_DELETE => "Crew's sandboxes can't be deleted from here yet.",
             methods::CLOUD_SET_MACHINE => "Crew's sandboxes have one size.",
@@ -382,6 +384,7 @@ impl CrewCloud {
                     repo: Some(scaffold::HOST_REPO.into()),
                     path: Some(scaffold::HOST_CWD.into()),
                     state: cloud_state(lifecycle),
+                    error: (lifecycle == Lifecycle::Failed).then(|| failed_words(environment.failure.as_deref())),
                     created_at: environment.last_activity_at.unwrap_or_default(),
                     last_active_at: environment.last_activity_at,
                     ..CloudSession::default()
@@ -861,6 +864,13 @@ fn cloud_state(lifecycle: Lifecycle) -> CloudState {
         Lifecycle::Failed => CloudState::Error,
         Lifecycle::Stopped => CloudState::Off,
     }
+}
+
+/// A failed sandbox, as its chat says it (Cloud's alert: "Machine failed"):
+/// why, when Platform recorded it (a launch refused before its runtime ran
+/// records nothing), and the way on, as Crew can't restart one yet.
+fn failed_words(failure: Option<&str>) -> String {
+    format!("{} Start a new chat to try again.", failure.unwrap_or("Its sandbox failed."))
 }
 
 /// A refusal in a sentence: Platform's own words when it gave some (its

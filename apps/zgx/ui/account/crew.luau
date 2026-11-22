@@ -11,6 +11,7 @@
 --   crew.managed_inference whether its agents run on Crew's shared accounts
 --   crew.managed(id)       whether that agent does, signed in by Crew
 --   crew.hides(id)         whether that agent isn't offered at all
+--   crew.sandbox_host(id)  whether that device is one of its sandboxes' hosts
 
 local M = {}
 
@@ -36,6 +37,17 @@ end
 
 function M.hides(id: string): boolean
 	return M.managed_inference and MANAGED[id] ~= true
+end
+
+-- The Cloud row's sandboxes each run as a host of their own,
+-- `comet-scaffold-{sandbox}-e{epoch}` (crates/engine/src/crew_scaffold.rs
+-- `device_id_for`). A chat on one follows its sandbox as a Cloud chat follows
+-- its machine (screens/chat/cloud_tray): starting, or why it failed. It isn't
+-- one of Cloud's devices otherwise (its accounts are its own, for one).
+local SANDBOX_HOST = "comet-scaffold-"
+
+function M.sandbox_host(device: string?): boolean
+	return M.on and device ~= nil and string.sub(device, 1, #SANDBOX_HOST) == SANDBOX_HOST
 end
 
 return M

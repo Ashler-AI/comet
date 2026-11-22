@@ -648,6 +648,39 @@ async fn a_grant_refusal_keeps_only_a_safe_code() {
     }
 }
 
+/// A failed sandbox's last start or resume, as its chat says it: Platform's
+/// message (bounded), only while it's failed, and never published with it.
+/// A record of a shape this build doesn't expect costs only the words.
+#[test]
+fn a_failed_sandbox_says_why_in_platform_s_words() {
+    let environment = |status: &str, lifecycle_error: Value| {
+        let mut value = sandbox_value(status);
+        value["lifecycleError"] = lifecycle_error;
+        serde_json::from_value::<Sandbox>(value).unwrap().into_environment(&scope()).unwrap()
+    };
+    let start = json!({"action": "start", "phase": "prepare", "message": "missing session operation response",
+        "occurredAt": "2026-11-22T16:07:25.884Z"});
+    let failed = environment("failed", start.clone());
+    assert_eq!(failed.failure.as_deref(), Some("The sandbox didn't start: missing session operation response."));
+    let published = serde_json::to_value(&failed).unwrap();
+    assert!(!published.to_string().contains("missing session"), "never published: {published}");
+    assert_eq!(serde_json::from_value::<SessionEnvironment>(published).unwrap().failure, None);
+
+    assert_eq!(environment("ready", start).failure, None, "only while it's failed");
+    assert_eq!(
+        environment("failed", json!({"action": "resume", "message": "base copy failed."})).failure.as_deref(),
+        Some("The sandbox didn't resume: base copy failed.")
+    );
+    let long = environment("failed", json!({"action": "start", "message": "x".repeat(400)})).failure.unwrap();
+    assert!(long.ends_with("x…") && long.chars().count() < 340, "{long}");
+    for odd in [json!("an error"), json!({"action": "start"}), json!({"message": "  "}), json!(null)] {
+        assert_eq!(environment("failed", odd.clone()).failure, None, "{odd}");
+    }
+    let mut without = sandbox_value("failed");
+    without.as_object_mut().unwrap().remove("lifecycleError");
+    assert_eq!(serde_json::from_value::<Sandbox>(without).unwrap().into_environment(&scope()).unwrap().failure, None);
+}
+
 #[test]
 fn a_host_s_device_names_its_sandbox_and_epoch() {
     assert_eq!(parse_device_id(DEVICE), Some((SANDBOX, 1)));
