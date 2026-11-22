@@ -719,9 +719,7 @@ a fake Edge only; nothing has created a sandbox on staging yet.
   `crew-runtime.json` for `https://crew-zgx-edge-staging.cgoggins.workers.dev` with
   `"sandboxRegion": "harness-zgx"`, and exits.
 - **Open**:
-  - Nothing has run against staging: no create in `harness-zgx`, no grant from the staging
-    Edge, no host attached, and no send, stream or interrupt through one. That is the exit
-    gate, after piece 4 and the Edge's redeploy.
+  - (Staging since: "Deployed: piece 4, and the exit gate", below.)
   - Platform's own launch mints a grant at the region's Edge and writes the chat row (its
     clock-0 upsert, which the desktop's row outranks). With that host already serving, the
     desktop's Attach only probes and reuses it; only without it does the desktop mint and
@@ -730,8 +728,77 @@ a fake Edge only; nothing has created a sandbox on staging yet.
     attachment escort send no `chatId`, so the pre-filter refuses them (the escort's, sent
     straight on a link, the Edge refuses).
   - Not here yet: titles for sandbox chats, a new epoch's Attach (its row is published; its
-    host comes from Platform's launch), resume/pause/stop, changing a chat's model after
-    create (Platform binds the host's inference to the create's route), and the machine tray.
+    host comes from Platform's launch), resume/pause/stop, and changing a chat's model after
+    create (Platform binds the host's inference to the create's route). The machine tray
+    follows a sandbox's host since 2026-11-22 (below), in upstream's words.
+
+**Deployed: piece 4, and the exit gate (2026-11-21 and 22).** Everything is staging-only and
+owner-approved. Nothing changed in production, and Platform has no PR to `master`.
+
+- **Platform** (task branch `czhen/crew-zgx-harness` in `~/ashler-platform-crew-zgx`, local):
+  - The control plane picks a region's own Edge (`SCAFFOLD_CREW_REGION_EDGE_URLS`, staging
+    `harness,harness-zgx`). `crewDeviceSession` verifies a `cs1.` bearer at that Edge too.
+  - It reaches the port's Edge through a service binding, `CREW_ZGX_EDGE` →
+    `crew-zgx-edge-staging` (`crewEdgeFetcher`, `crew-edge.ts`). Cloudflare refuses a
+    Worker's `fetch` to another `workers.dev` Worker of the same zone (a 404, error 1042),
+    so grants failed with `crew_device_grant_rejected:404` before it. The staging deploy
+    guard (`deploy-worker.sh`) allows that one binding; production's is untouched.
+  - `scaffold-staging` at `1a24d8daa82e…` (master merged, then the task branch), deployed
+    worker-only (run 45040880022, bindings `AGENT_AUTH`, `AGENT_AUTH_V2`, `CREW_ZGX_EDGE`).
+  - The harness release `scaffold-crew-zgx-harness` (namespace `scaffold-staging`,
+    `deploy-harness-crew-zgx.mjs --apply`; `/_scaffold/harness-zgx`). Revision 2 runs
+    `scaffold-session-crew-zgx@sha256:2c9a3ae2b71a…`. That is the live
+    `scaffold-session@sha256:ac8988011da9…` (checkout `e4e989bca802…`) with
+    `0.3.9-zgx.1` (archive `5b452e15d927…`, from `crew-zgx-linux-0.3.9-zgx.1`) in place of
+    Crew's engine, in the overlay layout.
+  - Revision 1 ran the harness from the image's checkout (`imageLayout: session`), and every
+    start failed in "prepare" with "missing session operation response". The harness runs
+    `session-ops.mjs` and `session-init.mjs` inside the session's view, from
+    `/opt/scaffold/internal/scaffold/harness/node`. That view binds `/opt/scaffold`, not the
+    checkout. The overlay now copies the harness there from its base's own checkout (a
+    regression check in `build-crew-zgx-session-image.test.mjs`).
+  - Rollback: `helm rollback scaffold-crew-zgx-harness 1 --kube-context platform --namespace
+    scaffold-staging`.
+- **Exit gate, passed 2026-11-22.** Run in the installed canary (`0.3.9`, staging Edge,
+  `sandboxRegion: harness-zgx`), from the Cloud row, on Claude Opus 5.5 with automatic
+  routing:
+  - **Create:** sandbox `rcs_64af2931681bfd231bb4bbed` on `scaffold-crew-zgx-harness-0.e1`,
+    Ready 8 s after it was asked for.
+  - **Attach:** the host attached 12 s after the send (`run_crew-78840397…`).
+  - **Send:** the reply `ZGXSANDBOX7` came back.
+  - **Stream:** a 3,000-line reply grew on screen every 2 s.
+  - **Interrupt:** Stop ended the turn in about 3 s ("Interrupted"), and the stored reply
+    stayed at line 765.
+- **Found and fixed:**
+  - A failed launch said nothing: the chat held its message as waiting for a day. The tray
+    followed only `cloud-…` machines.
+  - Now `crew.sandbox_host` lets the chat's Cloud tray follow its sandbox (`afbf0d714`, a
+    seam in `cloud_tray.luau`). A failed one shows "Machine failed", with Platform's
+    `lifecycleError` when it has one, and "Start a new chat to try again." It offers no Try
+    again (`8b1872225`): Crew can't restart a sandbox yet, and the engine refuses Cloud's
+    retry with the same words.
+  - Checked in the installed canary: the sandbox that failed in "prepare" says "The sandbox
+    didn't start: missing session operation response. Start a new chat to try again." A
+    fresh GPT-6.2 Sol launch showed the alert within 25 s. The working sandbox's chat shows
+    none and still answers.
+  - A failed sandbox's chat nudged its host (`POST /device/<host>/nudge`, a 404 each) every
+    few seconds while its message waited: upstream's remote-wake retry, which no terminal
+    state settled. `crew_cloud::sandbox_retired` (`ed92e9b7c`, a seam in
+    `doc_host_delivery.rs`) settles a wake whose host is a failed or stopped sandbox's.
+    Measured on the staging Edge (`wrangler tail`): six failed chats sent 136 nudges in 85 s
+    before; after, none in 89 s. The engine logged each wake settled as it started.
+- **Open:**
+  - A launch on GPT-6.2 Sol (`openai`, automatic) fails before its runtime runs
+    (`omp_inference_access_required`). Agent Auth answers Platform's authority request 429
+    `omp_inference_route_exhausted`. Four ChatGPT Pro accounts were at 100% weekly; the one
+    with room, a Team account, wasn't used for it (seen 2026-11-22, `rcs_41079b57…`).
+    Claude's routes launch.
+  - Platform records no reason on the sandbox for a launch refused before its runtime runs
+    (only a session event has it), so that chat says only "Its sandbox failed." A
+    `lifecycleError`-like field for launch failures would let it say why.
+  - Staging's shared harness, `scaffold-harness` (region `harness`), is on the session
+    layout. It likely fails every start the same way: it shows no sessions in five days.
+  - Staging holds this testing's sandboxes: six failed, and `rcs_64af…` left running.
 
 Earlier notes:
 
@@ -979,10 +1046,21 @@ Decided by the owner on 2026-11-20:
         model picker; the UI test covers the menu → dialog step.
     - Not done: completing a real sign-in or removing a real account (both change
       staging's shared pool).
-- [ ] 6. Scaffold: pieces 1 and 2 built and tested on this Mac, 2026-11-20 ("Scaffold
+- [x] 6. Scaffold: pieces 1 and 2 built and tested on this Mac, 2026-11-20 ("Scaffold
   sandboxes", "Built"); piece 3, the desktop, built and tested on this Mac against fakes,
-  2026-11-21 ("Built: piece 3"). Piece 4 (Platform) and the Edge's redeploy are next, then
-  the exit gate on staging.
+  2026-11-21 ("Built: piece 3"); piece 4 deployed to staging and the exit gate passed there,
+  2026-11-22 ("Deployed: piece 4, and the exit gate"). Open: OpenAI routes'
+  `omp_inference_route_exhausted`, the reason for a launch refused before its runtime, and
+  resume.
+  - The failed-sandbox fixes, 2026-11-22: `cargo test -p zeron-engine --lib -- crew_`: 77
+    passed; `-- doc_host::remote_delivery`: 4 passed. zgx `cargo test --bin zeron-zgx --
+    crew`: 29 passed; `-- crew sessions chat`: 180 passed, 2 ignored. Luau UI
+    (`scripts/ci/test-zgx.sh ui`): 1,470 tests, 0 failed. `check -p zeron-engine
+    --all-targets` and `clippy -p zeron-engine --lib`: nothing in the files changed. Platform
+    `build-crew-zgx-session-image.test.mjs`: 3 passed.
+    - `crew_cloud::scaffold::tests::attach_starts_the_host_as_the_native_runner_takes_it`
+      failed once in a full run while the UI suite loaded the machine ("the host answered
+      another authority"). It passed 4 of 4 alone, and in the next full run.
   - Piece 3, 2026-11-21:
     - `cargo test -p zeron-engine --lib -- crew_cloud crew_sandbox crew_inference crew_accounts
       rpc::tests`: 98 passed, 1 ignored. `crew_cloud`'s 25: Crew main's mocked-Platform tests
