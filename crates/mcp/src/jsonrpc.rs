@@ -6,13 +6,62 @@
 //! (`notifications/initialized`, `notifications/cancelled`) are accepted and
 //! ignored — there is no server-side state to initialize or cancel.
 
+use std::borrow::Cow;
 use std::sync::Arc;
 
+use async_trait::async_trait;
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::mpsc;
 
 use crate::tools::Tools;
+
+/// Result of one MCP tool invocation, supporting both text and multimodal
+/// (e.g. inline base64 image) content blocks.
+pub(crate) struct ToolOutput {
+    pub content: Vec<Value>,
+    pub structured: Option<Value>,
+}
+
+/// Server-specific MCP handler backing the shared stdio JSON-RPC transport.
+#[async_trait]
+pub(crate) trait McpHandler: Send + Sync + 'static {
+    fn server_name(&self) -> &'static str;
+    fn instructions(&self) -> Cow<'static, str>;
+    fn list(&self) -> Vec<Value>;
+    fn has(&self, name: &str) -> bool;
+    async fn call(&self, name: &str, arguments: Value) -> Result<ToolOutput, String>;
+}
+
+#[async_trait]
+impl McpHandler for Tools {
+    fn server_name(&self) -> &'static str {
+        "zeron"
+    }
+
+    fn instructions(&self) -> Cow<'static, str> {
+        instructions(self.side_chats_only())
+    }
+
+    fn list(&self) -> Vec<Value> {
+        Tools::list(self)
+            .into_iter()
+            .filter_map(|tool| serde_json::to_value(tool).ok())
+            .collect()
+    }
+
+    fn has(&self, name: &str) -> bool {
+        Tools::has(self, name)
+    }
+
+    async fn call(&self, name: &str, arguments: Value) -> Result<ToolOutput, String> {
+        let value = Tools::call(self, name, arguments).await?;
+        Ok(ToolOutput {
+            content: vec![json!({ "type": "text", "text": pretty(&value) })],
+            structured: Some(wrap_structured(value)),
+        })
+    }
+}
 
 /// Protocol revisions this server knows. The client's requested revision
 /// is echoed when it is one of these; otherwise the newest is offered and
@@ -85,6 +134,10 @@ const INVALID_PARAMS: i64 = -32602;
 
 /// Serve MCP on this process's stdin/stdout until stdin closes.
 pub async fn serve_stdio(tools: Arc<Tools>) -> anyhow::Result<()> {
+    serve_stdio_handler(tools).await
+}
+
+pub(crate) async fn serve_stdio_handler<H: McpHandler>(handler: Arc<H>) -> anyhow::Result<()> {
     let (out_tx, mut out_rx) = mpsc::channel::<String>(64);
     let writer = tokio::spawn(async move {
         let mut stdout = tokio::io::stdout();
@@ -116,7 +169,7 @@ pub async fn serve_stdio(tools: Arc<Tools>) -> anyhow::Result<()> {
                 continue;
             }
         };
-        let Some(response) = route(&tools, message, &out_tx) else {
+        let Some(response) = route(&handler, message, &out_tx) else {
             continue;
         };
         let _ = out_tx.send(response.to_string()).await;
@@ -128,7 +181,11 @@ pub async fn serve_stdio(tools: Arc<Tools>) -> anyhow::Result<()> {
 
 /// Classify one inbound message. Requests are answered asynchronously via
 /// `out`; an immediate `Some` is a synchronous error reply.
-fn route(tools: &Arc<Tools>, message: Value, out: &mpsc::Sender<String>) -> Option<Value> {
+fn route<H: McpHandler>(
+    handler: &Arc<H>,
+    message: Value,
+    out: &mpsc::Sender<String>,
+) -> Option<Value> {
     let Some(object) = message.as_object() else {
         return Some(error_response(
             Value::Null,
@@ -144,10 +201,10 @@ fn route(tools: &Arc<Tools>, message: Value, out: &mpsc::Sender<String>) -> Opti
     let params = object.get("params").cloned().unwrap_or(Value::Null);
     match (id, method) {
         (Some(id), Some(method)) => {
-            let tools = tools.clone();
+            let handler = handler.clone();
             let out = out.clone();
             tokio::spawn(async move {
-                let response = handle_request(&tools, id, &method, params).await;
+                let response = handle_request_with(handler.as_ref(), id, &method, params).await;
                 let _ = out.send(response.to_string()).await;
             });
             None
@@ -168,7 +225,17 @@ fn route(tools: &Arc<Tools>, message: Value, out: &mpsc::Sender<String>) -> Opti
 
 /// Answer one request. Public for tests and for embedding the dispatcher
 /// behind another transport.
+#[cfg_attr(not(test), allow(dead_code))]
 pub async fn handle_request(tools: &Tools, id: Value, method: &str, params: Value) -> Value {
+    handle_request_with(tools, id, method, params).await
+}
+
+pub(crate) async fn handle_request_with<H: McpHandler>(
+    handler: &H,
+    id: Value,
+    method: &str,
+    params: Value,
+) -> Value {
     match method {
         "initialize" => {
             let requested = params
@@ -186,35 +253,37 @@ pub async fn handle_request(tools: &Tools, id: Value, method: &str, params: Valu
                     "protocolVersion": version,
                     "capabilities": { "tools": { "listChanged": false } },
                     "serverInfo": {
-                        "name": "zeron",
+                        "name": handler.server_name(),
                         "version": env!("CARGO_PKG_VERSION"),
                     },
-                    "instructions": instructions(tools.side_chats_only()),
+                    "instructions": handler.instructions(),
                 }),
             )
         }
         "ping" => ok_response(id, json!({})),
-        "tools/list" => ok_response(id, json!({ "tools": tools.list() })),
+        "tools/list" => ok_response(id, json!({ "tools": handler.list() })),
         "tools/call" => {
             let Some(name) = params.get("name").and_then(Value::as_str) else {
                 return error_response(id, INVALID_PARAMS, "tools/call needs a tool name");
             };
-            if !tools.has(name) {
+            if !handler.has(name) {
                 return error_response(id, INVALID_PARAMS, &format!("unknown tool: {name}"));
             }
             let arguments = params
                 .get("arguments")
                 .cloned()
                 .unwrap_or_else(|| json!({}));
-            match tools.call(name, arguments).await {
-                Ok(value) => ok_response(
-                    id,
-                    json!({
-                        "content": [{ "type": "text", "text": pretty(&value) }],
-                        "structuredContent": wrap_structured(value),
+            match handler.call(name, arguments).await {
+                Ok(output) => {
+                    let mut result = json!({
+                        "content": output.content,
                         "isError": false,
-                    }),
-                ),
+                    });
+                    if let Some(structured) = output.structured {
+                        result["structuredContent"] = structured;
+                    }
+                    ok_response(id, result)
+                }
                 Err(message) => ok_response(
                     id,
                     json!({

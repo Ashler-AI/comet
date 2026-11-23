@@ -135,6 +135,17 @@ pub fn run_mcp() -> anyhow::Result<()> {
     runtime.block_on(zeron_mcp::run(config))
 }
 
+/// `zeron mcp --computer-use`: Crew's native desktop computer-use MCP server.
+/// Runs directly on stdio with no engine IPC connection and inherits the host
+/// Crew app bundle's macOS Accessibility and Screen Recording grants.
+pub fn run_computer_use_mcp() -> anyhow::Result<()> {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()?;
+    runtime.block_on(zeron_mcp::run_computer_use())
+}
+
 /// `{data_dir}/logs/zeron-{mode}.log`, previous launch preserved as `.old`.
 /// Headed and headless are separate files so an embedded-engine app and a
 /// daemon on the same machine never interleave writes.

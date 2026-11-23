@@ -2772,7 +2772,12 @@ impl Inner {
     /// mcp` subcommand, dialing the engine's IPC port and stamped with the
     /// originating chat + device so the agent's side chats link back here.
     /// None when the engine serves no port or its executable is unknown.
-    fn zeron_mcp(&self, chat_id: &str, side_chats_only: bool) -> Option<zeron_proto::McpServer> {
+    fn zeron_mcp(
+        &self,
+        chat_id: &str,
+        side_chats_only: bool,
+        computer_use: bool,
+    ) -> Option<zeron_proto::McpServer> {
         let port = self.ipc_port.load(std::sync::atomic::Ordering::Relaxed);
         if port == 0 {
             return None;
@@ -2788,6 +2793,12 @@ impl Inner {
         if side_chats_only {
             env.insert(
                 zeron_proto::McpServer::SIDE_CHATS_ONLY_ENV.to_owned(),
+                "1".to_owned(),
+            );
+        }
+        if computer_use {
+            env.insert(
+                zeron_proto::McpServer::COMPUTER_USE_ENV.to_owned(),
                 "1".to_owned(),
             );
         }
@@ -3834,7 +3845,13 @@ async fn drive_run(
     // The host stamps its own MCP server onto every run it drives, so the
     // agent can spawn and talk to side chats through the engine it runs in.
     if request.mcp.is_none() {
-        request.mcp = inner.zeron_mcp(&chat_id, side_chats_only);
+        let computer_use = cfg!(target_os = "macos")
+            && harness_id == HarnessId::Antigravity
+            && !matches!(
+                std::env::var("ZERON_DISABLE_COMPUTER_USE").ok().as_deref(),
+                Some("1" | "true" | "TRUE" | "yes" | "YES")
+            );
+        request.mcp = inner.zeron_mcp(&chat_id, side_chats_only, computer_use);
     }
     // Kept whole for the startup-crash retry (same user entry; dispatch
     // re-injects the stored resume id). Option so the retry branch (inside
