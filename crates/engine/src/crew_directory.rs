@@ -17,6 +17,14 @@ const JOB: &str = "crew-directory";
 const REGISTRY_VERSION: &str = "r:registry1";
 
 const RETRY_DELAY: Duration = Duration::from_secs(30);
+const MAX_SESSION_RETRY_DELAY: Duration = Duration::from_secs(6 * 60 * 60);
+
+#[derive(Debug, Clone, Copy)]
+struct SessionBackoff {
+    registry_seq: Option<u64>,
+    retry_at: tokio::time::Instant,
+    delay: Duration,
+}
 
 #[derive(Debug, thiserror::Error)]
 enum PublishError {
@@ -79,11 +87,18 @@ pub(crate) fn start(auth: Auth, services: CrewServices, workspace: WorkspaceHost
         let mut inventory = true;
         // Remote versions are prerequisites only, never local projection evidence.
         let mut required_sources = BTreeMap::new();
+        let mut backoffs = BTreeMap::new();
+        let mut last_identity = identity.borrow().clone();
         loop {
-            inventory |= registry.has_changed().unwrap_or(false) || identity.has_changed().unwrap_or(false);
+            let current_identity = identity.borrow_and_update().clone();
+            let identity_changed = current_identity != last_identity;
+            if identity_changed {
+                backoffs.clear();
+                last_identity = current_identity;
+            }
+            inventory |= registry.has_changed().unwrap_or(false) || identity_changed;
             registry.borrow_and_update();
             snapshots.borrow_and_update();
-            identity.borrow_and_update();
             let mut cooldown = RETRY_DELAY;
             if services.ensure_identity().is_ok() && workspace.registry_synced() {
                 if inventory {
@@ -93,7 +108,7 @@ pub(crate) fn start(auth: Auth, services: CrewServices, workspace: WorkspaceHost
                         inventory = false;
                     }
                 }
-                match drain(&store, &services, &workspace, &mut required_sources).await {
+                match drain_with_backoff(&store, &services, &workspace, &mut required_sources, &mut backoffs).await {
                     Ok(Some(delay)) => cooldown = delay,
                     Ok(None) => {},
                     Err(error) => tracing::warn!(%error, "directory pending work retained for retry"),
@@ -150,8 +165,15 @@ fn disprove_registry_reset(store: &DocsStore, workspace: &WorkspaceHost) -> Resu
 /// Whether this process has reported that publication is paused by the flag.
 static PAUSE_REPORTED: AtomicBool = AtomicBool::new(false);
 
+#[cfg(test)]
 async fn drain(store: &Arc<DocsStore>, services: &CrewServices, workspace: &WorkspaceHost,
     required_sources: &mut BTreeMap<String, Version>) -> Result<Option<Duration>, EngineError> {
+    drain_with_backoff(store, services, workspace, required_sources, &mut BTreeMap::new()).await
+}
+
+async fn drain_with_backoff(store: &Arc<DocsStore>, services: &CrewServices, workspace: &WorkspaceHost,
+    required_sources: &mut BTreeMap<String, Version>,
+    backoffs: &mut BTreeMap<String, SessionBackoff>) -> Result<Option<Duration>, EngineError> {
     if workspace.directory_reconciliation_required() {
         disprove_registry_reset(store, workspace)?;
         if workspace.directory_reconciliation_required() {
@@ -170,18 +192,40 @@ async fn drain(store: &Arc<DocsStore>, services: &CrewServices, workspace: &Work
             after.clone_from(&id);
             services.ensure_identity()?;
             let Some(generation) = store.sync_job_version(&id, JOB)? else { continue };
+            let registry_seq = workspace.acknowledged_chat(&id).map(|row| row.seq);
+            let now = tokio::time::Instant::now();
+            if let Some(entry) = backoffs.get(&id)
+                && entry.registry_seq == registry_seq
+                && now < entry.retry_at
+            {
+                continue;
+            }
             match publish(store, services, workspace, &id, required_sources).await {
                 Ok(true) => {
                     store.complete_sync_job(&id, JOB, generation)?;
                     required_sources.remove(&id);
+                    backoffs.remove(&id);
                 }
-                Ok(false) => {}, // Keep the durable job until its own source catches up.
+                Ok(false) => {
+                    backoffs.remove(&id);
+                } // Keep the durable job until its own source catches up.
                 Err(error) => {
                     tracing::warn!(session = %id, %error, "directory update awaits synchronization or reconciliation");
                     if let PublishError::Remote { source, .. } = error
                         && source.is_transient() {
                         return Ok(Some(source.retry_after().unwrap_or(RETRY_DELAY).max(RETRY_DELAY)));
                     }
+                    let delay = backoffs
+                        .get(&id)
+                        .filter(|entry| entry.registry_seq == registry_seq)
+                        .map_or(RETRY_DELAY, |entry| {
+                            entry.delay.saturating_mul(2).min(MAX_SESSION_RETRY_DELAY)
+                        });
+                    backoffs.insert(id, SessionBackoff {
+                        registry_seq,
+                        retry_at: now + delay,
+                        delay,
+                    });
                 },
             }
         }
@@ -889,5 +933,62 @@ mod tests {
         let saved: Evidence = serde_json::from_str(&store.directory_state(id).unwrap().unwrap()).unwrap();
         assert_eq!(saved.source_version, evidence.source_version);
         assert!(!saved.confirmed, "lost ACK remains retryable, never a new session");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn non_transient_errors_back_off_per_session_until_registry_advances() {
+        let id = "6c1f4d4e-3e7b-4f4e-9d2e-8f9b0c1d2e3f";
+        let doc = loro::LoroDoc::new();
+        doc.set_peer_id(7).unwrap();
+        let row = doc.get_list("messages").push_container(loro::LoroMap::new()).unwrap();
+        row.insert("role", "user").unwrap();
+        doc.commit();
+        let snapshot = doc.export(loro::ExportMode::Snapshot).unwrap();
+        let responses = Replies::new(Mutex::new(VecDeque::from([
+            (200_u16, json!({"session": null})),
+            (403, json!({"error": "forbidden"})),
+            (200, json!({"session": null})),
+            (200, json!({"revision": 1})),
+        ])));
+        let requests = Recorded::default();
+        let (origin, server) = fake_scaffold(responses.clone(), requests.clone()).await;
+        let dir = tempfile::tempdir().unwrap();
+        let (services, store) = signed_in_services(dir.path(), &origin).await;
+        let mut registry = RegistryDoc::new("test-device");
+        let _ = registry.apply_state(5, true, 0, vec![chat_row(&services, id, 5)]);
+        store.save_snapshot(REGISTRY_DOC_ID, &registry.to_bytes().unwrap()).unwrap();
+        store.save_snapshot(id, &snapshot).unwrap();
+        let workspace = open_workspace(&store);
+        enqueue_registry(&store, &workspace).await.unwrap();
+
+        let mut required = BTreeMap::new();
+        let mut backoffs = BTreeMap::new();
+        drain_with_backoff(&store, &services, &workspace, &mut required, &mut backoffs)
+            .await
+            .unwrap();
+        assert_eq!(requests.lock().len(), 2);
+        assert!(backoffs.contains_key(id));
+
+        // Repeated drains (even after unrelated registry inventory wakes) do not
+        // re-send HTTP requests while this session's backoff is active.
+        enqueue_registry(&store, &workspace).await.unwrap();
+        drain_with_backoff(&store, &services, &workspace, &mut required, &mut backoffs)
+            .await
+            .unwrap();
+        assert_eq!(requests.lock().len(), 2);
+        workspace.shutdown();
+
+        // Advancing this session's acknowledged registry seq resets its backoff.
+        let _ = registry.apply_state(6, false, 0, vec![chat_row(&services, id, 6)]);
+        store.save_snapshot(REGISTRY_DOC_ID, &registry.to_bytes().unwrap()).unwrap();
+        let workspace = open_workspace(&store);
+        drain_with_backoff(&store, &services, &workspace, &mut required, &mut backoffs)
+            .await
+            .unwrap();
+        assert_eq!(requests.lock().len(), 4);
+        assert!(!backoffs.contains_key(id));
+        assert!(store.sync_job_version(id, JOB).unwrap().is_none());
+        workspace.shutdown();
+        server.abort();
     }
 }
