@@ -212,6 +212,9 @@ struct DiffSyncInner {
     /// one root must never interleave. File-system watchers and read-only
     /// captures may still run concurrently.
     discard_lock: tokio::sync::Mutex<()>,
+    /// Set once Edge responds 410 Gone to the legacy `/diff/{chatId}` sidecar
+    /// route so subsequent edits do not repeatedly upload discarded payloads.
+    sidecar_gone: AtomicBool,
 }
 
 #[derive(Default)]
@@ -347,6 +350,7 @@ impl CheckoutDiffSync {
                 interest_linger,
                 interest_changed: Arc::new(Notify::new()),
                 discard_lock: tokio::sync::Mutex::new(()),
+                sidecar_gone: AtomicBool::new(false),
             }),
         };
         let task = tokio::spawn(diff_sync_task(
@@ -976,7 +980,9 @@ async fn sync_entry(inner: &Arc<DiffSyncInner>, entry: &Arc<CheckoutEntry>) {
 
     // Latest-only sidecar to every syncing chat's session DO slot.
     let chats = lock(&entry.chats).clone();
-    if let Some(edge) = &inner.edge {
+    if let Some(edge) = &inner.edge
+        && !inner.sidecar_gone.load(Ordering::Relaxed)
+    {
         for chat in chats.iter().filter(|chat| zeron_proto::chat_allows_sync(&chat.id)) {
             let sidecar = DiffSidecar {
                 chat_id: chat.id.clone(),
@@ -1001,6 +1007,11 @@ async fn sync_entry(inner: &Arc<DiffSyncInner>, entry: &Arc<CheckoutEntry>) {
                 .send(inner.http.post(&url).json(&sidecar), &bearer)
                 .await;
             match result {
+                Ok(response) if response.status() == reqwest::StatusCode::GONE => {
+                    inner.sidecar_gone.store(true, Ordering::Relaxed);
+                    tracing::debug!(chat = %chat.id, "diff-sync: legacy /diff sidecar endpoint returned 410 Gone; disabling");
+                    break;
+                }
                 Ok(response) if !response.status().is_success() => {
                     tracing::debug!(chat = %chat.id, status = %response.status(),
                         "diff-sync: sidecar publish rejected");

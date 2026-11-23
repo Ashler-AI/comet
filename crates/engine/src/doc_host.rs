@@ -48,6 +48,17 @@ use crate::{EngineError, Terminals, new_id, now_ms};
 
 /// Debounce window for local snapshot saves after a doc change.
 const SNAPSHOT_DEBOUNCE_MS: u64 = 1_000;
+/// Minimum interval between `PUT /chat2/{chat}/tail` uploads while a run is
+/// actively streaming. Idle/turn-end flushes bypass this throttle (still
+/// deduped by Loro oplog version vector).
+const TAIL_STREAMING_MIN_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
+/// Matches `MAX_SIDECAR_BYTES` in `edge/src/chat-room.ts`; skip uploading
+/// oversized tails that the server would reject with 413.
+const MAX_TAIL_SIDECAR_BYTES: usize = 4 * 1024 * 1024;
+const CHECKPOINT_MIN_ROW_BYTES: u64 = 512 * 1024;
+const CHECKPOINT_MAX_ROW_BYTES: u64 = 4 * 1024 * 1024;
+const CHECKPOINT_MIN_ROW_COUNT: u64 = 200;
+const CHECKPOINT_MAX_ROW_COUNT: u64 = 2_000;
 
 /// An edit client renews every 20s. Sixty seconds tolerates two missed
 /// heartbeats without turning a vanished client into an invisible permanent
@@ -668,6 +679,8 @@ pub struct ChatDocHandle {
     /// A threshold checkpoint POST is in flight (review H1: the quiesce
     /// tick must not stack concurrent full-snapshot uploads).
     checkpointing: Arc<AtomicBool>,
+    /// Throttles/dedups `PUT /chat2/{chat}/tail` sidecar uploads.
+    tail_publish: Arc<Mutex<TailPublishState>>,
     /// Set when a chat2 seed replaced this handle's lineage on disk: every
     /// further snapshot save from this handle is a stale FAT doc that would
     /// clobber the thin one — retired handles never persist again (unless no
@@ -708,6 +721,36 @@ impl Drop for ResetFlag {
     fn drop(&mut self) {
         self.0.store(false, Ordering::Release);
     }
+}
+
+#[derive(Default)]
+struct TailPublishState {
+    in_flight: bool,
+    last_vv: Option<Vec<u8>>,
+    last_published_at: Option<std::time::Instant>,
+}
+
+struct TailInFlightGuard(Arc<Mutex<TailPublishState>>);
+impl Drop for TailInFlightGuard {
+    fn drop(&mut self) {
+        lock(&self.0).in_flight = false;
+    }
+}
+
+/// Whether a chat2 room's row log warrants a threshold checkpoint upload.
+/// Requires a known server state with local cursor strictly past the room's
+/// current checkpoint (avoiding no-op re-uploads after catching up), and scales
+/// the row/byte trigger with existing checkpoint size to bound write
+/// amplification on multi-MB transcripts.
+fn threshold_checkpoint_due(stats: &zeron_sync::chat_client::ChatStatsSnapshot) -> bool {
+    if !stats.server_known || stats.cursor <= stats.checkpoint_seq {
+        return false;
+    }
+    let byte_threshold = CHECKPOINT_MIN_ROW_BYTES
+        .max((stats.checkpoint_size / 4).min(CHECKPOINT_MAX_ROW_BYTES));
+    let row_threshold = CHECKPOINT_MIN_ROW_COUNT
+        .max((stats.checkpoint_size / 2048).min(CHECKPOINT_MAX_ROW_COUNT));
+    stats.row_bytes > byte_threshold || stats.row_count > row_threshold
 }
 
 pub struct DocWriter {
@@ -1700,6 +1743,7 @@ impl DocHost {
             room_gen,
             retired: AtomicBool::new(false),
             checkpointing: Arc::new(AtomicBool::new(false)),
+            tail_publish: Arc::new(Mutex::new(TailPublishState::default())),
             chat2: Mutex::new(None),
             sync_started: AtomicBool::new(false),
             sync_requested: AtomicBool::new(false),
@@ -2907,13 +2951,14 @@ impl DocHost {
     }
 
     /// chat2 host duties on the doc-quiesce tick (docs/chat2-sync.md C3):
-    /// - threshold checkpoint: when the room's row log passes 512KB or 200
-    ///   rows, post a full checkpoint so cold readers load one compact blob
-    ///   instead of replaying the log (the alert-shaped growth bound);
+    /// - threshold checkpoint: post a full checkpoint once the room's row log
+    ///   exceeds a snapshot-scaled budget so cold readers load one compact blob
+    ///   without re-uploading multi-MB whale snapshots every few seconds;
     /// - tail sidecar: publish the last-64 transcript JSON for thin/instant
-    ///   readers (the iOS fallback path).
+    ///   readers (deduped by Loro oplog VV, throttled while streaming, capped
+    ///   to Edge's sidecar budget).
     async fn chat2_maintenance(&self, handle: &Arc<ChatDocHandle>) {
-        if handle.retired.load(Ordering::Relaxed) {
+        if handle.retired.load(Ordering::Relaxed) || !self.is_host(&handle.chat_id) {
             return;
         }
         let stats = match &*lock(&handle.chat2) {
@@ -2924,49 +2969,110 @@ impl DocHost {
             return;
         };
         let chat_id = handle.chat_id.clone();
-        // A whale's last 64 joined messages can still contain its entire
-        // history. Materialization/encoding must not occupy a network worker.
-        let doc = handle.doc.clone();
-        let body = tokio::task::spawn_blocking(move || {
-            let tail =
-                zeron_doc::materialize_tail(&doc, now_ms(), zeron_doc::TAIL_MESSAGE_COUNT).ok()?;
-            serde_json::to_vec(&tail).ok()
-        })
-        .await
-        .ok()
-        .flatten();
-        if let Some(body) = body {
+        let oplog_vv = handle.doc.doc().oplog_vv().encode();
+        let streaming = handle.writers.load(Ordering::Acquire) > 0;
+        let should_publish_tail = {
+            let mut state = lock(&handle.tail_publish);
+            let due = !state.in_flight
+                && state.last_vv.as_deref() != Some(oplog_vv.as_slice())
+                && (!streaming
+                    || state
+                        .last_published_at
+                        .is_none_or(|at| at.elapsed() >= TAIL_STREAMING_MIN_INTERVAL));
+            if due {
+                state.in_flight = true;
+            }
+            due
+        };
+        if should_publish_tail {
+            // A whale's last 64 joined messages can still contain its entire
+            // history. Materialization/encoding must not occupy a network worker.
+            let doc = handle.doc.clone();
+            let writers = handle.writers.clone();
             let http = self.inner.http.clone();
             let edge_tail = edge.clone();
             let chat = chat_id.clone();
+            let tail_state = handle.tail_publish.clone();
             self.spawn_worker(async move {
-                let Ok(bearer) = edge_tail.bearer().await else {
-                    return;
-                };
-                let url = format!(
-                    "{}/chat2/{}/tail",
-                    edge_tail.url.trim_end_matches('/'),
-                    chat
-                );
-                let Ok(_permit) = zeron_sync::budget::shared()
-                    .http(zeron_sync::budget::Priority::Background)
+                let _in_flight = TailInFlightGuard(tail_state.clone());
+                let mut oplog_vv = oplog_vv;
+                loop {
+                    let doc_for_tail = doc.clone();
+                    let body = tokio::task::spawn_blocking(move || {
+                        let tail = zeron_doc::materialize_tail(
+                            &doc_for_tail,
+                            now_ms(),
+                            zeron_doc::TAIL_MESSAGE_COUNT,
+                        )
+                        .ok()?;
+                        serde_json::to_vec(&tail).ok()
+                    })
                     .await
-                else {
-                    return;
-                };
-                let _ = edge_tail
-                    .send(
-                        http.put(&url)
-                            .header("content-type", "application/json")
-                            .body(body),
-                        &bearer,
-                    )
-                    .await;
+                    .ok()
+                    .flatten();
+                    let Some(body) = body else {
+                        return;
+                    };
+                    if body.len() > MAX_TAIL_SIDECAR_BYTES {
+                        tracing::debug!(
+                            chat = %chat,
+                            bytes = body.len(),
+                            limit = MAX_TAIL_SIDECAR_BYTES,
+                            "chat2: skipping oversized tail sidecar upload"
+                        );
+                        let mut state = lock(&tail_state);
+                        state.last_vv = Some(oplog_vv);
+                        state.last_published_at = Some(std::time::Instant::now());
+                        return;
+                    }
+                    let Ok(bearer) = edge_tail.bearer().await else {
+                        return;
+                    };
+                    let url = format!(
+                        "{}/chat2/{}/tail",
+                        edge_tail.url.trim_end_matches('/'),
+                        chat
+                    );
+                    let Ok(_permit) = zeron_sync::budget::shared()
+                        .http(zeron_sync::budget::Priority::Background)
+                        .await
+                    else {
+                        return;
+                    };
+                    let result = edge_tail
+                        .send(
+                            http.put(&url)
+                                .header("content-type", "application/json")
+                                .body(body),
+                            &bearer,
+                        )
+                        .await;
+                    let now = std::time::Instant::now();
+                    let succeeded = matches!(result, Ok(ref res) if res.status().is_success());
+                    let too_large = matches!(
+                        result,
+                        Ok(ref res) if res.status() == reqwest::StatusCode::PAYLOAD_TOO_LARGE
+                    );
+                    {
+                        let mut state = lock(&tail_state);
+                        state.last_published_at = Some(now);
+                        if succeeded || too_large {
+                            state.last_vv = Some(oplog_vv.clone());
+                        }
+                    }
+                    if !succeeded || writers.load(Ordering::Acquire) > 0 {
+                        return;
+                    }
+                    let next_vv = doc.doc().oplog_vv().encode();
+                    if next_vv == oplog_vv {
+                        return;
+                    }
+                    oplog_vv = next_vv;
+                }
             });
         }
-        // Threshold checkpoint (rowBytes > 512KB || rows > 200), one in
-        // flight at a time (review H1).
-        if stats.row_bytes <= 512 * 1024 && stats.row_count <= 200 {
+        // Threshold checkpoint, one in flight at a time (review H1).
+        if !threshold_checkpoint_due(&stats) {
             return;
         }
         self.spawn_chat2_checkpoint(handle, "threshold");
@@ -7054,6 +7160,53 @@ mod publication_eviction_tests {
         assert_eq!(store.pending_chat_updates("evicted").unwrap(), before);
         drop(reopened);
         host.shutdown_workers().await;
+    }
+
+    #[test]
+    fn threshold_checkpoint_due_scales_and_blocks_noop_reupload() {
+        use zeron_sync::chat_client::ChatStatsSnapshot;
+        let base = ChatStatsSnapshot {
+            server_known: true,
+            cursor: 100,
+            checkpoint_seq: 100,
+            checkpoint_size: 100_000,
+            row_count: 500,
+            row_bytes: 1_000_000,
+            ..Default::default()
+        };
+        // Never re-upload a checkpoint covering zero new rows.
+        assert!(!threshold_checkpoint_due(&base));
+        assert!(!threshold_checkpoint_due(&ChatStatsSnapshot {
+            server_known: false,
+            cursor: 200,
+            ..base
+        }));
+        // Small chat still triggers past 200 rows or 512 KiB.
+        assert!(threshold_checkpoint_due(&ChatStatsSnapshot {
+            cursor: 301,
+            row_count: 201,
+            row_bytes: 10_000,
+            ..base
+        }));
+        // 20 MiB whale chat does not re-upload after 200 tiny rows or 1 MiB.
+        let whale = ChatStatsSnapshot {
+            cursor: 67_500,
+            checkpoint_seq: 67_180,
+            checkpoint_size: 20 * 1024 * 1024,
+            row_count: 320,
+            row_bytes: 1_000_000,
+            ..base
+        };
+        assert!(!threshold_checkpoint_due(&whale));
+        // Triggers once scaled row or byte budget is exceeded.
+        assert!(threshold_checkpoint_due(&ChatStatsSnapshot {
+            row_count: CHECKPOINT_MAX_ROW_COUNT + 1,
+            ..whale
+        }));
+        assert!(threshold_checkpoint_due(&ChatStatsSnapshot {
+            row_bytes: CHECKPOINT_MAX_ROW_BYTES + 1,
+            ..whale
+        }));
     }
 }
 
