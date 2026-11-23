@@ -2797,25 +2797,69 @@ fn cancel_params(harness: HarnessId, session_id: &str) -> Value {
     params
 }
 
+const COMPUTER_USE_MCP_NAME: &str = "computer_use";
+
 /// `session/new` `mcpServers` for an injected server: ACP spells a stdio
 /// server as name/command/args plus `[{name, value}]` env pairs. Empty when
 /// the host injected nothing — the user's own servers come from the agent's
 /// config, never from here.
+#[cfg(test)]
 fn acp_mcp_servers(mcp: Option<&zeron_proto::McpServer>) -> Vec<Value> {
-    mcp.into_iter()
-        .map(|mcp| {
-            json!({
-                "name": mcp.name,
-                "command": mcp.command,
-                "args": mcp.args,
-                "env": mcp
-                    .env
-                    .iter()
-                    .map(|(name, value)| json!({ "name": name, "value": value }))
-                    .collect::<Vec<_>>(),
-            })
-        })
-        .collect()
+    acp_mcp_servers_for_harness(HarnessId::Antigravity, mcp)
+}
+
+fn acp_mcp_servers_for_harness(
+    harness: HarnessId,
+    mcp: Option<&zeron_proto::McpServer>,
+) -> Vec<Value> {
+    let Some(mcp) = mcp else {
+        return Vec::new();
+    };
+    let mut servers = vec![json!({
+        "name": mcp.name,
+        "command": mcp.command,
+        "args": mcp.args,
+        "env": mcp
+            .env
+            .iter()
+            .filter(|(name, _)| name.as_str() != zeron_proto::McpServer::COMPUTER_USE_ENV)
+            .map(|(name, value)| json!({ "name": name, "value": value }))
+            .collect::<Vec<_>>(),
+    })];
+    if harness == HarnessId::Antigravity && mcp.computer_use() {
+        servers.push(json!({
+            "name": COMPUTER_USE_MCP_NAME,
+            "command": mcp.command,
+            "args": ["mcp", "--computer-use"],
+            "env": [],
+            "_meta": {
+                "antigravity": {
+                    "forceAllToolsEager": true,
+                }
+            },
+        }));
+    }
+    servers
+}
+
+fn open_session_params(harness: HarnessId, request: &RunRequest) -> Value {
+    let mut params = json!({
+        "cwd": request.cwd,
+        "mcpServers": acp_mcp_servers_for_harness(harness, request.mcp.as_ref()),
+    });
+    if harness == HarnessId::Antigravity
+        && request
+            .mcp
+            .as_ref()
+            .is_some_and(zeron_proto::McpServer::computer_use)
+    {
+        params["_meta"] = json!({
+            "antigravity": {
+                "eagerMcpServers": [COMPUTER_USE_MCP_NAME],
+            }
+        });
+    }
+    params
 }
 
 /// `initialize._meta.steering.supported` — the `_session/steering` extension
@@ -3703,10 +3747,7 @@ async fn open_session(
     load_timeout: Duration,
     event_tx: &mpsc::Sender<Result<AgentEvent, HarnessError>>,
 ) -> Result<(String, Value), HarnessError> {
-    let params = json!({
-        "cwd": request.cwd,
-        "mcpServers": acp_mcp_servers(request.mcp.as_ref()),
-    });
+    let params = open_session_params(harness, request);
     if let Some(resume) = &request.resume {
         let method = restore_method(init, harness);
         let mut restore = params.clone();
@@ -7623,5 +7664,75 @@ mod mcp_injection_tests {
                 "env": [{ "name": "ZERON_IPC_PORT", "value": "27654" }],
             })]
         );
+    }
+
+    #[test]
+    fn antigravity_computer_use_injects_eager_mcp_server_and_strips_internal_flag() {
+        let mcp = zeron_proto::McpServer {
+            name: "zeron".into(),
+            command: "/Applications/Crew Staging.app/Contents/MacOS/Crew Engine".into(),
+            args: vec!["mcp".into()],
+            env: [
+                ("ZERON_IPC_PORT".to_owned(), "27957".to_owned()),
+                (
+                    zeron_proto::McpServer::COMPUTER_USE_ENV.to_owned(),
+                    "1".to_owned(),
+                ),
+            ]
+            .into_iter()
+            .collect(),
+        };
+        let req = RunRequest {
+            prompt: "hi".into(),
+            harness: Some(HarnessId::Antigravity),
+            model: None,
+            reasoning: None,
+            model_options: serde_json::Map::new(),
+            cwd: "/tmp".into(),
+            sandbox: zeron_proto::SandboxLevel::WorkspaceWrite,
+            auto_approve: true,
+            access: zeron_proto::AccessMode::default(),
+            plan: false,
+            resume: None,
+            attachments: vec![],
+            worktree: None,
+            mcp: Some(mcp),
+            env: Default::default(),
+        };
+        let params = open_session_params(HarnessId::Antigravity, &req);
+        assert_eq!(
+            params["_meta"]["antigravity"]["eagerMcpServers"],
+            json!(["computer_use"])
+        );
+        let servers = params["mcpServers"].as_array().unwrap();
+        assert_eq!(servers.len(), 2);
+        assert_eq!(
+            servers[0],
+            json!({
+                "name": "zeron",
+                "command": "/Applications/Crew Staging.app/Contents/MacOS/Crew Engine",
+                "args": ["mcp"],
+                "env": [{ "name": "ZERON_IPC_PORT", "value": "27957" }],
+            })
+        );
+        assert_eq!(
+            servers[1],
+            json!({
+                "name": "computer_use",
+                "command": "/Applications/Crew Staging.app/Contents/MacOS/Crew Engine",
+                "args": ["mcp", "--computer-use"],
+                "env": [],
+                "_meta": {
+                    "antigravity": {
+                        "forceAllToolsEager": true,
+                    }
+                },
+            })
+        );
+
+        // Other ACP harnesses never receive Antigravity's eager computer-use injection.
+        let grok_params = open_session_params(HarnessId::Grok, &req);
+        assert!(grok_params.get("_meta").is_none());
+        assert_eq!(grok_params["mcpServers"].as_array().unwrap().len(), 1);
     }
 }

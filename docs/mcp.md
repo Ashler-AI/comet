@@ -125,6 +125,13 @@ the MCP child when the Pi session shuts down.
 Title runs never carry it. A run with no served port (embedded engine that
 lost the bind) gets no Zeron tools rather than a dead server.
 
+On macOS, Antigravity runs also inject a separate `computer_use` stdio MCP
+server (`args: ["mcp", "--computer-use"]`) marked eager via Antigravity's ACP
+`_meta.antigravity.eagerMcpServers` / `forceAllToolsEager` extension so its
+desktop tools (`computer_displays`, `computer_screenshot`, `computer_action`)
+appear as native prompt tools while `zeron`'s chat-orchestration tools stay
+lazy. Set `ZERON_DISABLE_COMPUTER_USE=1` on the engine to opt out.
+
 ### Forks and the session card
 
 `ForkSideChat { chatId, sourceChatId, parentChatId? }` copies a chat's
@@ -431,6 +438,27 @@ When using individual tools, launch **all** chats/messages with `wait: false`
 first, then collect replies with `wait_for_turn`. Waiting on each individual
 launch before issuing the next serializes work at the caller, even though
 both the MCP transport and engine support concurrent chat runs.
+
+## Computer use (`mcp --computer-use`)
+
+`zeron mcp --computer-use` (and `zeron-engine mcp --computer-use`) runs a
+standalone macOS desktop automation MCP server over stdio with three tools:
+
+- `computer_displays` — reports active displays, logical bounds, scale factor,
+  and macOS Accessibility / Screen Recording permission status.
+- `computer_screenshot` — captures the main display (default), a specific
+  display (`display: "<id>"`), or the full virtual desktop (`display: "all"`)
+  via `/usr/sbin/screencapture`, scales it to fit within 1280×896 (PNG,
+  falling back to JPEG if > 1.5 MiB), and returns the image plus the exact
+  coordinate mapping back to display points.
+- `computer_action` — executes up to 25 validated mouse/keyboard/scroll/wait
+  actions in one call (`click`, `double_click`, `right_click`, `move`, `drag`,
+  `type`, `keypress`, `scroll`, `wait`) using coordinates from the latest
+  screenshot, optionally capturing a fresh post-action screenshot.
+
+Because `zeron-engine` is spawned inside the signed macOS app bundle (e.g.
+`Crew Staging.app`), Screen Recording and Accessibility permissions granted to
+the Crew app apply directly to the computer-use server.
 
 ## Smoke recipe
 

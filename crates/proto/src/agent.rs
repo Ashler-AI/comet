@@ -479,6 +479,19 @@ impl McpServer {
             .get(Self::SIDE_CHATS_ONLY_ENV)
             .is_some_and(|value| value == "1")
     }
+
+    /// Set to `1` on Zeron's own server when the host enables Crew's native
+    /// desktop computer-use MCP server for this run (Antigravity on macOS).
+    /// Drivers that support it launch a dedicated `computer_use` stdio server
+    /// from the same binary (`mcp --computer-use`) and strip this internal
+    /// flag from `zeron`'s own child environment.
+    pub const COMPUTER_USE_ENV: &'static str = "ZERON_COMPUTER_USE";
+
+    pub fn computer_use(&self) -> bool {
+        self.env
+            .get(Self::COMPUTER_USE_ENV)
+            .is_some_and(|value| value == "1")
+    }
 }
 
 /// Isolated-worktree directive riding [`RunRequest`]. The worktree is created

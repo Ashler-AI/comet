@@ -100,9 +100,14 @@ enum Command {
     /// Trigger an Appshot in the running headed instance (desktop shortcut fallback).
     Appshot,
     /// Serve the Crew MCP (Model Context Protocol) server on stdin/stdout,
-    /// proxying to the running engine's IPC. Agents use it to create, read,
-    /// and message chats. Logs go to stderr; stdout is the protocol.
-    Mcp,
+    /// proxying to the running engine's IPC (or serving native desktop
+    /// computer-use tools when `--computer-use` is passed). Logs go to stderr;
+    /// stdout is the protocol.
+    Mcp {
+        /// Serve Crew's native macOS desktop computer-use MCP server instead of the engine bridge.
+        #[arg(long)]
+        computer_use: bool,
+    },
     /// Manage the build-selected Crew engine as a background service.
     Daemon {
         #[command(subcommand)]
@@ -331,7 +336,10 @@ fn main() -> anyhow::Result<()> {
             let runtime = tokio::runtime::Runtime::new()?;
             runtime.block_on(sync_cli(config.ipc_port, &config.data_dir))
         }
-        Some(Command::Mcp) => {
+        Some(Command::Mcp { computer_use }) => {
+            if computer_use {
+                return zeron_app::run_computer_use_mcp();
+            }
             // One bridge per agent session, and it only relays: stdio
             // requests out to the engine over IPC and replies back. Two
             // workers keep a burst of parallel tool calls (large replies to

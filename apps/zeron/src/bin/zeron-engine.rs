@@ -19,6 +19,10 @@ fn main() -> anyhow::Result<()> {
     match std::env::args().nth(1).as_deref() {
         Some("--noop-browser") => Ok(()),
         Some("mcp") => {
+            if std::env::args().nth(2).as_deref() == Some("--computer-use") {
+                zeron_app::init_logging(None, "computer-use-mcp", true);
+                return zeron_app::run_computer_use_mcp();
+            }
             zeron_app::init_logging(None, "mcp", true);
             zeron_app::run_mcp()
         }

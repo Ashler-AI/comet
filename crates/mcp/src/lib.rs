@@ -16,6 +16,7 @@
 //! environment. Every send from such an agent is then attributed to its
 //! originating chat, and a chat can never message itself.
 
+pub mod computer_use;
 mod jsonrpc;
 mod tools;
 mod transcript;
@@ -65,4 +66,9 @@ pub async fn run(config: McpConfig) -> anyhow::Result<()> {
     let zeron = Zeron::new(config.ipc_port, config.data_dir, config.origin);
     let tools = Tools::new(std::sync::Arc::new(zeron));
     serve_stdio(std::sync::Arc::new(tools)).await
+}
+
+/// Run Crew's native desktop computer-use MCP server on stdin/stdout until stdin closes.
+pub async fn run_computer_use() -> anyhow::Result<()> {
+    computer_use::run_stdio().await
 }
