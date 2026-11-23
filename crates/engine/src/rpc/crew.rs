@@ -38,6 +38,19 @@ fn scaffold_host_rpc_allowed(method: &str, params: &Value, session_id: &str) -> 
     }
 }
 
+/// A chat hosted by a session-scoped Scaffold sandbox: Edge relays it only what
+/// `scaffold_host_rpc_allowed` admits.
+fn scaffold_session_hosted(chat: &Chat) -> bool {
+    chat.crew.as_ref().and_then(|metadata| metadata.environment.as_ref())
+        .is_some_and(|environment| matches!(environment.source, SessionEnvironmentSource::Scaffold { .. }))
+}
+
+/// Whether Edge relays `method` to `chat`'s host. Anything else draws a relay error,
+/// and the client drops the shared device link with every stream forwarded over it.
+pub(crate) fn scaffold_host_admits(chat: &Chat, method: &str, params: &Value) -> bool {
+    !scaffold_session_hosted(chat) || scaffold_host_rpc_allowed(method, params, &chat.id)
+}
+
 fn own_directory_search(params: &mut Value, owner: &str) -> Result<(), RpcError> {
     let object = params.as_object_mut().ok_or_else(|| denied("Session search requires an object"))?;
     // CLI Option fields arrive as null; the directory API requires omission.
@@ -104,9 +117,7 @@ impl EngineRpc {
 
     pub(super) fn guard_scaffold_target(&self, target: &str, method: &str, params: &Value) -> Result<(), RpcError> {
         let chats = self.workspace.watch_chats();
-        if let Some(chat) = chats.borrow().iter().find(|chat| chat.device_id == target
-            && chat.crew.as_ref().and_then(|metadata| metadata.environment.as_ref())
-                .is_some_and(|environment| matches!(environment.source, SessionEnvironmentSource::Scaffold { .. })))
+        if let Some(chat) = chats.borrow().iter().find(|chat| chat.device_id == target && scaffold_session_hosted(chat))
             && !scaffold_host_rpc_allowed(method, params, &chat.id)
         {
             return Err(RpcError::Failed(format!("{method} is unavailable for this session-scoped Scaffold host")));

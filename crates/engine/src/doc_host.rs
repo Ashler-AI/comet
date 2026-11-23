@@ -4603,6 +4603,9 @@ impl DocHost {
                     tokio::time::sleep(ROWS_POLL).await;
                     continue;
                 }
+                if !host.relay_admitted(chat) {
+                    return; // the doc is this host's only road; its bytes have landed
+                }
                 match host.relay_command(&target, chat, &entry).await {
                     Ok(outcome) => {
                         tracing::info!(chat = %chat, device = %target, command = %entry.id,
@@ -4693,6 +4696,17 @@ impl DocHost {
         handle
             .and_then(|h| lock(&h.chat2).as_ref().map(|c| c.stats()))
             .is_some_and(|s| s.connected && s.pending_pushes == 0)
+    }
+
+    /// Whether Edge relays [`zeron_rpc::methods::RELAY_COMMAND`] to the chat's host.
+    /// A session-scoped Scaffold host never takes it: Edge answers with a relay error
+    /// that drops the shared device link, and with it every transcript stream
+    /// forwarded over that link, on each retry for the whole relay budget.
+    fn relay_admitted(&self, chat_id: &str) -> bool {
+        let params = serde_json::json!({ "chatId": chat_id });
+        self.workspace()
+            .and_then(|workspace| workspace.chat(chat_id).ok().flatten())
+            .is_none_or(|chat| crate::rpc::scaffold_host_admits(&chat, zeron_rpc::methods::RELAY_COMMAND, &params))
     }
 
     /// One relay attempt: version-gate the host, then forward the entry over
@@ -7049,3 +7063,58 @@ mod sync_lifecycle_tests;
 
 #[path = "doc_host_delivery.rs"]
 mod remote_delivery;
+
+#[cfg(test)]
+mod relay_delivery_scope_tests {
+    use std::sync::Arc;
+    use zeron_proto::{
+        Chat, CollaborationScope, CrewChatMetadata, HarnessId, ScaffoldLifecycle, SessionEnvironment,
+        SessionEnvironmentSource,
+    };
+
+    fn chat(id: &str, device: &str, scaffold: bool) -> Chat {
+        let mut chat: Chat = serde_json::from_value(serde_json::json!({
+            "id": id, "deviceId": device, "archived": false, "createdAt": "2026-11-23T07:00:00Z",
+        }))
+        .unwrap();
+        if scaffold {
+            let scope = CollaborationScope {
+                project_id: "project".into(), deployment_id: Some("deployment".into()),
+                session_id: Some(id.into()), unknown: Default::default(),
+            };
+            chat.crew = Some(CrewChatMetadata {
+                owner_subject: "owner@example.com".into(), scope: scope.clone(), session_id: id.into(),
+                environment: Some(SessionEnvironment {
+                    source: SessionEnvironmentSource::Scaffold {
+                        sandbox_id: "rcs_box".into(), region: None, lifecycle: ScaffoldLifecycle::Ready,
+                        lifecycle_epoch: Some(1), links: Default::default(),
+                    },
+                    name: None, owner_principal: "owner@example.com".into(), scope, source_ref: None,
+                    last_activity_at: None, database_environment: None, unknown: Default::default(),
+                }),
+                agent_route: None, original_epoch_history: None,
+            });
+        }
+        chat
+    }
+
+    // Failure mode (staging 2026-11-23): a command sent to a Scaffold harness session was
+    // relayed as RelayCommand every 30 s for 15 minutes. Edge refused each one with
+    // session_scope_denied, the client dropped the shared device link on every refusal,
+    // and the desktop never showed the live session's transcript: its forwarded
+    // WatchDocMessages ended with the link.
+    #[tokio::test]
+    async fn relay_delivery_never_targets_a_session_scoped_scaffold_host() {
+        let dir = tempfile::tempdir().unwrap();
+        let core = crate::EngineCore::assemble_with_profile(
+            crate::EngineProfile::local(dir.path()).unwrap(),
+            Arc::new(crate::HarnessRegistry::new()), HarnessId::Omp, None,
+        )
+        .unwrap();
+        core.workspace.import_chat_row(&chat("harness-chat", "comet-scaffold-rcs_box-e1", true)).unwrap();
+        core.workspace.import_chat_row(&chat("laptop-chat", "laptop", false)).unwrap();
+        assert!(!core.doc_host.relay_admitted("harness-chat"));
+        assert!(core.doc_host.relay_admitted("laptop-chat"), "other hosts keep the relay road");
+        core.sessions.shutdown().await;
+    }
+}
