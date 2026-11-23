@@ -56,6 +56,8 @@ mod crew;
 mod native;
 mod voice_chat;
 mod voice_remote;
+
+pub(crate) use crew::scaffold_host_admits;
 use async_trait::async_trait;
 use base64::Engine as _;
 use futures::StreamExt;
