@@ -211,6 +211,35 @@ async fn a_calling_device_must_be_one_of_yours() {
     assert_eq!(answered["value"]["hi"], "me", "{answered}");
 }
 
+/// Crew: a Scaffold sandbox's host (`comet-scaffold-…`) is sent no plugin
+/// call. The Edge relays it none, and its refusal would end the host's device
+/// link with every stream on it (staging, 2026-11-24: each send dropped the
+/// link). The call is refused here in so many words, with nothing dialed.
+#[tokio::test]
+async fn a_crew_sandbox_host_is_sent_no_plugin_call() {
+    let f = fixture();
+    write(&f.plugins, "1.0.0", with_service(&[]), Some(SERVICE)).await;
+    allow(&f.plugins).await;
+    let edge = zeron_rpc::LinkCacheConfig::new("http://127.0.0.1:9", std::sync::Arc::new(zeron_rpc::StaticToken("t".into())));
+    f.plugins.set_links(zeron_rpc::LinkCache::new(edge));
+    let refused = call(
+        &f.plugins,
+        methods::CALL_PLUGIN_SERVICE,
+        json!({ "plugin": "svc", "method": "hello", "device": "comet-scaffold-rcs_a1-e1" }),
+    )
+    .await;
+    assert_eq!(refused["reason"], reason::NO_SERVICE, "{refused}");
+    assert!(refused["message"].as_str().unwrap_or_default().contains("Crew sandbox"), "{refused}");
+    // Another device is still dialed (and, with no Edge here, can't be reached).
+    let unreachable = call(
+        &f.plugins,
+        methods::CALL_PLUGIN_SERVICE,
+        json!({ "plugin": "svc", "method": "hello", "device": "dev-9" }),
+    )
+    .await;
+    assert_eq!(unreachable["reason"], reason::OFFLINE, "{unreachable}");
+}
+
 #[tokio::test]
 async fn a_service_event_reaches_this_devices_windows() {
     let f = fixture();

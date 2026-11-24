@@ -1021,8 +1021,11 @@ pub(crate) fn guard_scaffold_target(workspace: &WorkspaceHost, target: &str, met
         .find(|chat| chat.device_id == target)
         .map(|chat| chat.id.clone());
     if session.is_some_and(|session| host_rpc_allowed(method, params, &session)) {
+        // (What a sandbox host is sent, by name: an Edge refusal ends the link.)
+        tracing::debug!(target, method, "crew: a call goes to a sandbox host");
         return Ok(());
     }
+    tracing::debug!(target, method, "crew: a call to a sandbox host is refused here");
     Err(RpcError::Failed(format!("{method} is unavailable for this session-scoped Scaffold host")))
 }
 

@@ -434,6 +434,14 @@ struct ServeParams {
 }
 
 /// `PluginDeliver` outcomes (and the sender's `offline`).
+/// Crew: a Scaffold sandbox's host (`comet-scaffold-…`) runs no plugin for
+/// another device. The Edge relays it no plugin call, and a refused frame ends
+/// the device link with every stream forwarded over it
+/// (crew_cloud::guard_scaffold_target's reason), so none is sent.
+fn crew_sandbox_host(device: &str) -> bool {
+    crate::crew_cloud::is_sandbox_host(device)
+}
+
 pub mod outcome {
     pub const DELIVERED: &str = "delivered";
     pub const NOT_INSTALLED: &str = "not_installed";
@@ -1118,6 +1126,9 @@ impl Plugins {
         let (Some(links), Ok(runtime)) = (lock(&self.inner.links).clone(), tokio::runtime::Handle::try_current()) else {
             return;
         };
+        if crew_sandbox_host(&device) {
+            return;
+        }
         runtime.spawn(async move {
             let told = tokio::time::timeout(DELIVER_TIMEOUT, async {
                 links.client(&device).await?.call(methods::CHECK_PLUGIN_KEY, serde_json::json!({})).await
@@ -2587,6 +2598,9 @@ impl Plugins {
                 let Some(links) = links else {
                     return (target, outcome::OFFLINE.to_owned());
                 };
+                if crew_sandbox_host(&target) {
+                    return (target, outcome::NOT_INSTALLED.to_owned());
+                }
                 let reply = tokio::time::timeout(DELIVER_TIMEOUT, async {
                     let client = links.client(&target).await?;
                     client.call(methods::PLUGIN_DELIVER, deliver).await
@@ -2915,6 +2929,9 @@ impl Plugins {
         let Some(links) = lock(&self.inner.links).clone() else {
             return Refusal::new(reason::OFFLINE, format!("{name} can't be reached: this device isn't connected")).to_json();
         };
+        if crew_sandbox_host(&target) {
+            return Refusal::new(reason::NO_SERVICE, format!("{name} is a Crew sandbox: plugins don't run there")).to_json();
+        }
         let params = serde_json::to_value(&call).unwrap_or_default();
         let reply = tokio::time::timeout(service::DEFAULT_TIMEOUT + LINK_SLACK, async {
             links.client(&target).await?.call(methods::SERVE_PLUGIN_AGENTS, params).await
@@ -3041,6 +3058,9 @@ impl Plugins {
             "data": data,
         });
         for target in targets {
+            if crew_sandbox_host(&target) {
+                continue;
+            }
             let (links, deliver, this, plugin) = (links.clone(), deliver.clone(), self.clone(), plugin.to_owned());
             runtime.spawn(async move {
                 let reply = tokio::time::timeout(DELIVER_TIMEOUT, async {
@@ -3099,6 +3119,9 @@ impl Plugins {
         let Some(links) = lock(&self.inner.links).clone() else {
             return Refusal::new(reason::OFFLINE, format!("{name} can't be reached: this device isn't connected")).to_json();
         };
+        if crew_sandbox_host(target) {
+            return Refusal::new(reason::NO_SERVICE, format!("{name} is a Crew sandbox: plugins don't run there")).to_json();
+        }
         let wait = clamp_timeout(call.timeout) + LINK_SLACK;
         let params = serde_json::to_value(&call).unwrap_or_default();
         let reply = tokio::time::timeout(wait, async {
