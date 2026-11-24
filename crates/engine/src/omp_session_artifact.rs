@@ -1022,7 +1022,8 @@ mod tests {
                 let (tx, rx) = tokio::sync::oneshot::channel(); let _ = tx.send(Vec::new()); rx
             }), steering, interrupt: CancellationToken::new(),
                 context: Some(RunContext { session_id: expected_id.clone(), ipc_port: 0,
-                    supervision_token: None, inference: Some(route.clone()), fork_from: None }), realtime: None,
+                    supervision_token: None, inference: Some(route.clone()), fork_from: None,
+                    managed_state_root: None }), realtime: None,
                 execution_lease: None, turn: Default::default() };
             let request = RunRequest { prompt, model: Some(model.clone()), harness: None, worktree: None,
                 mcp: None, reasoning: None, model_options: serde_json::Map::new(), cwd: cwd.clone(),

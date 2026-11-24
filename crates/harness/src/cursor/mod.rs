@@ -403,6 +403,8 @@ impl Harness for CursorHarness {
         crate::compose_child_path(&mut cmd, &exe);
         crate::apply_run_env(&mut cmd, &request.env);
         crate::apply_run_context(&mut cmd, controls.context.as_ref());
+        let managed_home =
+            crate::apply_managed_home(self.id(), &mut cmd, controls.context.as_ref())?;
         if !request.cwd.is_empty() {
             cmd.current_dir(&request.cwd);
         }
@@ -461,6 +463,7 @@ impl Harness for CursorHarness {
         let (event_tx, event_rx) = mpsc::channel::<Result<AgentEvent, HarnessError>>(256);
         tokio::spawn(run_session(Session {
             lease,
+            managed_home,
             child,
             stdout_lines: crate::lossy_lines::lossy_lines(stdout),
             stdin_tx,
@@ -634,6 +637,7 @@ async fn stdin_writer(mut stdin: ChildStdin, mut rx: mpsc::UnboundedReceiver<Str
 
 struct Session {
     lease: Option<state::Lease>,
+    managed_home: Option<crate::ManagedHome>,
     child: Child,
     stdout_lines: crate::lossy_lines::LossyLines<crate::process::ChildStdout>,
     stdin_tx: mpsc::UnboundedSender<String>,
@@ -656,6 +660,7 @@ fn new_message_id() -> String {
 async fn run_session(session: Session) {
     let Session {
         lease: _lease,
+        managed_home: _managed_home,
         mut child,
         mut stdout_lines,
         stdin_tx,

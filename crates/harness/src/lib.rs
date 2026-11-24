@@ -161,6 +161,10 @@ pub struct RunContext {
     pub inference: Option<InferenceRoute>,
     /// One-shot native fork source; never exported to the child environment.
     pub fork_from: Option<String>,
+    /// Profile-scoped persistent root for Crew-managed harness homes (isolated
+    /// from host credentials, survives child restarts). `None` falls back to a
+    /// disposable scratch directory (used by one-shot metadata probes).
+    pub managed_state_root: Option<std::path::PathBuf>,
 }
 
 impl std::fmt::Debug for RunContext {
@@ -171,6 +175,7 @@ impl std::fmt::Debug for RunContext {
             .field("supervision_token", &"<redacted>")
             .field("inference", &self.inference)
             .field("fork_from", &self.fork_from)
+            .field("managed_state_root", &self.managed_state_root)
             .finish()
     }
 }
@@ -380,6 +385,8 @@ pub mod muse;
 pub mod omp;
 pub mod opencode;
 pub use omp::OmpHarness;
+mod managed_home;
+pub(crate) use managed_home::{ManagedHome, apply_managed_home, uses_managed_home};
 mod run_context;
 pub(crate) use run_context::{apply_run_context, validate_inference_route};
 pub mod pi;

@@ -1525,3 +1525,156 @@ async fn a_kill_before_a_send_started_redispatches_it() {
         core.shutdown().await;
     }
 }
+
+#[tokio::test]
+async fn managed_state_root_persists_across_engine_restarts_and_isolates_profiles() {
+    struct ContextRecordingHarness {
+        contexts: Arc<Mutex<Vec<Option<zeron_harness::RunContext>>>>,
+        resumes: Arc<Mutex<Vec<Option<String>>>>,
+    }
+
+    #[async_trait]
+    impl Harness for ContextRecordingHarness {
+        fn id(&self) -> HarnessId {
+            HarnessId::Mock
+        }
+        fn display_name(&self) -> &str {
+            "ContextRecording"
+        }
+        fn supports_steering(&self) -> bool {
+            false
+        }
+        fn steering_mode(&self) -> SteeringMode {
+            SteeringMode::TurnBoundary
+        }
+        fn reasoning_levels(&self) -> &[ReasoningLevel] {
+            &[ReasoningLevel::Medium]
+        }
+        async fn models(&self) -> Result<Vec<Model>, HarnessError> {
+            Ok(vec![])
+        }
+        async fn run(
+            &self,
+            request: RunRequest,
+            controls: RunControls,
+        ) -> Result<BoxStream<'static, Result<AgentEvent, HarnessError>>, HarnessError> {
+            self.contexts.lock().unwrap().push(controls.context.clone());
+            self.resumes.lock().unwrap().push(request.resume.clone());
+            Ok(futures::stream::iter(vec![
+                Ok(AgentEvent::SessionStarted {
+                    harness: HarnessId::Mock,
+                    model: "mock-1".into(),
+                    tools: vec![],
+                    cwd: request.cwd.clone(),
+                    session_id: "sess-managed-1".into(),
+                    assistant_message_id: "a-1".into(),
+                }),
+                Ok(AgentEvent::TextDelta {
+                    text: format!("ack: {}", request.prompt),
+                }),
+                Ok(AgentEvent::Done {
+                    status: DoneStatus::Completed,
+                    result: None,
+                    error: None,
+                    session_id: Some("sess-managed-1".into()),
+                }),
+            ])
+            .boxed())
+        }
+    }
+
+    let data = tempfile::tempdir().unwrap();
+    let workspace = tempfile::tempdir().unwrap();
+    let cwd = workspace.path().display().to_string();
+
+    let profile_a = zeron_engine::EngineProfile::synced(data.path(), "org-a", "user-a");
+    let expected_root_a =
+        std::path::absolute(profile_a.store_root().join("managed-homes")).unwrap();
+
+    let contexts_a = Arc::new(Mutex::new(Vec::new()));
+    let resumes_a = Arc::new(Mutex::new(Vec::new()));
+    {
+        let registry = HarnessRegistry::new();
+        registry.register(Arc::new(ContextRecordingHarness {
+            contexts: contexts_a.clone(),
+            resumes: resumes_a.clone(),
+        }));
+        let core = EngineCore::assemble_with_profile(
+            profile_a.clone(),
+            Arc::new(registry),
+            HarnessId::Mock,
+            None,
+        )
+        .unwrap();
+        queue_run(&core, "turn 1", &cwd, "u-1");
+        wait_for(|| complete_assistant_count(&core) == 1, "first turn completes").await;
+        core.shutdown().await;
+    }
+
+    // Restart the engine on the same profile and send a follow-up turn.
+    {
+        let registry = HarnessRegistry::new();
+        registry.register(Arc::new(ContextRecordingHarness {
+            contexts: contexts_a.clone(),
+            resumes: resumes_a.clone(),
+        }));
+        let core = EngineCore::assemble_with_profile(
+            profile_a,
+            Arc::new(registry),
+            HarnessId::Mock,
+            None,
+        )
+        .unwrap();
+        queue_run(&core, "turn 2", &cwd, "u-2");
+        wait_for(|| complete_assistant_count(&core) == 2, "second turn completes").await;
+        core.shutdown().await;
+    }
+
+    let recorded_a = contexts_a.lock().unwrap().clone();
+    assert_eq!(recorded_a.len(), 2);
+    for ctx in &recorded_a {
+        let root = ctx
+            .as_ref()
+            .expect("RunContext must be present")
+            .managed_state_root
+            .as_ref()
+            .expect("managed_state_root must be populated");
+        assert!(root.is_absolute());
+        assert_eq!(root, &expected_root_a);
+    }
+    assert_eq!(
+        *resumes_a.lock().unwrap(),
+        vec![None, Some("sess-managed-1".into())]
+    );
+
+    // A distinct profile under the same data_dir receives its own isolated managed-homes root.
+    let profile_b = zeron_engine::EngineProfile::synced(data.path(), "org-b", "user-b");
+    let expected_root_b =
+        std::path::absolute(profile_b.store_root().join("managed-homes")).unwrap();
+    assert_ne!(expected_root_a, expected_root_b);
+    let contexts_b = Arc::new(Mutex::new(Vec::new()));
+    let registry = HarnessRegistry::new();
+    registry.register(Arc::new(ContextRecordingHarness {
+        contexts: contexts_b.clone(),
+        resumes: Arc::new(Mutex::new(Vec::new())),
+    }));
+    let core = EngineCore::assemble_with_profile(
+        profile_b,
+        Arc::new(registry),
+        HarnessId::Mock,
+        None,
+    )
+    .unwrap();
+    queue_run(&core, "turn b", &cwd, "u-b");
+    wait_for(|| complete_assistant_count(&core) == 1, "profile b turn completes").await;
+    core.shutdown().await;
+
+    let recorded_b = contexts_b.lock().unwrap().clone();
+    assert_eq!(recorded_b.len(), 1);
+    assert_eq!(
+        recorded_b[0]
+            .as_ref()
+            .and_then(|ctx| ctx.managed_state_root.as_ref()),
+        Some(&expected_root_b)
+    );
+}

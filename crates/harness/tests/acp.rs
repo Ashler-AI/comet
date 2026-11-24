@@ -2009,10 +2009,16 @@ async fn antigravity_managed_gateway_authenticates_without_local_google_credenti
     let harness = AcpHarness::antigravity().with_executable(fixture);
     let (mut controls, _steer, _token) = controls();
     controls.context = Some(zeron_harness::RunContext {
-        session_id: "gateway-session".into(), ipc_port: 0, supervision_token: None, fork_from: None,
+        session_id: "gateway-session".into(),
+        ipc_port: 0,
+        supervision_token: None,
+        fork_from: None,
+        managed_state_root: None,
         inference: Some(zeron_harness::InferenceRoute {
-            provider: "antigravity".into(), model: "gemini-3.8-flash-high".into(),
-            base_url: "http://127.0.0.1:9876".into(), token: "opaque-managed-test".into(),
+            provider: "antigravity".into(),
+            model: "gemini-3.8-flash-high".into(),
+            base_url: "http://127.0.0.1:9876".into(),
+            token: "opaque-managed-test".into(),
         }),
     });
     let mut req = request("hi");
@@ -2028,7 +2034,85 @@ async fn antigravity_managed_gateway_authenticates_without_local_google_credenti
         .insert("GEMINI_HOME".into(), "/unowned/google-home".into());
     let events = run_to_end(&harness, req, controls).await;
     assert_eq!(dones(&events), vec![(DoneStatus::Completed, None)]);
-    assert!(events.contains(&AgentEvent::TextDelta { text: "gateway-authorized".into() }));
+    assert!(events.contains(&AgentEvent::TextDelta {
+        text: "gateway-authorized".into()
+    }));
+}
+
+#[tokio::test]
+async fn antigravity_managed_gateway_resumes_session_across_process_restarts() {
+    let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/fake-antigravity-gateway.sh");
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&fixture, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let state_root = tempfile::tempdir().unwrap();
+    let managed_root = state_root.path().join("managed-homes");
+    let expected_gemini_home = managed_root.join("antigravity");
+    let harness = AcpHarness::antigravity().with_executable(fixture);
+
+    let make_context = || {
+        Some(zeron_harness::RunContext {
+            session_id: "gateway-session".into(),
+            ipc_port: 0,
+            supervision_token: None,
+            fork_from: None,
+            managed_state_root: Some(managed_root.clone()),
+            inference: Some(zeron_harness::InferenceRoute {
+                provider: "antigravity".into(),
+                model: "gemini-3.8-flash-high".into(),
+                base_url: "http://127.0.0.1:9876".into(),
+                token: "opaque-managed-test".into(),
+            }),
+        })
+    };
+
+    // Turn 1: creates the session DB under the persistent managed home.
+    let (mut controls1, _steer1, _token1) = controls();
+    controls1.context = make_context();
+    let mut req1 = request("first turn");
+    req1.model = Some("default".into());
+    req1.env
+        .insert("GEMINI_HOME".into(), "/unowned/google-home".into());
+    req1.env.insert(
+        "ZERON_TEST_EXPECTED_GEMINI_HOME".into(),
+        expected_gemini_home.display().to_string(),
+    );
+    let events1 = run_to_end(&harness, req1, controls1).await;
+    assert_eq!(dones(&events1), vec![(DoneStatus::Completed, None)]);
+    assert!(events1.contains(&AgentEvent::TextDelta {
+        text: "gateway-authorized".into()
+    }));
+    let db = expected_gemini_home
+        .join("antigravity-acp")
+        .join("conversations")
+        .join("gateway-1.db");
+    assert!(
+        db.is_file(),
+        "conversation DB must persist after process exit: {}",
+        db.display()
+    );
+
+    // Turn 2: fresh process resumes the previous session without losing context.
+    let (mut controls2, _steer2, _token2) = controls();
+    controls2.context = make_context();
+    let mut req2 = request("second turn");
+    req2.model = Some("default".into());
+    req2.resume = Some("gateway-1".into());
+    req2.env
+        .insert("GEMINI_HOME".into(), "/unowned/google-home".into());
+    req2.env.insert(
+        "ZERON_TEST_EXPECTED_GEMINI_HOME".into(),
+        expected_gemini_home.display().to_string(),
+    );
+    let events2 = run_to_end(&harness, req2, controls2).await;
+    assert_eq!(dones(&events2), vec![(DoneStatus::Completed, None)]);
+    assert!(
+        !events2.iter().any(|ev| matches!(ev, AgentEvent::Error { .. })),
+        "resuming across process restarts must not emit restore errors: {events2:?}"
+    );
+    assert!(events2.contains(&AgentEvent::TextDelta {
+        text: "gateway-resumed".into()
+    }));
 }
 
 #[tokio::test]

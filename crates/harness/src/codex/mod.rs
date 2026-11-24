@@ -805,6 +805,8 @@ impl CodexHarness {
         }
         crate::compose_child_path(&mut cmd, &exe);
         crate::apply_run_context(&mut cmd, controls.context.as_ref());
+        let managed_home =
+            crate::apply_managed_home(self.id(), &mut cmd, controls.context.as_ref())?;
         if !request.cwd.is_empty() {
             cmd.current_dir(&request.cwd);
         }
@@ -846,6 +848,7 @@ impl CodexHarness {
             title_only,
             idle,
             executable: exe,
+            managed_home,
             child,
             client,
             incoming,
@@ -872,6 +875,7 @@ struct Session {
     executable: PathBuf,
     title_only: bool,
     idle: bool,
+    managed_home: Option<crate::ManagedHome>,
     child: Child,
     client: RpcClient,
     incoming: mpsc::Receiver<Incoming>,
@@ -1071,6 +1075,7 @@ async fn run_session(session: Session) {
         executable,
         title_only,
         idle,
+        managed_home: _managed_home,
         mut child,
         client,
         mut incoming,

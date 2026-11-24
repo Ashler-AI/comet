@@ -346,6 +346,9 @@ struct Inner {
     /// [`crate::Repos::scratch_root`]; bare tests fall back to
     /// `~/.zeron/scratch`.
     scratch_root: OnceLock<std::path::PathBuf>,
+    /// Profile-scoped persistent root for Crew-managed harness homes
+    /// (`{profile.store_root}/managed-homes`); set once at boot.
+    managed_state_root: OnceLock<std::path::PathBuf>,
     /// Fired with `(chat_id, cwd)` when a user prompt starts a turn (fresh
     /// dispatch or accepted steer) — the diff sync snapshots the checkout tree
     /// for the Changes pane's "Latest turn" scope. Absent in bare tests.
@@ -461,6 +464,7 @@ impl SessionsEngine {
                 original_epoch_binding: Mutex::new(()),
                 native_branches: OnceLock::new(),
                 scratch_root: OnceLock::new(),
+                managed_state_root: OnceLock::new(),
                 turn_listener: OnceLock::new(),
             }),
         }
@@ -742,6 +746,12 @@ impl SessionsEngine {
     /// Where projectless chats' scratch folders resolve (set once at boot).
     pub(crate) fn set_scratch_root(&self, root: std::path::PathBuf) {
         let _ = self.inner.scratch_root.set(root);
+    }
+
+    /// Where Crew-managed harnesses keep persistent credential-isolated homes
+    /// (set once at boot to `{profile.store_root}/managed-homes`).
+    pub(crate) fn set_managed_state_root(&self, root: std::path::PathBuf) {
+        let _ = self.inner.managed_state_root.set(root);
     }
 
     pub fn set_generated_images(
@@ -1402,6 +1412,7 @@ impl SessionsEngine {
                 supervision_token: Some(supervision_token.clone()),
                 inference: inference.clone(),
                 fork_from,
+                managed_state_root: self.inner.managed_state_root.get().cloned(),
             }),
             realtime: (harness_id == HarnessId::Codex && !managed).then_some(realtime),
             execution_lease: None,
