@@ -522,6 +522,11 @@ local function seed_of(id: string): number
 	return n
 end
 
+-- (Made below, with the reply's foot; named here so the waiting line's call
+-- reaches it. Undeclared, that call read a global, nil: "attempt to call a
+-- nil value" on a prompt whose turn said why it stopped.)
+local turn_line: (line: () -> TurnLine?) -> Node
+
 -- Under a person's newest prompt while its reply hasn't begun, in that
 -- reply's place: "Sending…" while it is on its way, then the turn's working
 -- word and clock, as Zeron's working trailer (transcript.rs); not
@@ -649,7 +654,7 @@ export type TurnLine = { text: string, spinner: boolean?, step: string?, summary
 
 -- The line said in a working word's place: a ring while it's still on its
 -- way, then its words, in the working word's quiet ink.
-local function turn_line(line: () -> TurnLine?): Node
+function turn_line(line: () -> TurnLine?): Node
 	return ui.row {
 		gap = "$space.2",
 		items = "center",

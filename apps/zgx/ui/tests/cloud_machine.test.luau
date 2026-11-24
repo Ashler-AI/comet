@@ -1642,3 +1642,18 @@ test("with nothing sent, a machine waking still says so in the deck", function()
 	expect(showing(app, in_deck('~"Waking its Cloud machine…"'))).to_be(true)
 	expect(app:has(step_row("Waking its Cloud machine…"))).to_be(false)
 end)
+
+-- Its turn begun but no reply yet, the prompt's own line says why it stopped
+-- (ds/transcript's waiting line), as a reply's foot does. Its call to the
+-- words' line once read a global, nil: a script error in the line's place on
+-- each new Cloud chat's first send (Crew zgx on staging, 2026-11-24).
+test("a prompt whose machine went to sleep before its reply began says so in its place", function()
+	local app = on_cloud("ready")
+	send_now(app, "Ship it")
+	app:command("turn_starts")
+	app:frames(10)
+	expect(says(app, "Interrupted")).to_be(false)
+	to_case(app, "sleeping")
+	expect(says(app, "Interrupted — its Cloud machine went to sleep")).to_be(true)
+	expect(app:error()).to_be(nil)
+end)
