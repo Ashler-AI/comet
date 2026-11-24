@@ -17,6 +17,7 @@
   "commands": { "method": "QueueCommand", "id": "crew-web:<lifecycleEpoch>:<requestId>", "payloadKinds": ["run", "steer", "interrupt", "respondInput"], "interruptTarget": "expectedTurnId: last native transcript entry id", "outcomeMethod": "ReadCommand" },
   "otherMethods": ["ListModels", "UploadChunk", "UploadCommit", "FetchToolBlob"],
   "history": "Native reset/delta mirror, bounded HTTP pages with explicit display truncation",
+  "detached": { "module": "web/detached.mjs", "contract": "crew.native.web.detached.v1", "exports": ["detachedState", "detachedToolDetail"], "source": "Crew Edge GET /chat2/<chatId>/tail" },
   "limits": { "jsonRequestBytes": 262144, "uploadBytes": 16777216, "rpcFrameBytes": 33554432, "transcriptMirrorBytes": 67108864, "pageBytes": 524288, "pageEntries": 100, "sseBacklogBytes": 2097152 },
-  "assets": ["server.mjs", "rpc.mjs", "package.json", "contract.json", "public/app.js", "public/transcript.js", "public/index.html", "public/style.css"]
+  "assets": ["server.mjs", "rpc.mjs", "detached.mjs", "package.json", "contract.json", "public/app.js", "public/transcript.js", "public/index.html", "public/style.css"]
 }

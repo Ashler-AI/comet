@@ -1,7 +1,7 @@
 import { messageRows, toolChipContent, userFolds } from './transcript.js';
 
 const $ = (id) => document.getElementById(id);
-const ui = Object.fromEntries(['session-title', 'connection', 'empty', 'empty-prompt', 'transcript', 'older', 'pending-input', 'activity', 'latest', 'composer', 'message', 'model', 'reasoning', 'attach', 'file-input', 'attachments', 'send', 'stop', 'cwd', 'branch', 'error', 'error-text'].map((id) => [id, $(id)]));
+const ui = Object.fromEntries(['session-title', 'connection', 'empty', 'empty-prompt', 'transcript', 'older', 'history-note', 'pending-input', 'activity', 'latest', 'composer', 'message', 'model', 'reasoning', 'attach', 'file-input', 'attachments', 'send', 'stop', 'cwd', 'branch', 'error', 'error-text'].map((id) => [id, $(id)]));
 let state;
 let connected = false;
 let sending = false;
@@ -22,6 +22,16 @@ const messageNodes = new Map();
 const toolDetails = new Map();
 // User bubbles a person unfolded, by message id: re-rendering a message keeps it open.
 const unfoldedUsers = new Set();
+// A session that is not running is shown from its Crew Edge tail (`connection: 'paused'`). Sending
+// there resumes it: the message waits here, and in this tab's storage across a reload, until the
+// live view connects, then goes through the ordinary send.
+const heldSendKey = `crew-web:held-send:${location.pathname}`;
+let heldSend = (() => { try { return JSON.parse(sessionStorage.getItem(heldSendKey) || 'null'); } catch { return null; } })();
+function holdSend(value) {
+  heldSend = value;
+  try { if (value) sessionStorage.setItem(heldSendKey, JSON.stringify(value)); else sessionStorage.removeItem(heldSendKey); } catch {}
+}
+function paused() { return state?.connection === 'paused'; }
 function userText(text) {
   const root = element('div');
   const markers = Array.from(text.matchAll(/\n\nAttached (?:images|files|text) \(local files[^\n]*\):\r?\n/gi));
@@ -53,8 +63,10 @@ const inputDrafts = new Map();
 const terminalCommandStatuses = new Set(['rejected', 'expired', 'superseded', 'cancelled']);
 
 function renderActivity() {
-  const statuses = { working: 'Composing…', awaitingInput: 'Awaiting your answer', errored: 'Session encountered an error', idle: '' };
-  const pending = pendingCommands.values().next().value;
+  const statuses = { working: 'Composing…', awaitingInput: 'Awaiting your answer', errored: 'Session encountered an error', idle: '',
+    paused: '', resuming: 'Resuming this session…', starting: 'Resuming this session…', creating: 'Starting this session…',
+    restoring_snapshot: 'Starting this session…', stopped: 'This session was stopped. Open it in Crew to continue.', failed: 'This session failed to start.' };
+  const pending = pendingCommands.values().next().value || (heldSend ? 'Resuming this session. Your message sends once it’s back.' : '');
   ui.activity.textContent = pending || (statuses[state?.session.status] ?? state?.session.status ?? '');
 }
 
@@ -125,15 +137,18 @@ async function command(path, payload, scope = '') {
 }
 function running() { return state?.session.status === 'working' || state?.session.status === 'awaitingInput'; }
 function allowed(capability) { return connected && state?.connection === 'connected' && state?.capabilities?.[capability] === true; }
+// A paused view can hold one text message for the resume; files and model changes need the live view.
+function canHoldSend() { return paused() && state.capabilities?.message === true && !heldSend && !uploads.length; }
 function updateControls() {
   const ready = allowed('message');
+  const holdable = canHoldSend();
   ui.message.disabled = !state;
   ui.attach.disabled = !ready || sending;
   ui.model.disabled = !ready || sending || running() || !availableModels().length;
   ui.reasoning.disabled = !ready || sending || running() || ui.reasoning.options.length < 2;
-  ui.send.disabled = !ready || sending || uploads.some((file) => file.uploading) || (!ui.message.value.trim() && !uploads.length);
-  ui.send.title = ui.send.ariaLabel = running() ? 'Steer agent' : 'Send message';
-  ui.message.placeholder = running() ? 'Steer this agent…' : 'Message Crew…';
+  ui.send.disabled = !(ready || holdable) || sending || uploads.some((file) => file.uploading) || (!ui.message.value.trim() && !uploads.length);
+  ui.send.title = ui.send.ariaLabel = running() ? 'Steer agent' : holdable ? 'Send and resume this session' : 'Send message';
+  ui.message.placeholder = running() ? 'Steer this agent…' : holdable ? 'Message Crew to resume this session…' : 'Message Crew…';
   ui.stop.hidden = !running();
   ui.stop.disabled = !allowed('interrupt') || !state?.session.turnId || stopping;
   ui.stop.title = ui.stop.ariaLabel = stopping ? 'Stop requested…' : 'Stop agent';
@@ -142,9 +157,30 @@ function updateControls() {
 function connection(value) {
   connected = value;
   const live = value && state?.connection === 'connected';
-  ui.connection.dataset.state = live ? 'connected' : 'disconnected';
-  ui.connection.textContent = live ? 'Connected' : state ? 'Reconnecting…' : 'Connecting…';
+  const pausedLabels = { paused: 'Paused', stopped: 'Stopped', failed: 'Failed' };
+  ui.connection.dataset.state = live ? 'connected' : paused() ? 'paused' : 'disconnected';
+  ui.connection.textContent = live ? 'Connected'
+    : paused() ? (heldSend ? 'Resuming…' : pausedLabels[state.session.status] ?? 'Resuming…')
+    : state ? 'Reconnecting…' : 'Connecting…';
   updateControls();
+}
+// Once the resumed session's live view connects, the held message goes out like any other.
+async function sendHeld() {
+  if (!heldSend || sending || !allowed('message')) return;
+  const payload = heldSend.payload;
+  sending = true; updateControls();
+  try {
+    await command('message', payload);
+    holdSend(null);
+  } catch (error) {
+    // Nothing is lost: the text returns to the composer for another try.
+    holdSend(null);
+    if (!ui.message.value.trim()) { ui.message.value = payload.text; resizeComposer(); }
+    showError(error);
+  } finally {
+    sending = false;
+    if (state) receive(state);
+  }
 }
 
 // Markdown is constructed entirely from DOM text nodes. Raw HTML and remote images
@@ -332,7 +368,8 @@ function renderUser(message, node) {
   }
   node.append(card);
   const meta = element('div', 'message-meta');
-  if (message.status === 'queued' || message.status === 'steered') meta.append(element('span', 'delivery', message.status === 'queued' ? 'Queued for the next turn' : 'Steered'));
+  const deliveries = { queued: 'Queued for the next turn', steered: 'Steered', held: 'Sends once this session is back' };
+  if (deliveries[message.status]) meta.append(element('span', 'delivery', deliveries[message.status]));
   if (message.createdAt) meta.append(timestamp(message.createdAt));
   if (texts.join('').trim()) meta.append(copyButton(texts.join('\n\n')));
   if (meta.childNodes.length) node.append(meta);
@@ -517,13 +554,24 @@ function receive(next) {
   const project = state.session.cwd?.split('/').filter(Boolean).at(-1) || 'this project';
   ui['empty-prompt'].textContent = `Send a message to get started in ${project}.`;
   if (state.transcriptReset === true) { modelCatalog = undefined; modelSignature = ''; }
-  ui.empty.hidden = entries.length > 0;
-  renderTranscript(entries);
+  const detached = paused() ? state.detached : undefined;
+  if (detached && !entries.length) {
+    ui['empty-prompt'].textContent = state.capabilities?.message
+      ? 'This session’s transcript isn’t available while it’s paused. Send a message to resume it.'
+      : 'This session’s transcript isn’t available here. Open it in Crew.';
+  }
+  ui.empty.hidden = entries.length > 0 || !!heldSend;
+  renderTranscript(heldSend ? [...entries, { id: 'held-send', role: 'user', status: 'held', createdAt: heldSend.at,
+    parts: [{ kind: 'text', id: 'held-text', text: heldSend.payload.text }] }] : entries);
   renderModels();
   renderInputs(entries);
   ui.older.hidden = historyBefore == null;
+  // The Edge keeps the latest messages; the rest of a long session is in Crew.
+  ui['history-note'].hidden = !(detached && detached.total > detached.shown);
+  if (!ui['history-note'].hidden) ui['history-note'].textContent = `Showing the latest ${detached.shown} of ${detached.total} messages. Open this session in Crew for the rest.`;
   renderActivity();
   connection(connected);
+  if (heldSend && allowed('message')) void sendHeld();
 }
 function resizeComposer() {
   ui.message.style.height = 'auto';
@@ -541,6 +589,22 @@ ui.reasoning.addEventListener('change', () => { modelDirty = true; modelRevision
 ui.composer.addEventListener('submit', async (event) => {
   event.preventDefault();
   if (ui.send.disabled) return;
+  if (!allowed('message') && canHoldSend()) {
+    // Not running: hold the text, ask Scaffold to resume the session, and send once it is live.
+    const held = ui.message.value;
+    holdSend({ payload: { text: held, attachments: [] }, at: Date.now() });
+    ui.message.value = ''; resizeComposer();
+    receive(state);
+    try {
+      await api('resume', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' });
+    } catch (error) {
+      holdSend(null);
+      if (!ui.message.value.trim()) { ui.message.value = held; resizeComposer(); }
+      receive(state);
+      showError(error);
+    }
+    return;
+  }
   const text = ui.message.value;
   const submittedModelRevision = modelRevision;
   const submitted = uploads.slice();
@@ -670,7 +734,8 @@ const initialVersion = frameVersion;
 api('session').then((initial) => { if (frameVersion === initialVersion) receive(initial); }).catch(showError);
 api('models').then((catalog) => {
   if (!Array.isArray(catalog.models)) throw new Error('Crew returned an invalid model catalog.');
-  modelCatalog = catalog.models;
+  // A paused view has no engine to list models: keep reading them from the live state once it connects.
+  modelCatalog = catalog.models.length ? catalog.models : undefined;
   if (state) { renderModels(); updateControls(); }
 }).catch(showError);
 window.addEventListener('pagehide', () => { clearTimeout(reconnect); events.close(); events = null; });
