@@ -9,3 +9,39 @@
 @media(prefers-reduced-motion:no-preference){.round-button,.composer,.icon-button{transition:background .15s,border-color .15s}.thinking.active{animation:breathe 2s ease-in-out infinite}@keyframes breathe{50%{opacity:.5}}}
 .composer-controls{max-width:100%}.composer-controls select{min-width:0}.composer-controls .icon-button{flex-shrink:0}
 #native-open{flex-shrink:0;white-space:nowrap}
+/* The transcript in Zeron's dark tokens (crates/ui theme.rs): text neutral(.922), muted neutral(.708),
+   faint neutral(.556), raised neutral(.235), hairlines white at 8%, inline code in the Green accent on
+   its 12% wash. Rows follow transcript.js: user bubbles, folded work groups, markdown replies. */
+:root{--text:#e5e5e5;--muted:#a1a1a1;--faint:#737373;--raised:#1e1e1e;--hairline:rgba(255,255,255,.08);--accent:oklch(.75 .17 150);--code-wash:oklch(.75 .17 150/.12)}
+.markdown{color:var(--text)}
+code{color:var(--accent);background:var(--code-wash);border-radius:5px;padding:1px 5px}
+pre code,.tool-detail code{color:inherit;background:none;padding:0}
+.message.user{max-width:85%;margin-left:auto;text-align:left;font-weight:400;color:var(--text)}
+.user-card{background:var(--raised);border:1px solid var(--hairline);border-radius:16px;padding:12px 16px;line-height:1.6}
+.user-card .markdown{line-height:1.6}
+.user-card.folded .user-body{max-height:8em;overflow:hidden;-webkit-mask-image:linear-gradient(#000 calc(100% - 2.4em),transparent);mask-image:linear-gradient(#000 calc(100% - 2.4em),transparent)}
+.fold-toggle{display:inline-flex;align-items:center;gap:5px;margin:6px 0 -4px -8px;color:var(--muted)}
+.fold-toggle::after{content:"›";display:inline-block;transform:rotate(90deg);font-size:14px;line-height:1}
+.user-card:not(.folded) .fold-toggle::after{transform:rotate(-90deg)}
+.message.user .message-meta{justify-content:flex-end;align-items:center;gap:6px;color:var(--faint);margin-top:6px}
+.copy-button{height:24px;width:24px;color:var(--faint)}
+.copy-button svg{height:14px;width:14px}
+.copy-button[data-copied]{color:var(--accent)}
+.tool-group{margin:12px 0}
+.tool-group>summary{display:flex;align-items:center;gap:7px;color:var(--faint);font-size:13px;padding:4px 0;cursor:pointer;list-style:none;width:fit-content;max-width:100%}
+.tool-group>summary::-webkit-details-marker{display:none}
+.tool-group>summary:hover{color:var(--muted)}
+.chevron{display:inline-block;width:10px;text-align:center;font-size:15px;line-height:1}
+.tool-group[open]>summary .chevron{transform:rotate(90deg)}
+.group-summary{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.tool-list{padding:2px 0 2px 12px;margin:2px 0 0 4px;border-left:1px solid var(--hairline)}
+.tool{background:none;border:0;border-radius:6px;margin:0;overflow:visible}
+.tool>summary{min-height:28px;padding:4px 8px;font-size:12.5px;gap:8px}
+.tool>summary:hover{background:rgba(235,235,235,.06)}
+.tool>summary::after{color:var(--faint)}
+.tool-label{color:var(--muted)}
+.tool-description{color:var(--faint);font-family:"SFMono-Regular",Consolas,"Liberation Mono",monospace;font-size:12px}
+.tool.failed .tool-label,.tool.failed .tool-description{color:#e07a7a}
+.tool-detail{border:1px solid var(--hairline);border-radius:8px;margin:4px 0 8px}
+.thought{color:var(--faint);font-size:12.5px;padding:4px 8px;min-height:28px;display:flex;align-items:center}
+@media(prefers-reduced-motion:no-preference){.chevron,.fold-toggle::after{transition:transform .15s}.group-summary.active,.thought.active{background:linear-gradient(90deg,var(--faint) 30%,var(--text) 50%,var(--faint) 70%) 0 0/250% 100%;-webkit-background-clip:text;background-clip:text;color:transparent;animation:zeron-shimmer 1.8s linear infinite}@keyframes zeron-shimmer{from{background-position:100% 0}to{background-position:-150% 0}}}

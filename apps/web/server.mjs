@@ -584,7 +584,7 @@ export async function createServer(config, viewport = new Viewport(config)) {
       if (req.method === 'POST' && ['/api/message', '/api/interrupt', '/api/input'].includes(path)) {
         return respond(res, 202, await viewport.enqueue(path.slice('/api/'.length), await jsonBody(req)));
       }
-      if (req.method === 'GET' && ['/', '/index.html', '/app.js', '/style.css'].includes(path)) {
+      if (req.method === 'GET' && ['/', '/index.html', '/app.js', '/transcript.js', '/style.css'].includes(path)) {
         const file = path === '/' ? 'index.html' : path.slice(1);
         const bytes = await readFile(join(publicDir, file));
         res.writeHead(200, { 'Content-Type': file.endsWith('.html') ? 'text/html; charset=utf-8' : file.endsWith('.js') ? 'text/javascript; charset=utf-8' : 'text/css; charset=utf-8' });
