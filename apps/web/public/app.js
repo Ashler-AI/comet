@@ -1,3 +1,5 @@
+import { messageRows, toolChipContent, userFolds } from './transcript.js';
+
 const $ = (id) => document.getElementById(id);
 const ui = Object.fromEntries(['session-title', 'connection', 'empty', 'empty-prompt', 'transcript', 'older', 'pending-input', 'activity', 'latest', 'composer', 'message', 'model', 'reasoning', 'attach', 'file-input', 'attachments', 'send', 'stop', 'cwd', 'branch', 'error', 'error-text'].map((id) => [id, $(id)]));
 let state;
@@ -18,6 +20,8 @@ let frameVersion = 0;
 const retainedMessages = new Map();
 const messageNodes = new Map();
 const toolDetails = new Map();
+// User bubbles a person unfolded, by message id: re-rendering a message keeps it open.
+const unfoldedUsers = new Set();
 function userText(text) {
   const root = element('div');
   const markers = Array.from(text.matchAll(/\n\nAttached (?:images|files|text) \(local files[^\n]*\):\r?\n/gi));
@@ -30,7 +34,8 @@ function userText(text) {
   }
   let body = text.slice(0, bodyEnd).trimEnd();
   if (refs.length && ['See the attached image(s).', 'See the attached file(s).', 'See the attached text.'].includes(body.trim())) body = '';
-  if (body) root.append(element('div', 'markdown', body));
+  // As in the desktop, a person's message is Markdown too: inline code, headings and lists render.
+  if (body) root.append(markdown(body));
   if (refs.length) {
     const strip = element('div', 'attachments');
     for (const path of refs) {
@@ -226,23 +231,6 @@ function markdown(text) {
   }
   return root;
 }
-function toolLabel(call) {
-  switch (call.kind) {
-    case 'exec': return ['Run', call.command];
-    case 'readFile': return ['Read', call.path];
-    case 'writeFile': return ['Write', call.path];
-    case 'editFile': return ['Edit', call.path];
-    case 'applyPatch': return ['Patch', call.path || 'workspace'];
-    case 'search': return ['Search', `${call.pattern}${call.path ? ` in ${call.path}` : ''}`];
-    case 'glob': return ['Glob', call.pattern];
-    case 'webFetch': return ['Fetch', call.url];
-    case 'webSearch': return ['Web', call.query];
-    case 'todo': return ['Todo', `${call.items.filter((item) => item.done).length}/${call.items.length} done`];
-    case 'agent': return ['Agents', call.agents.map((agent) => `${agent.id} · ${agent.role} · ${agent.status}`).join(', ')];
-    case 'mcp': return ['MCP', `${call.server} · ${call.tool}`];
-    default: return ['Tool', call.name || call.kind];
-  }
-}
 function paintToolDetail(container, detail, part) {
   container.replaceChildren();
   if (detail?.error) container.append(element('p', '', detail.error));
@@ -266,19 +254,88 @@ async function loadToolDetail(container, part, force = false) {
     paintToolDetail(container, detail, part);
   } catch (error) { if (container.isConnected) paintToolDetail(container, { error: error.message }, part); }
 }
+// A tool chip as the desktop draws it inside a group: what it did, then the one-line detail.
 function renderTool(part) {
   const node = element('details', `tool${part.isError ? ' failed' : ''}`);
   node.dataset.fold = `tool:${part.id}`;
   const summary = element('summary');
-  const [label, description] = toolLabel(part.call);
-  summary.append(element('span', 'tool-icon', '◇'), element('span', 'tool-label', label), element('span', 'tool-description', description));
-  summary.title = `${label} ${description}`;
-  if (!part.resolved) summary.append(element('span', 'tool-state', 'Pending'));
+  const [label, description] = toolChipContent(part.call);
+  summary.append(element('span', 'tool-label', label), element('span', 'tool-description', description));
+  summary.title = description ? `${label} ${description}` : label;
+  if (!part.resolved) summary.append(element('span', 'tool-state', 'Running'));
   else if (part.isError) summary.append(element('span', 'tool-state', 'Failed'));
   const detail = element('div', 'tool-detail');
   node.append(summary, detail);
   node.addEventListener('toggle', () => { if (node.open) loadToolDetail(detail, part); });
   return node;
+}
+// A thought's text stays in native Crew: here it is a chip that counts toward the group's line.
+function renderThought(item) {
+  return element('div', `thought${item.live ? ' active' : ''}`, item.live ? 'Thinking…' : 'Thought process');
+}
+// Consecutive thoughts and tool calls fold into one line, "Thought 2 times · Ran 4 commands", as in
+// the desktop. Only the streaming tail of a reply opens by itself.
+function renderGroup(row, streaming) {
+  const wrap = element('details', 'tool-group');
+  wrap.dataset.fold = `group:${row.items[0].part.id}`;
+  wrap.open = row.autoOpen;
+  const summary = element('summary');
+  const active = streaming && row.items.some((item) => item.live || (item.kind === 'tool' && !item.part.resolved));
+  summary.append(element('span', 'chevron', '›'), element('span', `group-summary${active ? ' active' : ''}`, row.summary));
+  const list = element('div', 'tool-list');
+  for (const item of row.items) list.append(item.kind === 'thought' ? renderThought(item) : renderTool(item.part));
+  wrap.append(summary, list);
+  return wrap;
+}
+const copyIcon = '<svg viewBox="0 0 24 24" aria-hidden="true"><rect x="9" y="9" width="11" height="11" rx="2"/><path d="M5 15V5a2 2 0 0 1 2-2h10"/></svg>';
+function copyButton(text) {
+  const node = button('', async () => {
+    try {
+      await navigator.clipboard.writeText(text);
+      node.dataset.copied = 'true';
+      setTimeout(() => { delete node.dataset.copied; }, 1500);
+    } catch { showError('Copy failed. Select the message text to copy it.'); }
+  }, 'icon-button copy-button');
+  node.title = node.ariaLabel = 'Copy message';
+  node.innerHTML = copyIcon;
+  return node;
+}
+function timestamp(createdAt) {
+  const date = new Date(createdAt);
+  const time = element('time', '', date.toLocaleString([], { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' }));
+  time.dateTime = date.toISOString(); time.title = date.toLocaleString();
+  return time;
+}
+// The person's message as the desktop shows it: a bubble that folds past five lines or 400
+// characters behind "Show more", then its time and a copy button.
+function renderUser(message, node) {
+  const texts = message.parts.filter((part) => part.kind === 'text' || part.kind === 'textWindow').map((part) => part.text);
+  const card = element('div', 'user-card');
+  const body = element('div', 'user-body');
+  for (const part of message.parts) {
+    if (part.kind === 'textWindow') body.append(element('p', 'truncation', `Earlier text omitted (${Number(part.omitted_prefix_bytes || 0).toLocaleString()} bytes).`));
+    if (part.kind === 'text' || part.kind === 'textWindow') body.append(userText(part.text));
+    else if (part.kind === 'error') body.append(element('div', 'part-error', part.message));
+  }
+  card.append(body);
+  if (userFolds(texts.join('\n\n'))) {
+    const folded = !unfoldedUsers.has(message.id);
+    card.classList.toggle('folded', folded);
+    const toggle = button(folded ? 'Show more' : 'Show less', () => {
+      const now = card.classList.toggle('folded');
+      if (now) unfoldedUsers.delete(message.id); else unfoldedUsers.add(message.id);
+      toggle.textContent = now ? 'Show more' : 'Show less';
+      toggle.ariaExpanded = String(!now);
+    }, 'text-button fold-toggle');
+    toggle.ariaExpanded = String(!folded);
+    card.append(toggle);
+  }
+  node.append(card);
+  const meta = element('div', 'message-meta');
+  if (message.status === 'queued' || message.status === 'steered') meta.append(element('span', 'delivery', message.status === 'queued' ? 'Queued for the next turn' : 'Steered'));
+  if (message.createdAt) meta.append(timestamp(message.createdAt));
+  if (texts.join('').trim()) meta.append(copyButton(texts.join('\n\n')));
+  if (meta.childNodes.length) node.append(meta);
 }
 function renderMessage(message) {
   const node = element('article', `message ${message.role}${message.continuationOf ? ' continuation' : ''}`);
@@ -289,41 +346,21 @@ function renderMessage(message) {
     peer.append(element('summary', '', 'Message from another agent'), element('pre', '', message.parts.filter((part) => part.kind === 'text' || part.kind === 'textWindow').map((part) => part.text).join('\n\n')));
     node.append(peer); return node;
   }
-  let group = [];
-  const flush = () => {
-    if (!group.length) return;
-    const wrap = element('details', 'tool-group');
-    wrap.dataset.fold = `group:${group[0].id}`;
-    wrap.open = message.status === 'streaming';
-    const failed = group.filter((part) => part.isError).length;
-    wrap.append(element('summary', '', `${group.length} tool ${group.length === 1 ? 'call' : 'calls'}${failed ? ` · ${failed} failed` : ''}`));
-    const list = element('div', 'tool-list');
-    for (const part of group) list.append(renderTool(part));
-    wrap.append(list); node.append(wrap); group = [];
-  };
-  for (const part of message.parts) {
-    if (part.kind === 'tool') { if (part.id !== 'omp-goal-state') group.push(part); continue; }
-    flush();
+  if (message.role === 'user') { renderUser(message, node); return node; }
+  const streaming = message.status === 'streaming';
+  for (const row of messageRows(message.parts, streaming)) {
+    if (row.type === 'group') { node.append(renderGroup(row, streaming)); continue; }
+    const { part } = row;
     if (part.kind === 'text' || part.kind === 'textWindow') {
       if (part.kind === 'textWindow') node.append(element('p', 'truncation', `Earlier text omitted (${Number(part.omitted_prefix_bytes || 0).toLocaleString()} bytes).`));
-      if (message.role === 'user') node.append(userText(part.text));
-      else node.append(markdown(part.text));
-    } else if (part.kind === 'thinking' && part.started) {
-      const active = !part.completed && message.status === 'streaming';
-      node.append(element('p', `thinking${active ? ' active' : ''}`, part.completed ? 'Thought process completed' : active ? 'Thinking…' : 'Thought process ended'));
+      node.append(markdown(part.text));
     } else if (part.kind === 'input') {
       node.append(element('p', 'input-chip', part.resolved ? `Answered · ${part.questions[0]?.header || 'Agent question'}` : 'Awaiting your answer…'));
     } else if (part.kind === 'error') node.append(element('div', 'part-error', part.message));
   }
-  flush();
   const meta = element('div', 'message-meta');
   if (message.status === 'queued' || message.status === 'steered') meta.append(element('span', 'delivery', message.status === 'queued' ? 'Queued for the next turn' : 'Steered'));
   if (message.status === 'aborted') meta.append(element('span', '', 'Interrupted'));
-  if (message.createdAt && message.status !== 'streaming') {
-    const date = new Date(message.createdAt);
-    const time = element('time', '', date.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' }));
-    time.dateTime = date.toISOString(); time.title = date.toLocaleString(); meta.append(time);
-  }
   if (meta.childNodes.length) node.append(meta);
   return node;
 }
