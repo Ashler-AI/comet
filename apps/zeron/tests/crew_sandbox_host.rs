@@ -9,6 +9,7 @@
 //!   desktop's attach probe, with its workspace-relative data dir) prints
 //!   Crew's line;
 //! - what a host refuses, it refuses;
+//! - it runs no agent CLI to check it for updates;
 //! - SIGTERM ends it with 0 well within the runner's 30 s;
 //! - the runner's restart (no bootstrap) refreshes the credential and serves
 //!   the same authority;
@@ -165,9 +166,14 @@ impl Host {
 /// clean one), in a home of its own.
 fn runner_command(root: &Path, scaffold: &FakeScaffold, data: &Path) -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_zeron"));
+    // A sandbox's PATH: the fake agent CLIs (agent_clis), when there are any,
+    // as its only agent installs, and the system's tools. (With a second install
+    // of a CLI on it, resolving one asks each its version.)
+    let mut path = std::ffi::OsString::from(root.join("agent-bin"));
+    path.push(":/usr/bin:/bin:/usr/sbin:/sbin");
     command
         .env_clear()
-        .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+        .env("PATH", path)
         .env("HOME", root.join("home"))
         .env("TMPDIR", std::env::temp_dir())
         .env("ZERON_DISABLE_NOTIFICATIONS", "1")
@@ -177,6 +183,23 @@ fn runner_command(root: &Path, scaffold: &FakeScaffold, data: &Path) -> Command 
         .env("COMET_SCAFFOLD_URL", &scaffold.origin)
         .current_dir(root);
     command
+}
+
+/// Fake `codex` and `claude` CLIs, each run of either recorded in
+/// `agent-cli-runs.log`. A sandbox host runs neither to check it for updates:
+/// Platform installs its agents, and Codex's run lays links outside the
+/// session's roots, which refuse every checkpoint the harness takes.
+fn agent_clis(root: &Path) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt as _;
+    let bin = root.join("agent-bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let runs = root.join("agent-cli-runs.log");
+    for name in ["codex", "claude"] {
+        let path = bin.join(name);
+        std::fs::write(&path, format!("#!/bin/sh\necho \"{name} $*\" >> '{}'\necho '1.0.0'\n", runs.display())).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    runs
 }
 
 /// native-crew-runner.mjs's argv: `launchArgs`, the bootstrap at index 5.
@@ -264,6 +287,7 @@ fn the_native_runner_s_host_enrolls_answers_the_probe_stops_and_restarts() {
     let data = root.join(".scaffold/crew-data");
     let port = free_port();
     let bootstrap = write_bootstrap(&root, GRANT_ID);
+    let agent_runs = agent_clis(&root);
 
     let runtime = tokio::runtime::Runtime::new().unwrap();
     let mut host = launch(&root, &scaffold, &data, port, Some(&bootstrap), "enrolled");
@@ -306,6 +330,12 @@ fn the_native_runner_s_host_enrolls_answers_the_probe_stops_and_restarts() {
     assert!(call(zeron_rpc::methods::LIST_AGENT_ACCOUNTS, serde_json::json!({})).contains("cannot manage local credentials"));
     assert!(call(zeron_rpc::methods::UPLOAD_COMMIT, serde_json::json!({"chatId": "other", "uploadId": "u", "fileName": "f"}))
         .contains("bound to a different session"));
+
+    // No agent CLI was run to check it for updates, whose first check would
+    // have run at start (staging, 2026-11-24: Codex's links refused every pause).
+    std::thread::sleep(Duration::from_secs(3));
+    let runs = std::fs::read_to_string(&agent_runs).unwrap_or_default();
+    assert!(runs.is_empty(), "a sandbox host ran agent CLIs:\n{runs}");
 
     // SIGTERM: exit 0, well within the runner's 30 s.
     drop(client);

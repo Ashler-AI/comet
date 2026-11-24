@@ -510,7 +510,13 @@ impl EngineCore {
         acp_registry::start(data_dir, &registry);
         let harness_updates =
             harness_updates::HarnessUpdateCoordinator::new(data_dir, registry.clone());
-        harness_updates.start();
+        // Crew: a sandbox host checks no agent for updates. Platform installs
+        // them (the host refuses their updates), and a check runs each CLI:
+        // Codex's lays links out of the session's roots there, which refuse
+        // every checkpoint the harness takes, and so every pause.
+        if profile.device_id_override().is_none() {
+            harness_updates.start();
+        }
         sessions.set_titles(TitleGenerator::new(
             workspace.clone(),
             registry.clone(),
