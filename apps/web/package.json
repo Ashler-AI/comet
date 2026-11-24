@@ -8,5 +8,5 @@
     "start": "node server.mjs",
     "test": "node --test *.test.mjs"
   },
-  "files": ["server.mjs", "rpc.mjs", "contract.json", "public"]
+  "files": ["server.mjs", "rpc.mjs", "detached.mjs", "contract.json", "public"]
 }
