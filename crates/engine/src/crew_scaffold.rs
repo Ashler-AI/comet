@@ -38,6 +38,8 @@ use crate::auth::{DeviceGrantAuthority, ScaffoldScope};
 use crate::now_ms;
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+/// A lifecycle call (resume) may outlast a read: Crew's own bound.
+const LIFECYCLE_REQUEST_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 const RUNTIME_START_POLL: Duration = Duration::from_millis(500);
 /// At 30 s a request, two retries cap a persistent timeout at about 90 s.
 const ATTACH_PROBE_TRANSPORT_RETRIES: usize = 2;
@@ -972,6 +974,19 @@ impl ScaffoldClient {
         answer.sandbox.into_environment(scope)
     }
 
+    /// `POST /api/code-sandboxes/{id}/resume` (Crew's `lifecycle(resume)`): a
+    /// paused sandbox back, on a new epoch. Platform claims one resume at a
+    /// time and answers another ask while one runs with that one
+    /// (`resumeDeduplicated`), so a send that asks again never resumes twice.
+    pub(crate) async fn resume(&self, sandbox_id: &str, scope: &ScaffoldScope, cancellation: &CancellationToken) -> Result<SessionEnvironment, ScaffoldError> {
+        self.validate_scope(scope)?;
+        let url = self.sandbox_url(sandbox_id, Some("resume"))?;
+        let answer: SandboxEnvelope = self
+            .request_within(Method::POST, url, Some(&serde_json::json!({})), cancellation, Some(LIFECYCLE_REQUEST_TIMEOUT))
+            .await?;
+        answer.sandbox.into_environment(scope)
+    }
+
     async fn exec(&self, sandbox_id: &str, body: &ExecBody<'_>, cancellation: &CancellationToken) -> Result<ExecResponse, ScaffoldError> {
         self.request(Method::POST, self.sandbox_url(sandbox_id, Some("exec"))?, Some(body), cancellation).await
     }
@@ -998,7 +1013,27 @@ impl ScaffoldClient {
         T: for<'de> Deserialize<'de>,
         B: Serialize + ?Sized,
     {
+        self.request_within(method, url, body, cancellation, None).await
+    }
+
+    /// `request`, its whole exchange bounded by `timeout` in place of the
+    /// client's (a lifecycle call may outlast a read).
+    async fn request_within<T, B>(
+        &self,
+        method: Method,
+        url: Url,
+        body: Option<&B>,
+        cancellation: &CancellationToken,
+        timeout: Option<Duration>,
+    ) -> Result<T, ScaffoldError>
+    where
+        T: for<'de> Deserialize<'de>,
+        B: Serialize + ?Sized,
+    {
         let mut request = self.http.request(method, url).header(reqwest::header::ACCEPT, "application/json");
+        if let Some(timeout) = timeout {
+            request = request.timeout(timeout);
+        }
         if let Some(body) = body {
             request = request.json(body);
         }
@@ -1235,9 +1270,9 @@ impl SandboxHosts {
             .to_vec()
     }
 
-    /// Attach `sandbox_id`'s host for `scope` (Crew's `control(Attach)` less
-    /// resume): reuse an exactly bound host, else mint, hand over and start
-    /// one, and wait for its probe to confirm it.
+    /// Attach `sandbox_id`'s host for `scope` (Crew's `control(Attach)`): reuse
+    /// an exactly bound host (Platform's harness enrolls one itself), else
+    /// mint, hand over and start one, and wait for its probe to confirm it.
     pub(crate) async fn attach(
         &self,
         sandbox_id: &str,
@@ -1246,7 +1281,7 @@ impl SandboxHosts {
     ) -> Result<(SessionEnvironment, Attachment), ScaffoldError> {
         let environment = self.client.inspect(sandbox_id, scope, cancellation).await?;
         let (_, lifecycle, _) = environment.sandbox()?;
-        // (Crew resumes a paused sandbox here; this port doesn't yet.)
+        // (A paused one is resumed first, by crew_cloud's wake: Crew main #237.)
         if !lifecycle.attachable() {
             return Err(ScaffoldError::AttachRejected(lifecycle));
         }

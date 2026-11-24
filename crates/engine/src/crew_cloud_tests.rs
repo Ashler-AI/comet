@@ -386,7 +386,6 @@ async fn the_cloud_rpcs_answer_as_crew_s_sandboxes() {
     );
     assert_eq!(workspace.chat(SESSION).unwrap().unwrap().device_id, DEVICE, "listing publishes rows, nothing more");
     for method in [
-        methods::CLOUD_SESSION_WAKE,
         methods::CLOUD_SESSION_SLEEP,
         methods::CLOUD_SESSION_DELETE,
         methods::CLOUD_SET_MACHINE,
@@ -512,6 +511,87 @@ async fn a_failed_sandbox_s_chat_stops_waking_its_host() {
     host.shutdown_workers().await;
 }
 
+/// A send to a paused sandbox's chat resumes it (Crew main #237): the 404 its
+/// host's nudge gets wakes the sandbox once, its new epoch's row is published,
+/// and the waiting send goes to that epoch's host. Cloud's Wake does the same
+/// and never resumes it twice; a failed one is refused in its alert's words.
+#[tokio::test]
+async fn a_send_to_a_paused_sandbox_resumes_it() {
+    use std::sync::atomic::{AtomicU8, Ordering};
+
+    use crate::doc_host::{DocHost, DocHostConfig, EdgeConfig};
+    fn answer(status: &str, epoch: u64) -> String {
+        let mut value = sandbox_value(status);
+        value["lifecycleEpoch"] = json!(epoch);
+        json!({"ok": true, "sandbox": value}).to_string()
+    }
+    // Platform's sandbox: paused at epoch 1, resuming at 2 once asked, then failed.
+    let phase = Arc::new(AtomicU8::new(0));
+    let platform = phase.clone();
+    let (origin, requests) = serve(move |request, _| {
+        if request.starts_with("POST /api/code-sandboxes/sandbox-a/resume ") {
+            platform.store(1, Ordering::SeqCst);
+            return (200, answer("resuming", 2));
+        }
+        if request.starts_with("GET /api/code-sandboxes/sandbox-a ") {
+            return match platform.load(Ordering::SeqCst) {
+                0 => (200, answer("paused", 1)),
+                1 => (200, answer("resuming", 2)),
+                _ => (200, answer("failed", 2)),
+            };
+        }
+        (404, "{}".into()) // no host serving yet: nudges, probes and grants
+    })
+    .await;
+    let Fixture { cloud, workspace, store, .. } = fixture(&origin, Some("harness-zgx"));
+    let resumes = || requests.lock().unwrap().iter().filter(|request| request.starts_with("POST /api/code-sandboxes/sandbox-a/resume ")).count();
+    let new_host = "comet-scaffold-sandbox-a-e2";
+    let paused = serde_json::from_value::<scaffold::Sandbox>(sandbox_value("paused"))
+        .unwrap()
+        .into_environment(&controller().scope(SESSION))
+        .unwrap();
+    assert!(cloud.publish(&controller(), &paused, None, None).unwrap());
+    assert_eq!(workspace.chat(SESSION).unwrap().unwrap().device_id, DEVICE);
+
+    let host = DocHost::new(
+        store.clone(),
+        DocHostConfig { device_id: "desktop".into(), default_harness: HarnessId::Mock, edge: Some(EdgeConfig::with_static_token(&origin, "test")) },
+    );
+    host.set_workspace(workspace.clone());
+    host.set_crew_cloud(&cloud);
+    store.schedule_sync_job(SESSION, "remote-wake").unwrap();
+    let moved = tokio::time::timeout(Duration::from_secs(20), async {
+        while workspace.chat(SESSION).unwrap().unwrap().device_id != new_host {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await;
+    assert!(moved.is_ok(), "the send resumed its sandbox, and its row moved to the new epoch's host");
+    assert_eq!(resumes(), 1);
+    let nudge = format!("POST /device/{new_host}/nudge ");
+    let retargeted = tokio::time::timeout(Duration::from_secs(20), async {
+        while !requests.lock().unwrap().iter().any(|request| request.starts_with(&nudge)) {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await;
+    assert!(retargeted.is_ok(), "the waiting send goes to the new epoch's host");
+
+    // Cloud's Wake while it resumes: its session, and no second resume.
+    let Some(Ok(RpcReply::Value(session))) = cloud.cloud_rpc(methods::CLOUD_SESSION_WAKE, &json!({"chatId": SESSION})).await else {
+        panic!("a woken session");
+    };
+    assert_eq!((session["deviceId"].clone(), session["state"].clone()), (json!(new_host), json!("starting")));
+    assert_eq!(resumes(), 1, "never resumed twice");
+
+    // A failed one: refused in its alert's words, and nothing resumed.
+    phase.store(2, Ordering::SeqCst);
+    let refused = cloud.cloud_rpc(methods::CLOUD_SESSION_WAKE, &json!({"chatId": SESSION})).await.unwrap().err().expect("refused").to_string();
+    assert!(refused.contains("Start a new chat to try again."), "{refused}");
+    assert_eq!(resumes(), 1);
+    host.shutdown_workers().await;
+}
+
 /// A row is never re-homed from another device, bound to another sandbox,
 /// or moved back to an older epoch.
 #[tokio::test]
@@ -561,7 +641,6 @@ async fn only_what_the_edge_relays_goes_to_a_sandbox_host() {
         (methods::QUEUE_MESSAGE, with(json!({"text": "next", "holdForTurnEnd": true}))),
         (methods::BEGIN_QUEUED_MESSAGE_EDIT, with(json!({"id": "q1"}))),
         (methods::SEND_QUEUED_MESSAGE_NOW, with(json!({"id": "q1", "targetDeviceId": DEVICE}))),
-        (methods::RELAY_COMMAND, with(json!({"entry": {"payload": {"kind": "run"}}}))),
         (methods::STOP_WAITING, chat.clone()),
         (methods::UPLOAD_CHUNK, with(json!({"uploadId": "u", "seq": 0, "data": ""}))),
     ] {
@@ -575,6 +654,9 @@ async fn only_what_the_edge_relays_goes_to_a_sandbox_host() {
         (methods::UPDATE_STATUS, json!({})),
         (methods::UPLOAD_CHUNK, json!({"uploadId": "u", "seq": 0, "data": ""})),
         (methods::QUEUE_COMMAND, with(json!({"command": {"kind": "reset"}}))),
+        // Never a relayed command, typed or not (Crew main #231): the chat doc is
+        // a sandbox host's only road for one.
+        (methods::RELAY_COMMAND, with(json!({"entry": {"payload": {"kind": "run"}}}))),
         (methods::RELAY_COMMAND, with(json!({"entry": {"payload": {"kind": "reset"}}}))),
         (methods::WATCH_DOC_MESSAGES, json!({"chatId": "another-chat"})),
     ] {
@@ -584,6 +666,11 @@ async fn only_what_the_edge_relays_goes_to_a_sandbox_host() {
     // Not a sandbox host: as upstream.
     assert!(guard_scaffold_target(&workspace, "laptop-1", methods::LIST_HARNESSES, &json!({})).is_ok());
     assert!(guard_scaffold_target(&workspace, "cloud-abc", methods::OPEN_TERMINAL, &json!({})).is_ok());
+    // The command escort relays to no sandbox's host; any other host keeps the road.
+    assert!(!relay_admitted(&workspace, SESSION));
+    workspace.create_chat("laptop-chat", None, Some("laptop-1"), None, None).unwrap();
+    assert!(relay_admitted(&workspace, "laptop-chat"));
+    assert!(relay_admitted(&workspace, "no-such-chat"));
 }
 
 /// The engine's seams (rpc.rs): its Cloud RPCs are the adapter's, the Cloud

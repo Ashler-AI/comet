@@ -373,6 +373,9 @@ struct DocHostInner {
     /// Peer links (engine assembly, edge runtimes only) — the transport that
     /// pushes queued attachment bytes to a remote host.
     links: OnceLock<Arc<zeron_rpc::LinkCache>>,
+    /// Crew: a Scaffold desktop's sandboxes, which a send to a sandbox host
+    /// not connected wakes (`doc_host_delivery`, crew_cloud.rs).
+    crew_cloud: OnceLock<std::sync::Weak<crate::crew_cloud::CrewCloud>>,
     /// Shared client for sidecar blob PUT/GET (30s timeout, uploads.rs
     /// discipline — diff_sync's untimed client hung on dead links).
     http: reqwest::Client,
@@ -1393,6 +1396,7 @@ impl DocHost {
                 connectivity_grace: Mutex::new(DegradeGrace::default()),
                 executing: Mutex::new(HashSet::new()),
                 links: OnceLock::new(),
+                crew_cloud: OnceLock::new(),
                 http: reqwest::Client::builder()
                     .pool_max_idle_per_host(2)
                     .pool_idle_timeout(std::time::Duration::from_secs(10))
@@ -1742,6 +1746,23 @@ impl DocHost {
     /// transport for queued attachment transfers to a remote host.
     pub fn set_links(&self, links: Arc<zeron_rpc::LinkCache>) {
         let _ = self.inner.links.set(links);
+    }
+
+    /// Crew: wire a Scaffold desktop's sandboxes (engine assembly), which a
+    /// send to an unconnected sandbox host wakes.
+    pub fn set_crew_cloud(&self, crew: &Arc<crate::crew_cloud::CrewCloud>) {
+        let _ = self.inner.crew_cloud.set(Arc::downgrade(crew));
+    }
+
+    /// Crew: a send to `chat` found its host `target` not connected; if that
+    /// is a Scaffold sandbox's host, its sandbox is woken (crew_cloud.rs).
+    pub(crate) fn crew_wake(&self, chat: &str, target: &str) {
+        if !crate::crew_cloud::is_sandbox_host(target) {
+            return;
+        }
+        if let Some(crew) = self.inner.crew_cloud.get().and_then(std::sync::Weak::upgrade) {
+            crew.wake_for_send(chat);
+        }
     }
 
     /// Boot recovery has been through every chat it cut off, and each it means
@@ -5550,6 +5571,12 @@ impl DocHost {
             };
             if !transfers.is_empty() && !host.deliver_attachments(&chat, &transfers).await {
                 return; // gave up; the drain's wait cap surfaces the failure
+            }
+            // Crew: a sandbox's host takes no relayed command (Crew main #231,
+            // crew_cloud::relay_admitted). The doc is its only road, and the
+            // command's bytes have landed.
+            if host.workspace().is_some_and(|workspace| !crate::crew_cloud::relay_admitted(workspace, &chat)) {
+                return;
             }
             let mut wake = zeron_sync::wake::subscribe();
             let mut online = zeron_sync::wake::subscribe_online();

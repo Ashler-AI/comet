@@ -744,6 +744,8 @@ impl EngineCore {
     /// built), once.
     pub fn set_crew_cloud(&self, crew: Arc<crew_cloud::CrewCloud>) {
         if self.crew_cloud.set(crew.clone()).is_ok() {
+            // (A send to a sandbox host not connected wakes its sandbox.)
+            self.doc_host.set_crew_cloud(&crew);
             crew.start();
         }
     }

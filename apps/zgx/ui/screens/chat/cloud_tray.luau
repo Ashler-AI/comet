@@ -140,9 +140,10 @@ function M.bind(c: Bind): any
 				return logic.dismissed(put_away, s.chat, kind, level)
 			end,
 		})
-		-- Crew: a sandbox can't be restarted from here, so its alert offers
-		-- no Try again (its words say the way on: a new chat).
-		if a and a.action == "retry" and crew.sandbox_host(c.device()) then
+		-- Crew: a failed sandbox can't be restarted from here, so its alert
+		-- offers no Try again (its words say the way on: a new chat). A wake
+		-- that failed keeps its own: a paused sandbox resumes.
+		if a and a.kind == "failed" and a.action == "retry" and crew.sandbox_host(c.device()) then
 			a = table.clone(a)
 			a.action, a.action_label = nil, nil
 		end

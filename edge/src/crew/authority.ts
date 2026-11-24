@@ -213,11 +213,10 @@ export const scopedRpcAllowed = (kind: string, payload: Uint8Array, authority?: 
     if (value.method === "ApplyCrewAnnotation") return authority.capabilities.includes("session.annotate");
     if (QUEUE_METHODS.includes(value.method)) return authority.capabilities.includes("session.chat");
     if (["StopWaiting", "StopBackgroundTask"].includes(value.method)) return authority.capabilities.includes("session.control");
-    // The typed command itself (QueueCommand), or its relayed delivery when the
-    // chat's rows haven't reached the host yet (RelayCommand: the same entry,
-    // deduplicated by the host's command ledger).
-    const command = value.method === "QueueCommand" ? params.command
-      : value.method === "RelayCommand" ? params.entry?.payload : undefined;
+    // The typed command itself (QueueCommand). Never its relayed delivery
+    // (RelayCommand), as Crew's own Edge: a sandbox's commands go by its chat's
+    // rows alone, and the desktop's escort sends it none (Crew main #231).
+    const command = value.method === "QueueCommand" ? params.command : undefined;
     const capability = commandCapability(command?.kind);
     return capability !== undefined && authority.capabilities.includes(capability);
   } catch {

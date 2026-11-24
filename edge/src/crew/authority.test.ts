@@ -97,14 +97,17 @@ describe("scoped transport authority", () => {
       expect(scopedRpcAllowed("rpc", call(method, { taskId: "t" }), controller), method).toBe(true);
       expect(scopedRpcAllowed("rpc", call(method, { chatId: "other" }), controller), method).toBe(false);
     }
+    // Never a relayed command, typed or not, as Crew's own Edge (Crew main #231):
+    // a sandbox's commands go by its chat's rows alone.
     const relayed = (kind: string, chatId = "session-a") =>
       call("RelayCommand", { chatId, entry: { id: "c1", payload: { kind }, issuedBy: "desktop", issuedAt: 1, status: "pending" } });
-    expect(scopedRpcAllowed("rpc", relayed("run"), authority)).toBe(true);
-    expect(scopedRpcAllowed("rpc", relayed("interrupt"), authority)).toBe(false);
-    expect(scopedRpcAllowed("rpc", relayed("interrupt"), controller)).toBe(true);
-    expect(scopedRpcAllowed("rpc", relayed("run", "other"), controller)).toBe(false);
-    expect(scopedRpcAllowed("rpc", relayed("reset"), controller)).toBe(false);
+    for (const kind of ["run", "steer", "interrupt", "respondInput", "reset"]) {
+      expect(scopedRpcAllowed("rpc", relayed(kind), controller), kind).toBe(false);
+    }
     expect(scopedRpcAllowed("rpc", call("RelayCommand", {}), controller)).toBe(false);
+    // The typed command itself still goes.
+    expect(scopedRpcAllowed("rpc", call("QueueCommand", { command: { kind: "run" } }), authority)).toBe(true);
+    expect(scopedRpcAllowed("rpc", call("QueueCommand", { command: { kind: "interrupt" } }), controller)).toBe(true);
   });
   it("admits empty liveness probes without granting a data channel or extra capability", () => {
     const authority = requestAuthority(trustedRequest(req("/device/device-a/ws"), device))!;

@@ -195,6 +195,11 @@ async fn deliver(weak: std::sync::Weak<DocHostInner>, chat: &str) {
                 false
             }
             Ok(response) => {
+                // Crew: an unclaimed sandbox host is often a paused sandbox's:
+                // the send wakes it (Crew main #237, crew_cloud.rs).
+                if response.status().as_u16() == 404 {
+                    host.crew_wake(chat, &target);
+                }
                 tracing::debug!(%chat, device = %target, status = response.status().as_u16(), "remote host wake retrying");
                 false
             }

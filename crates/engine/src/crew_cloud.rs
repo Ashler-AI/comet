@@ -39,7 +39,7 @@ mod ledger;
 #[path = "crew_scaffold.rs"]
 pub(crate) mod scaffold;
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -69,6 +69,9 @@ const RECONCILE_STEP: Duration = Duration::from_secs(30);
 /// An attach waits for its sandbox's runtime as long as Platform says it's
 /// starting; this bounds it all the same.
 const ATTACH_DEADLINE: Duration = Duration::from_secs(10 * 60);
+/// How often sends may wake one sandbox: its offline host answers every
+/// nudge 404 while its resume and enrollment run.
+const WAKE_GAP: Duration = Duration::from_secs(30);
 
 fn refused(sentence: impl Into<String>) -> RpcError {
     RpcError::Failed(sentence.into())
@@ -176,6 +179,8 @@ struct Inner {
     gate: tokio::sync::Mutex<()>,
     /// Attaches running in this process, by command id.
     attaching: Mutex<HashSet<String>>,
+    /// When a send last woke each sandbox, by sandbox id (`WAKE_GAP`).
+    waking: Mutex<HashMap<String, std::time::Instant>>,
     stop: CancellationToken,
 }
 
@@ -241,6 +246,7 @@ impl CrewCloud {
                 ledger,
                 gate: tokio::sync::Mutex::new(()),
                 attaching: Mutex::new(HashSet::new()),
+                waking: Mutex::new(HashMap::new()),
                 stop: CancellationToken::new(),
             }),
         }
@@ -346,7 +352,15 @@ impl CrewCloud {
                 let default = RepoRef { name: DEFAULT_BRANCH.into(), current: true, worktree_path: None };
                 return Some(RpcReply::value(&[default]));
             }
-            methods::CLOUD_SESSION_WAKE => "Crew's sandboxes can't be woken from here yet.",
+            // Cloud's Wake (a sleeping machine's line, a wake that failed): the
+            // chat's sandbox resumed and its host attached, as a send does.
+            methods::CLOUD_SESSION_WAKE => {
+                let chat = params.get("chatId").and_then(Value::as_str).unwrap_or_default();
+                let woken = self.wake(chat).await.and_then(|environment| {
+                    cloud_session(&environment).ok_or_else(|| failed("The woken sandbox has no session."))
+                });
+                return Some(woken.and_then(|session| RpcReply::value(&session)));
+            }
             // (A failed sandbox's alert offers it: the way on, said again.)
             methods::CLOUD_SESSION_RETRY => "Crew's sandboxes can't be restarted from here yet. Start a new chat to try again.",
             methods::CLOUD_SESSION_SLEEP => "Crew's sandboxes can't be put to sleep from here yet.",
@@ -392,25 +406,95 @@ impl CrewCloud {
     async fn sessions(&self) -> Result<CloudSessions, RpcError> {
         let controller = self.controller()?;
         let environments = self.refresh(&controller).await?;
-        let sessions = environments
-            .iter()
-            .filter_map(|environment| {
-                let (sandbox, lifecycle, epoch) = environment.sandbox().ok()?;
-                Some(CloudSession {
-                    chat_id: environment.scope.session_id.clone()?,
-                    device_id: device_id_for(sandbox, epoch?),
-                    space_id: String::new(),
-                    repo: Some(scaffold::HOST_REPO.into()),
-                    path: Some(scaffold::HOST_CWD.into()),
-                    state: cloud_state(lifecycle),
-                    error: (lifecycle == Lifecycle::Failed).then(|| failed_words(environment.failure.as_deref())),
-                    created_at: environment.last_activity_at.unwrap_or_default(),
-                    last_active_at: environment.last_activity_at,
-                    ..CloudSession::default()
-                })
-            })
-            .collect();
+        let sessions = environments.iter().filter_map(cloud_session).collect();
         Ok(CloudSessions { sessions, available: true })
+    }
+
+    /// This adapter as an owned handle (its state is shared).
+    fn handle(&self) -> Arc<Self> {
+        Arc::new(Self { inner: self.inner.clone() })
+    }
+
+    /// The sandbox `chat`'s row publishes (its Crew metadata), if it is one.
+    fn published_environment(&self, chat: &str) -> Option<SessionEnvironment> {
+        let metadata = self.inner.workspace.crew_chat_metadata(chat)?;
+        serde_json::from_value::<Metadata>(metadata).ok()?.environment
+    }
+
+    /// A send to `chat` found its sandbox's host offline (a 404 nudge,
+    /// `doc_host_delivery`'s seam): wake it in the background, as Crew main's
+    /// send does (#237). A failed or stopped sandbox is left alone (its wake
+    /// settles), and a sandbox is woken at most once every `WAKE_GAP`.
+    pub(crate) fn wake_for_send(&self, chat: &str) {
+        let Some(environment) = self.published_environment(chat) else { return };
+        let Ok((sandbox, lifecycle, _)) = environment.sandbox() else { return };
+        if lifecycle.terminal() || !self.wake_due(sandbox) {
+            return;
+        }
+        let cloud = self.handle();
+        let chat = chat.to_owned();
+        tokio::spawn(async move {
+            if let Err(error) = cloud.wake(&chat).await {
+                tracing::warn!(%chat, %error, "crew: a send's sandbox wasn't woken");
+            }
+        });
+    }
+
+    /// Whether `sandbox` may be woken now (none in the last `WAKE_GAP`), and
+    /// that it is.
+    fn wake_due(&self, sandbox: &str) -> bool {
+        let mut waking = self.inner.waking.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let now = std::time::Instant::now();
+        if waking.get(sandbox).is_some_and(|at| now.duration_since(*at) < WAKE_GAP) {
+            return false;
+        }
+        waking.insert(sandbox.to_owned(), now);
+        true
+    }
+
+    /// Wake `chat`'s sandbox: a paused one is resumed (Crew main #237), its new
+    /// epoch's row published so a waiting send goes to that epoch's host, and
+    /// that host attached. Platform's harness enrolls a resumed session's Crew
+    /// itself (Ashler-AI/ashler-platform#16475): the Attach finds it and reuses
+    /// it. A running one is only attached; a failed or stopped one is refused
+    /// in its alert's words.
+    async fn wake(&self, chat: &str) -> Result<SessionEnvironment, RpcError> {
+        let controller = self.controller()?;
+        let published = self
+            .published_environment(chat)
+            .ok_or_else(|| refused("This chat isn't on a Crew sandbox."))?;
+        let sandbox = published.sandbox().map_err(failed)?.0.to_owned();
+        let cancellation = self.inner.stop.child_token();
+        let client = self.inner.hosts.client();
+        let current = client
+            .inspect(&sandbox, &published.scope, &cancellation)
+            .await
+            .map_err(|error| refused(words(&error, "Crew couldn't read the sandbox")))?;
+        self.verify(&controller, &current).map_err(failed)?;
+        let (_, lifecycle, epoch) = current.sandbox().map_err(failed)?;
+        if lifecycle.terminal() {
+            // (Its row learns it, and its waiting send's wake settles.)
+            let _ = self.publish(&controller, &current, None, None);
+            return Err(refused(failed_words(current.failure.as_deref())));
+        }
+        let current = if lifecycle == Lifecycle::Paused {
+            let resumed = client
+                .resume(&sandbox, &published.scope, &cancellation)
+                .await
+                .map_err(|error| refused(words(&error, "Crew couldn't resume the sandbox")))?;
+            self.verify(&controller, &resumed).map_err(failed)?;
+            let (resumed_id, _, resumed_epoch) = resumed.sandbox().map_err(failed)?;
+            if resumed_id != sandbox || resumed.owner_principal != current.owner_principal || resumed_epoch < epoch {
+                return Err(failed("The sandbox answered as another while it resumed."));
+            }
+            tracing::info!(%chat, %sandbox, epoch = ?resumed_epoch, "crew: a paused sandbox was resumed");
+            resumed
+        } else {
+            current
+        };
+        self.publish(&controller, &current, None, None)?;
+        self.handle().spawn_attach(current.clone(), None);
+        Ok(current)
     }
 
     /// `cloud_chat_host`, for a Cloud chat: its sandbox (created, or the one
@@ -873,6 +957,24 @@ fn outcome_result(outcome: Outcome) -> Result<SessionEnvironment, RpcError> {
     }
 }
 
+/// A sandbox as a Cloud session: its chat on its epoch's host. None for one
+/// without a session or an epoch.
+fn cloud_session(environment: &SessionEnvironment) -> Option<CloudSession> {
+    let (sandbox, lifecycle, epoch) = environment.sandbox().ok()?;
+    Some(CloudSession {
+        chat_id: environment.scope.session_id.clone()?,
+        device_id: device_id_for(sandbox, epoch?),
+        space_id: String::new(),
+        repo: Some(scaffold::HOST_REPO.into()),
+        path: Some(scaffold::HOST_CWD.into()),
+        state: cloud_state(lifecycle),
+        error: (lifecycle == Lifecycle::Failed).then(|| failed_words(environment.failure.as_deref())),
+        created_at: environment.last_activity_at.unwrap_or_default(),
+        last_active_at: environment.last_activity_at,
+        ..CloudSession::default()
+    })
+}
+
 /// A sandbox's lifecycle as a Cloud session's state.
 fn cloud_state(lifecycle: Lifecycle) -> CloudState {
     match lifecycle {
@@ -924,8 +1026,24 @@ pub(crate) fn guard_scaffold_target(workspace: &WorkspaceHost, target: &str, met
     Err(RpcError::Failed(format!("{method} is unavailable for this session-scoped Scaffold host")))
 }
 
+/// Crew main's `relay_admitted` (#231): whether the Edge relays a command
+/// (`RelayCommand`) to `chat`'s host. A sandbox's host takes only its list,
+/// which hasn't it: there a command's only road is the chat doc, as an Edge
+/// refusal would end the device link with every stream forwarded over it.
+/// Any other host keeps the relay.
+pub(crate) fn relay_admitted(workspace: &WorkspaceHost, chat: &str) -> bool {
+    match workspace.chat(chat) {
+        Ok(Some(row)) if is_sandbox_host(&row.device_id) => {
+            host_rpc_allowed(methods::RELAY_COMMAND, &json!({ "chatId": chat }), chat)
+        }
+        _ => true,
+    }
+}
+
 /// The Edge's list for a host's own session (its `session.*` capabilities
-/// being Crew's seven).
+/// being Crew's seven). Crew's own (`QueueCommand`'s typed kinds and the
+/// transcript, uploads and annotations), plus what zgx's queue and stop
+/// buttons send. Never `RelayCommand` (Crew main #231).
 fn host_rpc_allowed(method: &str, params: &Value, session_id: &str) -> bool {
     if params.get("chatId").and_then(Value::as_str) != Some(session_id) {
         return false;
@@ -955,7 +1073,6 @@ fn host_rpc_allowed(method: &str, params: &Value, session_id: &str) -> bool {
         | methods::STOP_WAITING
         | methods::STOP_BACKGROUND_TASK => true,
         methods::QUEUE_COMMAND => typed(kind(params.get("command"))),
-        methods::RELAY_COMMAND => typed(kind(params.get("entry").and_then(|entry| entry.get("payload")))),
         _ => false,
     }
 }
