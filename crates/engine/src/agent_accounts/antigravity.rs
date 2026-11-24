@@ -99,6 +99,7 @@ pub(super) async fn gateway_user_agent(harness: &zeron_harness::AcpHarness) -> R
     let _guard = AbortOnDrop(abort);
     let context = zeron_harness::RunContext {
         session_id: "antigravity-login-metadata".into(), ipc_port: 0, supervision_token: None, fork_from: None,
+        managed_state_root: None,
         inference: Some(zeron_harness::InferenceRoute { provider: "antigravity".into(),
             model: "gemini-3.8-flash-high".into(), base_url: format!("http://{address}"), token }),
     };

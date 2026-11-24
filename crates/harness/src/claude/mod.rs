@@ -422,7 +422,9 @@ impl ClaudeHarness {
         title_only: bool,
         context: Option<&crate::RunContext>,
     ) -> Result<Runtime, HarnessError> {
-        let mut child = Self::build_command(exe, request, title_only, context)
+        let mut cmd = Self::build_command(exe, request, title_only, context);
+        let managed_home = crate::apply_managed_home(HarnessId::ClaudeCode, &mut cmd, context)?;
+        let mut child = cmd
             .spawn()
             .map_err(|e| {
                 let cwd = (!request.cwd.is_empty()).then(|| std::path::Path::new(&request.cwd));
@@ -441,6 +443,7 @@ impl ClaudeHarness {
             tokio::spawn(read_stderr(stderr, stderr_tail.clone()));
         }
         Ok(Runtime {
+            managed_home,
             child,
             stdout_lines: crate::lossy_lines::lossy_lines(stdout),
             stdin: Stdin::new(
@@ -871,6 +874,7 @@ impl ClaudeHarness {
             None => Normalizer::new(),
         };
         let Runtime {
+            managed_home,
             child,
             stdout_lines,
             mut stdin,
@@ -906,6 +910,7 @@ impl ClaudeHarness {
             title_only,
             exe,
             launched: request.clone(),
+            managed_home,
             child,
             stdout_lines,
             first_command,
@@ -939,6 +944,7 @@ async fn read_stderr(stderr: impl tokio::io::AsyncRead + Unpin, tail: crate::Std
 
 /// One launched CLI process and its stdio.
 struct Runtime {
+    managed_home: Option<crate::ManagedHome>,
     child: Child,
     stdout_lines: crate::lossy_lines::LossyLines<crate::process::ChildStdout>,
     stdin: Stdin,
@@ -1103,6 +1109,7 @@ struct Session {
     /// session cannot be restored.
     exe: PathBuf,
     launched: RunRequest,
+    managed_home: Option<crate::ManagedHome>,
     child: Child,
     stdout_lines: crate::lossy_lines::LossyLines<crate::process::ChildStdout>,
     /// The uuid the opening prompt was written with.
@@ -1130,6 +1137,7 @@ async fn run_session(session: Session) {
         title_only,
         exe,
         launched,
+        managed_home: mut _managed_home,
         mut child,
         mut stdout_lines,
         first_command,
@@ -1241,6 +1249,7 @@ async fn run_session(session: Session) {
             fresh.resume = None;
             match ClaudeHarness::launch(&exe, &fresh, title_only, context.as_ref()) {
                 Ok(runtime) => {
+                    _managed_home = runtime.managed_home;
                     child = runtime.child;
                     stdout_lines = runtime.stdout_lines;
                     stdin = runtime.stdin;

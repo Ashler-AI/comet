@@ -153,6 +153,7 @@ mod tests {
             session_id: "session".into(),
             ipc_port: 1234,
             fork_from: None,
+            managed_state_root: None,
             supervision_token: Some("exact-run-capability".into()),
             inference: Some(InferenceRoute {
                 base_url: "http://127.0.0.1:9876".into(),

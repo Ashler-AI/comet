@@ -1839,7 +1839,7 @@ impl AcpHarness {
         context: Option<&crate::RunContext>,
     ) -> Result<
         (
-            Option<ScratchDir>,
+            LaunchGuards,
             Child,
             crate::StderrTail,
             CancellationToken,
@@ -1864,8 +1864,11 @@ impl AcpHarness {
         if let Some(cwd) = cwd.filter(|c| !c.is_empty()) {
             cmd.current_dir(cwd);
         }
+        let uses_managed_home = crate::uses_managed_home(self.spec.id, context);
         if self.spec.id == HarnessId::Antigravity {
-            cmd.env("GEMINI_HOME", antigravity_paths::home()?);
+            if !uses_managed_home {
+                cmd.env("GEMINI_HOME", antigravity_paths::home()?);
+            }
             match noop_browser() {
                 Ok(browser) => {
                     cmd.env("BROWSER", browser);
@@ -1877,26 +1880,14 @@ impl AcpHarness {
                 }
             }
         }
-        let scratch = if managed_antigravity {
-            Some(ScratchDir::new("antigravity-managed")?)
-        } else {
-            self.adapter_scratch()?
-        };
+        let scratch = self.adapter_scratch()?;
         if let Some(dir) = &scratch {
             dir.apply(&mut cmd);
         }
         crate::apply_run_env(&mut cmd, run_env);
-        if managed_antigravity {
-            let home = scratch
-                .as_ref()
-                .expect("managed Antigravity scratch")
-                .path()
-                .join("gemini");
-            std::fs::create_dir_all(home.join("antigravity-acp"))?;
-            cmd.env("GEMINI_HOME", home);
-        }
-        // Managed identity and credentials outrank host environment overlays.
+        // Managed identity, isolated home, and credentials outrank host environment overlays.
         crate::apply_run_context(&mut cmd, context);
+        let managed_home = crate::apply_managed_home(self.spec.id, &mut cmd, context)?;
         cmd.stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -1927,7 +1918,15 @@ impl AcpHarness {
                 tail.close();
             });
         }
-        Ok((scratch, child, stderr_tail, sign_in_prompted))
+        Ok((
+            LaunchGuards {
+                _scratch: scratch,
+                _managed_home: managed_home,
+            },
+            child,
+            stderr_tail,
+            sign_in_prompted,
+        ))
     }
 
     /// Short-lived discovery run for [`Harness::commands`]: initialize, scan
@@ -2552,7 +2551,7 @@ impl Harness for AcpHarness {
         controls: RunControls,
     ) -> Result<BoxStream<'static, Result<AgentEvent, HarnessError>>, HarnessError> {
         crate::validate_inference_route(self.id(), controls.context.as_ref())?;
-        let (scratch, mut child, stderr_tail, sign_in_prompted) = self
+        let (guards, mut child, stderr_tail, sign_in_prompted) = self
             .spawn_agent(
                 Some(&request.cwd),
                 true,
@@ -2607,7 +2606,7 @@ impl Harness for AcpHarness {
         };
         tokio::spawn(run_session(Session {
             child,
-            scratch,
+            guards,
             client,
             incoming,
             event_tx,
@@ -2653,9 +2652,14 @@ impl Harness for AcpHarness {
 // Session
 // ---------------------------------------------------------------------------
 
+struct LaunchGuards {
+    _scratch: Option<ScratchDir>,
+    _managed_home: Option<crate::ManagedHome>,
+}
+
 struct Session {
     child: Child,
-    scratch: Option<ScratchDir>,
+    guards: LaunchGuards,
     client: RpcClient,
     incoming: mpsc::Receiver<Incoming>,
     event_tx: mpsc::Sender<Result<AgentEvent, HarnessError>>,
@@ -4481,7 +4485,7 @@ async fn select_session_config(
 async fn run_session(session: Session) {
     let Session {
         // Locals drop in reverse binding order: reap the child before cleanup.
-        scratch: _scratch,
+        guards: _guards,
         mut child,
         client,
         mut incoming,

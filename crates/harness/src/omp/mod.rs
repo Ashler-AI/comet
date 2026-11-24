@@ -399,6 +399,7 @@ fn managed_google_model(model: &str) -> (&str, Option<&str>) {
 pub(crate) struct OmpRunConfig {
     path: PathBuf,
     gateway: Option<crate::scratch::ScratchDir>,
+    managed_home: Option<crate::ManagedHome>,
 }
 
 impl OmpRunConfig {
@@ -422,7 +423,11 @@ impl OmpRunConfig {
             let _ = std::fs::remove_file(&path);
             return Err(error.into());
         }
-        Ok(Self { path, gateway: None })
+        Ok(Self {
+            path,
+            gateway: None,
+            managed_home: None,
+        })
     }
 
     fn apply(&self, command: &mut Command, inherited: Option<&std::ffi::OsStr>) {
@@ -2512,6 +2517,8 @@ impl Harness for OmpHarness {
             std::env::var_os(PI_CONFIG_FILES_ENV).as_deref(),
         );
         crate::apply_run_context(&mut command, controls.context.as_ref());
+        run_config.managed_home =
+            crate::apply_managed_home(self.id(), &mut command, controls.context.as_ref())?;
         // OMP uses the run-owned gateway below, not the legacy globally loaded
         // extension that activates on this Codex-only token alias.
         command.env_remove("COMET_INFERENCE_TOKEN");
