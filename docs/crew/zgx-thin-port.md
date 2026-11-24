@@ -10,8 +10,21 @@ the daily-driver Crew Staging install, its profile, or the shared staging backen
   The port started from `94ae5b10812abb854704bc014c2bcebdec64eac9` (v0.3.4, 2026-11-13);
   the 241 commits since (v0.3.8, the GPUI app's removal in #1499) merged with 19
   conflicts, 18 hunks of them content.
-- Crew: `Ashler-AI/comet` `1932df84d` (0.2.151, 2026-11-17).
-- Branch: `crew/zgx-thin-port`, local, tracking no remote.
+- Crew: `Ashler-AI/comet` `888bd9447` (0.2.155, 2026-11-24). It was `1932df84d` (0.2.151)
+  until 2026-11-24. From the twelve commits between, Crew's sandbox behaviour is ported:
+  - #231: a command is never relayed to a sandbox's host;
+  - #237: a send to a paused sandbox resumes it.
+
+  Not ported:
+  - #233, client-side bandwidth fixes in upstream's own engine files (chat2 tail
+    uploads, diff sidecars) and in `crew_directory`, which the port hasn't;
+  - #234, Antigravity's computer use (no Antigravity here);
+  - #227, the app's name and link scheme, which the port has its own of;
+  - crew-web's #229 and #236, which a sandbox gets from the Linux archive, packaged from
+    `origin/main`'s `apps/web`.
+- Platform: the task branch `czhen/crew-zgx-harness` sits on `ashler-platform`
+  `master` (rebased 2026-11-24, from 2026-11-21's).
+- Branch: `crew/zgx-thin-port`, on `origin` (pushing it is approved).
 - Crew's last upstream import is `a0468502a` (v0.2.129+1, squashed by PR #152),
   not the git merge base v0.2.113. Compare each Crew file with that version, and
   audit dropped Crew lines with `scripts/audit-upstream-port.py` from the Crew
@@ -727,10 +740,11 @@ a fake Edge only; nothing has created a sandbox on staging yet.
   - Attachments to a sandbox host don't work yet: upstream's uploads and the doc host's
     attachment escort send no `chatId`, so the pre-filter refuses them (the escort's, sent
     straight on a link, the Edge refuses).
-  - Not here yet: titles for sandbox chats, a new epoch's Attach (its row is published; its
-    host comes from Platform's launch), resume/pause/stop, and changing a chat's model after
-    create (Platform binds the host's inference to the create's route). The machine tray
-    follows a sandbox's host since 2026-11-22 (below), in upstream's words.
+  - Not here yet: titles for sandbox chats, and changing a chat's model after create
+    (Platform binds the host's inference to the create's route). Since 2026-11-24 a send
+    resumes a paused sandbox ("Synced with Crew 0.2.155", below). Pause and stop controls,
+    and the Web and Tilt views, are left out on purpose. The machine tray follows a
+    sandbox's host since 2026-11-22 (below), in upstream's words.
 
 **Deployed: piece 4, and the exit gate (2026-11-21 and 22).** Everything is staging-only and
 owner-approved. Nothing changed in production, and Platform has no PR to `master`.
@@ -798,7 +812,131 @@ owner-approved. Nothing changed in production, and Platform has no PR to `master
     `lifecycleError`-like field for launch failures would let it say why.
   - Staging's shared harness, `scaffold-harness` (region `harness`), is on the session
     layout. It likely fails every start the same way: it shows no sessions in five days.
+    (Since fixed on Platform's side: #15851 puts the harness under `/opt/scaffold` in the
+    session image itself.)
   - Staging holds this testing's sandboxes: six failed, and `rcs_64af…` left running.
+
+**Synced with Crew 0.2.155 and Platform master (2026-11-24).** How Crew and Scaffold work
+together changed under the port:
+
+- **Platform enrolls Crew itself.** Every create and resume of a harness session carries
+  the Worker's device bootstrap, and the harness enrolls the session's native Crew with it
+  once the session is ready (Ashler-AI/ashler-platform#16475). It does what the desktop's
+  Attach does. The desktop's Attach still runs: its probe finds that host and reuses it.
+  Only without it does the desktop mint and launch one, and the native runner admits one
+  launch.
+- **Scaffold pauses sessions.** It pauses a Board agent's session when the agent ends, and
+  any session idle for 24 h (the Worker's idle sweep, staging and production). So a Cloud
+  chat whose sandbox is paused must come back on a send. Crew main does it in its
+  composer (#237).
+- **The port resumes on send, in the engine** (`crew_cloud::wake`):
+  - **Trigger:** a waiting send's nudge answered 404, meaning the host isn't connected
+    (a seam in `doc_host_delivery.rs`). The sandbox is woken at most once every 30 s.
+  - **Cloud's Wake** (a sleeping chat's line, or a wake that failed) does the same.
+  - **The wake:** a paused sandbox is resumed (`POST …/resume`, 5 minutes; Platform runs
+    one resume at a time). Its new epoch's chat row is published, so the waiting send goes
+    to that epoch's host. Then the host is attached.
+  - A failed or stopped sandbox stays ended, in its alert's words.
+  - Upstream's sleeping-machine line, "it wakes when you send", is now true of a Crew
+    sandbox.
+- **A sandbox's host takes no relayed command** (Crew main #231). The desktop's command
+  escort stops once the command's attachment bytes land (`crew_cloud::relay_admitted`),
+  and the chat doc is the only road. The pre-filter and this branch's Edge refuse
+  `RelayCommand` to a session-scoped host, as Crew's own Edge always has. zgx's queue and
+  stop calls keep going to the host.
+- **Found and fixed: a sandbox host blocked every checkpoint, so it could never pause.**
+  - From 2026-11-23 the idle sweep tried to pause `rcs_64af…` every 5 minutes (342
+    times by 11-24 21:00Z). Each try failed in the harness's save with "missing
+    session operation response".
+  - The harness reports any error of its session helper that way. It reads the helper's
+    stdout first, so the helper's stderr is lost.
+  - Run by hand inside the session, the helper's state archive (`crew-data.py`) refuses
+    `~/.codex/tmp/arg0-linux/*`. Those are Codex's dispatch links into
+    `/usr/local/lib/node_modules`, outside the snapshot roots.
+  - Codex laid them because upstream's harness update checker ran `codex --version` at
+    the host's start and every day after, to the second of the links' times.
+  - A host now starts no update checker (a seam in `lib.rs`, on
+    `profile.device_id_override()`). Platform installs a host's agents, and the host
+    refuses their updates already.
+  - `crew_sandbox_host.rs` puts fake `codex` and `claude` first on the host's PATH, with
+    a system-only PATH behind them, and asserts that neither runs. Without the gate the
+    host ran both within seconds.
+  - `rcs_64af…` keeps its links: it stays unpausable until it is stopped or its links
+    are removed.
+  - So does `rcs_c8dc…`, made on the old host the same day. Its save on the harness's
+    rollout failed, so the new pod holds it for a pause retry (`checkpointPending` in its
+    `state.json`) and starts nothing in it, by design: "never auto-restart during
+    capture". Platform still reports it ready, and the pod logs nothing for it, so its
+    chat's sends go unanswered. Worth raising with Platform: the control plane isn't told.
+- **Found and fixed: each send dropped the desktop's link to a sandbox's host.**
+  - The link came up, and 16 ms later the Edge answered `session_scope_denied`. A refused
+    frame ends the whole link, with every stream on it.
+  - The cause was the plugin system. It calls other devices over the link cache itself
+    (`SERVE_PLUGIN_CALL`, `SERVE_PLUGIN_AGENTS`, `PLUGIN_DELIVER`, `CHECK_PLUGIN_KEY`),
+    so it bypasses the pre-filter. The built-in `git` plugin's `turn_start` hook calls
+    the chat's host on each send; its refusal is in the app's log now.
+  - The plugin system now sends a `comet-scaffold-…` host nothing (`20402183f`: a check
+    at each of its five link calls, in `plugins/mod.rs`). A service call is refused here
+    (`no_service`, "… is a Crew sandbox: plugins don't run there"), a delivery reads
+    `not_installed`, and a broadcast skips the host. The pre-filter logs each call it lets
+    through to a sandbox host, and each it refuses, at debug.
+- **Found and fixed: a new Cloud chat's first send showed a script error.** The bug is
+  upstream's, from 2026-11-06, and still in its main (0.3.20).
+  - In `ds/transcript.luau`, the prompt's waiting line calls `turn_line`. That is a local
+    function made about a hundred lines below, so the call reads a global, nil:
+    `ds/transcript.luau:544: attempt to call a nil value`.
+  - It fires when the line has words to say in the working word's place, for example a
+    turn whose host hasn't said it runs within 15 s of its start. A sandbox's first boot
+    takes longer than that.
+  - Fixed by declaring `turn_line` above the waiting line (`7a6af26c9`, a seam in an
+    upstream file; upstream should take it). Test: `zgx test ui "Cloud machine: a prompt
+    whose machine went to sleep before its reply began"`, which fails without the fix with
+    staging's error.
+  - A quick zgx CLI for the UI tests: build its bin in the app's own workspace, which
+    reuses the app's build (50 s): `cargo build --manifest-path apps/zgx/Cargo.toml
+    --config apps/zgx/.cargo/config.toml -p zeron-zgx -p zgx-script --bin zeron-zgx
+    --bin zgx --target-dir target/zgx`, under `scripts/crew/clean-env` with
+    `CREW_FLAVOR=zgx-canary` and `ZIG` as `package-zgx-app` sets them. It is a debug
+    build, so the full suite takes about an hour, and it carries the app's `i18n`, so
+    `thousands archived …` fails on "2,037" (Status, slice 6).
+- **Verified on staging (2026-11-24):**
+  - Deployed: this branch's Edge (`crew-zgx-edge-staging-20261124-1`), and harness-zgx
+    revision 6. That revision's image is `…@sha256:f5900f55…`, with the Linux archive
+    `0.3.9-zgx.3` from `cd0522528`.
+  - The desktop: a debug canary of `20402183f`; for the second chat on, with the
+    transcript fix (`7a6af26c9`).
+  - Two new Cloud chats (`rcs_8b13…`, `rcs_8892…`) each answered their first prompt:
+    - In the harness's log, Platform enrolled each host (`crew_enrolled`), and the
+      sessions were ready in 15.8 s and 14.4 s. Each restore save and turn save
+      succeeded.
+    - Neither host's home has a Codex link.
+  - A 500-line reply streamed: `running` turned true about 6 s after the send, and Stop
+    showed.
+  - Stop on a running reply ended it within a second, its words so far kept.
+  - No link dropped. The pre-filter refused the composer's `ListRefs` and the GitHub
+    plugin's `WatchCheckoutChangeRequest` here, at debug.
+  - After the transcript fix, no script error on a new chat's first send.
+  - Once, 8 s after a new chat's first reply, the window went back to the chat open
+    before it. It didn't happen again.
+- **Not verified live: a send resuming a paused sandbox.** It needs a pausable sandbox
+  that has been paused, and the idle sweep pauses one only after 24 h without activity
+  (`lastActivityAt`: agent heartbeats and touches). Sandboxes from `0.3.9-zgx.3` save, so
+  the sweep should pause `rcs_8b13…` and `rcs_8892…` about a day after their last turn
+  (2026-11-25, from about 23:25Z). Then a send in their chats ("Reply with exactly the
+  word ZGXFRESH1/2…") is the live check. `a_send_to_a_paused_sandbox_resumes_it` covers
+  it against a fake Platform.
+- **Staging now holds** this testing's sandboxes: the six failed ones, `rcs_64af…` and
+  `rcs_c8dc…` (both unpausable, above), and `rcs_8b13…` and `rcs_8892…` (healthy).
+  The tag `crew-zgx-linux-0.3.9-zgx.2` names an archive whose build was cancelled.
+- **Left out on purpose:**
+  - Pause, stop and start controls: Scaffold owns the lifecycle, and a send resumes.
+  - The Web and Tilt views: Scaffold opens them on the session's runner, through the
+    Worker's attach route (#15858).
+- **Platform:** the task branch is rebased onto `master`. Its one conflict was staging's
+  regions in `wrangler.toml`, now `harness,harness-zgx` with `harness` the default, as on
+  `scaffold-staging`. Master now carries the harness tier itself: native Crew in harness
+  sessions (#15857), runner Web and Tilt (#15858), asynchronous pause (#15861), and the
+  harness under `/opt/scaffold` (#15851).
 
 Earlier notes:
 
@@ -1049,9 +1187,26 @@ Decided by the owner on 2026-11-20:
 - [x] 6. Scaffold: pieces 1 and 2 built and tested on this Mac, 2026-11-20 ("Scaffold
   sandboxes", "Built"); piece 3, the desktop, built and tested on this Mac against fakes,
   2026-11-21 ("Built: piece 3"); piece 4 deployed to staging and the exit gate passed there,
-  2026-11-22 ("Deployed: piece 4, and the exit gate"). Open: OpenAI routes'
-  `omp_inference_route_exhausted`, the reason for a launch refused before its runtime, and
-  resume.
+  2026-11-22 ("Deployed: piece 4, and the exit gate"); synced with Crew 0.2.155's sandbox
+  model and re-verified on staging, 2026-11-24 ("Synced with Crew 0.2.155"). Open: OpenAI
+  routes' `omp_inference_route_exhausted`, the reason for a launch refused before its
+  runtime, and a live check of resume on send.
+  - The sync, 2026-11-24 (Rust code as of `20402183f`):
+    - `cargo test -p zeron-engine --lib -- plugins::service crew_ doc_host::remote_delivery`:
+      117 passed, with `a_send_to_a_paused_sandbox_resumes_it` and
+      `a_crew_sandbox_host_is_sent_no_plugin_call`.
+    - `cargo test -p zeron --test crew_sandbox_host`: 3 passed. With the update checker's
+      gate taken out, its main test fails on the agent CLIs the host ran.
+    - zgx `cargo test --bin zeron-zgx -- crew`: 29 passed.
+    - Luau UI (`scripts/ci/test-zgx.sh ui`, with the CLI built in the app's workspace):
+      1,471 tests, 1 failed. The failure is `thousands archived: only the rows the page
+      shows are built, to the very last`. It expects "2037 sessions", but this CLI
+      carries the app's `i18n` feature, which writes "2,037"; with that text the test
+      passes. CI's CLI has no `i18n`.
+    - Edge: `src/crew/authority.test.ts` 49 passed; `npm run test:unit` 459 passed.
+    - Platform, on the rebased task branch: the Worker's suite 635 passed (`master` alone:
+      622 of 623); the Crew Edge, region and device tests 25 passed;
+      `build-crew-zgx-session-image.test.mjs` 3 passed.
   - The failed-sandbox fixes, 2026-11-22: `cargo test -p zeron-engine --lib -- crew_`: 77
     passed; `-- doc_host::remote_delivery`: 4 passed. zgx `cargo test --bin zeron-zgx --
     crew`: 29 passed; `-- crew sessions chat`: 180 passed, 2 ignored. Luau UI
