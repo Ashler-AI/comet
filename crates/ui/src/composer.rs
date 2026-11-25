@@ -14475,18 +14475,19 @@ mod tests {
         }
     }
 
-    // Failure modes: a send to a chat whose Scaffold sandbox paused only queues, and the message
-    // waits on a host nothing wakes ("Messages will send once the connection recovers", staging
-    // 2026-11-24); the resume replaces the send instead of preceding its queued delivery; a chat
-    // whose host is online, or whose sandbox failed, is resumed anyway; a refused resume is silent,
-    // so the person waits on a message that cannot send.
     #[gpui::test]
-    // A send to a paused Scaffold chat, against the ways it fails:
-    // R1 it goes to the paused epoch's host, which the relay refuses ("device is offline");
-    // R2 the draft is lost while the sandbox resumes, or when the resume fails;
-    // R3 it goes out before the resumed host is online;
-    // R4 leaving the chat mid-resume sends the held draft anyway.
-    fn send_to_a_paused_scaffold_chat_resumes_its_sandbox_then_sends(cx: &mut gpui::TestAppContext) {
+    // A send to a paused Scaffold chat. The chat is bound to the paused epoch's placeholder host:
+    // registered, never seen, and never claimed by any host (staging 2026-11-25). Failure modes:
+    // Q1 it goes to the placeholder, whose device room refuses it (403 "device room unreachable");
+    // Q2 the message stays in the composer until the sandbox resumes, so it reads as unsent and has
+    //    to be sent again, instead of leaving the composer and reading Queued in the transcript;
+    // Q3 it goes out before the resumed host is online, or to a resumed host Crew has not seen yet;
+    // Q4 leaving the chat while the sandbox resumes drops the queued message;
+    // Q5 the resume shows the unstyled "Connecting to host… Cancel" row;
+    // Q6 a refused resume loses the message instead of handing the draft back with the reason.
+    // Q7 a resume slower than the two-minute delivery grace turns the queued message Not delivered.
+    // A chat whose host is online, or whose sandbox failed, sends at once without a resume.
+    fn send_to_a_paused_scaffold_chat_queues_it_resumes_the_sandbox_then_delivers(cx: &mut gpui::TestAppContext) {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -14508,24 +14509,27 @@ mod tests {
                     "crew": {
                         "ownerSubject": "owner@example.com", "scope": scope, "sessionId": id,
                         "environment": {
-                            "source": { "kind": "scaffold", "sandbox_id": "rcs_x", "lifecycle": lifecycle, "lifecycle_epoch": 1 },
+                            "source": { "kind": "scaffold", "sandbox_id": "rcs_x", "lifecycle": lifecycle, "lifecycle_epoch": 2 },
                             "ownerPrincipal": "owner@example.com", "scope": scope,
                         },
                     },
                 })).unwrap()
             };
-            let device = |id: &str, last_seen: chrono::DateTime<chrono::Utc>| -> zeron_proto::Device {
+            let device = |id: &str, last_seen: Option<chrono::DateTime<chrono::Utc>>| -> zeron_proto::Device {
                 serde_json::from_value(serde_json::json!({
-                    "id": id, "name": "Scaffold", "platform": "linux", "version": "0.2.156", "lastSeenAt": last_seen,
+                    "id": id, "name": "Scaffold", "platform": "linux", "version": last_seen.map(|_| "0.2.157"), "lastSeenAt": last_seen,
                 })).unwrap()
             };
             state.update(cx, |state, _| {
                 state.local_device_id = Some("controller".into());
-                // The sandbox's host registered when it ran; a paused one stops heartbeating.
-                let last_seen = if case == "online" { chrono::Utc::now() } else { chrono::Utc::now() - chrono::Duration::minutes(30) };
-                state.devices = vec![device("comet-scaffold-rcs_x-e1", last_seen)];
-                let lifecycle = if case == "failed" { "failed" } else { "starting" };
-                state.chats = vec![chat("scaffold-chat", "comet-scaffold-rcs_x-e1", lifecycle), chat("other-chat", "controller", "starting")];
+                state.connectivity.state = zeron_proto::ConnectivityState::Connected;
+                // e1 ran the session and stopped heartbeating when it paused; e2 is the paused epoch's
+                // placeholder. An online case is still bound to its live host.
+                let ran = if case == "online" { chrono::Utc::now() } else { chrono::Utc::now() - chrono::Duration::minutes(30) };
+                state.devices = vec![device("comet-scaffold-rcs_x-e1", Some(ran)), device("comet-scaffold-rcs_x-e2", None)];
+                let host = if case == "online" { "comet-scaffold-rcs_x-e1" } else { "comet-scaffold-rcs_x-e2" };
+                let lifecycle = if case == "failed" { "failed" } else { "paused" };
+                state.chats = vec![chat("scaffold-chat", host, lifecycle), chat("other-chat", "controller", "ready")];
                 state.selected_chat = Some("scaffold-chat".into());
                 state.set_test_engine(crate::state::EngineHandle::from_test_client(zeron_rpc::RpcClient::new(out, inbound)));
             });
@@ -14537,8 +14541,8 @@ mod tests {
             cx.run_until_parked();
             composer.update(cx, |composer, cx| composer.on_submit(cx));
             let mut controls: Vec<zeron_rpc::ClientFrame> = Vec::new();
-            let mut commands = 0;
-            let mut pump = |cx: &mut gpui::TestAppContext, controls: &mut Vec<zeron_rpc::ClientFrame>, commands: &mut usize| {
+            let mut queued: Vec<serde_json::Value> = Vec::new();
+            let mut pump = |cx: &mut gpui::TestAppContext, controls: &mut Vec<zeron_rpc::ClientFrame>, queued: &mut Vec<serde_json::Value>| {
                 for _ in 0..6 {
                     runtime.block_on(async { tokio::task::yield_now().await });
                     cx.run_until_parked();
@@ -14546,15 +14550,13 @@ mod tests {
                         let frame: zeron_rpc::ClientFrame = serde_json::from_str(&frame).unwrap();
                         let reply = match frame.method.as_deref() {
                             Some(methods::QUEUE_COMMAND) => {
-                                *commands += 1;
+                                queued.push(frame.params.clone());
                                 serde_json::json!({ "commandId": "queued" })
                             }
+                            // The case answers the resume itself.
                             Some("scaffold.control") => {
-                                let refused = case == "refused";
                                 controls.push(frame.clone());
-                                // A resume in flight stays unanswered until the case answers it.
-                                if !refused { continue; }
-                                serde_json::json!({ "commandId": frame.params["commandId"], "status": "rejected", "error": "Scaffold refused the resume." })
+                                continue;
                             }
                             _ => continue,
                         };
@@ -14563,59 +14565,76 @@ mod tests {
                     }
                 }
             };
-            pump(cx, &mut controls, &mut commands);
-            let held = |cx: &mut gpui::TestAppContext| composer.read_with(cx, |composer, cx| {
+            pump(cx, &mut controls, &mut queued);
+            let composer_state = |cx: &mut gpui::TestAppContext| composer.read_with(cx, |composer, cx| {
                 (composer.input.read(cx).text().to_string(), composer.input.read(cx).read_only, composer.failure.clone().unwrap_or_default())
             });
             match case {
                 "online" | "failed" => {
                     assert!(controls.is_empty(), "{case}: nothing to resume");
-                    assert_eq!(commands, 1, "{case}: sent at once");
+                    assert_eq!(queued.len(), 1, "{case}: sent at once");
+                    assert_eq!(queued[0]["targetDeviceId"], state.read_with(cx, |state, _| state.chats[0].device_id.clone()).as_str());
                     continue;
                 }
                 _ => {}
             }
             assert_eq!(controls.len(), 1, "{case}: one resume for the send");
             assert_eq!(controls[0].params["control"], serde_json::json!({ "operation": "attach", "sandbox_id": "rcs_x", "scope": scope }));
-            assert_eq!(commands, 0, "{case}: nothing goes to the paused host (R1)");
-            if case == "refused" {
-                let (text, read_only, failure) = held(cx);
-                assert!(failure.contains("Scaffold refused the resume."), "{failure}");
-                assert_eq!((text.as_str(), read_only), (draft, false), "the draft comes back (R2)");
-                continue;
-            }
-            let (text, read_only, _) = held(cx);
-            assert_eq!((text.as_str(), read_only), (draft, true), "held while the sandbox resumes (R2)");
+            assert!(queued.is_empty(), "{case}: nothing goes to the placeholder host (Q1)");
+            let (text, read_only, failure) = composer_state(cx);
+            assert_eq!((text.as_str(), read_only, failure.as_str()), ("", false, ""), "{case}: the composer is free at once (Q2)");
+            let (echoes, reads_queued) = state.read_with(cx, |state, _| {
+                (state.pending_echoes().iter().map(|echo| echo.id.clone()).collect::<Vec<_>>(), state.send_queued("scaffold-chat", chrono::Utc::now()))
+            });
+            assert_eq!(echoes.len(), 1, "{case}: the message shows in the transcript (Q2)");
+            assert!(reads_queued, "{case}: and reads Queued while the sandbox resumes (Q2)");
+            assert!(composer.read_with(cx, |composer, _| composer.host_wake_task.is_none()
+                && composer.scaffold_resume.as_deref() == Some("scaffold-chat")), "{case}: one styled resume status (Q5)");
+            // A resume that has run for longer than the delivery grace still reads Queued.
+            state.update(cx, |state, _| state.begin_pending_send("scaffold-chat", &echoes[0], chrono::Utc::now() - chrono::Duration::seconds(200)));
+            assert!(state.read_with(cx, |state, _| state.send_undelivered("scaffold-chat", chrono::Utc::now())));
+            cx.executor().advance_clock(Duration::from_secs(31));
+            pump(cx, &mut controls, &mut queued);
+            assert!(state.read_with(cx, |state, _| !state.send_undelivered("scaffold-chat", chrono::Utc::now())
+                && state.send_queued("scaffold-chat", chrono::Utc::now())), "{case}: a slow resume keeps the message Queued (Q7)");
             if case == "switched" {
                 state.update(cx, |state, _| state.selected_chat = Some("other-chat".into()));
                 composer.update(cx, |composer, cx| composer.on_state_changed(cx));
             }
             let attach = controls.pop().unwrap();
-            let confirmed = zeron_rpc::ServerFrame {
-                id: attach.id,
-                ok: Some(serde_json::json!({ "commandId": attach.params["commandId"], "status": "confirmed" })),
-                ..Default::default()
+            let answer = if case == "refused" {
+                serde_json::json!({ "commandId": attach.params["commandId"], "status": "rejected", "error": "Scaffold refused the resume." })
+            } else {
+                serde_json::json!({ "commandId": attach.params["commandId"], "status": "confirmed" })
             };
-            replies.try_send(serde_json::to_string(&confirmed).unwrap()).unwrap();
-            pump(cx, &mut controls, &mut commands);
+            let answer = zeron_rpc::ServerFrame { id: attach.id, ok: Some(answer), ..Default::default() };
+            replies.try_send(serde_json::to_string(&answer).unwrap()).unwrap();
+            pump(cx, &mut controls, &mut queued);
             cx.executor().advance_clock(Duration::from_secs(2));
-            pump(cx, &mut controls, &mut commands);
-            if case == "switched" {
-                assert_eq!(commands, 0, "leaving the chat ends the wait (R4)");
-                assert!(composer.read_with(cx, |composer, _| composer.scaffold_resume.is_none() && composer.host_wake_task.is_none()));
+            pump(cx, &mut controls, &mut queued);
+            if case == "refused" {
+                let (text, read_only, failure) = composer_state(cx);
+                assert!(failure.contains("Scaffold refused the resume."), "{failure}");
+                assert_eq!((text.as_str(), read_only), (draft, false), "the draft comes back (Q6)");
+                assert!(state.read_with(cx, |state, _| state.pending_echoes().is_empty()), "and leaves the transcript (Q6)");
+                assert!(queued.is_empty() && composer.read_with(cx, |composer, _| composer.scaffold_resume.is_none()));
                 continue;
             }
-            assert_eq!(commands, 0, "resumed but its host is not online yet (R3)");
-            // Scaffold rebinds the chat to the resumed epoch's host, which then comes online.
-            state.update(cx, |state, _| {
-                state.chats[0].device_id = "comet-scaffold-rcs_x-e2".into();
-                state.devices.push(device("comet-scaffold-rcs_x-e2", chrono::Utc::now()));
-            });
+            assert!(queued.is_empty(), "{case}: resumed, but the chat is still on the placeholder (Q3)");
+            // Scaffold rebinds the chat to the resumed epoch's host before Crew has seen that host.
+            state.update(cx, |state, _| state.chats[0].device_id = "comet-scaffold-rcs_x-e3".into());
             cx.executor().advance_clock(Duration::from_secs(2));
-            pump(cx, &mut controls, &mut commands);
-            assert_eq!(commands, 1, "sent once the resumed host is online");
-            let (_, read_only, failure) = held(cx);
-            assert!(!read_only && failure.is_empty(), "{failure}");
+            pump(cx, &mut controls, &mut queued);
+            assert!(queued.is_empty(), "{case}: a resumed host Crew has not seen is not online (Q3)");
+            state.update(cx, |state, _| state.devices.push(device("comet-scaffold-rcs_x-e3", Some(chrono::Utc::now()))));
+            cx.executor().advance_clock(Duration::from_secs(2));
+            pump(cx, &mut controls, &mut queued);
+            assert_eq!(queued.len(), 1, "{case}: delivered once the resumed host is online (Q3, Q4)");
+            assert_eq!((queued[0]["chatId"].as_str(), queued[0]["targetDeviceId"].as_str()),
+                (Some("scaffold-chat"), Some("comet-scaffold-rcs_x-e3")), "{case}: to the resumed host");
+            assert!(controls.is_empty(), "{case}: one resume only");
+            let (_, _, failure) = composer_state(cx);
+            assert!(failure.is_empty() && composer.read_with(cx, |composer, _| composer.scaffold_resume.is_none()), "{failure}");
         }
     }
 
