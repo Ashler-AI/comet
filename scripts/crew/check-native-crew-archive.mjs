@@ -40,6 +40,18 @@ const assets = ["comet", "crew-web-contract.json", "crew-web/contract.json", "cr
   "crew-web/rpc.mjs", "crew-web/package.json", "crew-web/public/index.html", "crew-web/public/app.js",
   "crew-web/public/style.css"];
 
+// The files crew-web's contract lists (`assets`), each a plain relative path.
+export function contractAssets(contract) {
+  const listed = contract?.assets;
+  if (!Array.isArray(listed) || listed.length === 0) throw new Error("Crew web contract lists no assets");
+  for (const name of listed) {
+    if (typeof name !== "string" || name === "" || name.startsWith("/") || name.split("/").some((part) => part === "" || part === "." || part === "..")) {
+      throw new Error(`Crew web contract lists an unsafe asset: ${JSON.stringify(name)}`);
+    }
+  }
+  return listed;
+}
+
 export async function sha256File(path) {
   const digest = createHash("sha256");
   for await (const chunk of createReadStream(path)) digest.update(chunk);
@@ -105,6 +117,13 @@ export async function checkArchive(archive, version, sha256, { exec = true } = {
         contract.packageDirectory !== "crew-web" || contract.entrypoint !== "web/server.mjs" ||
         contract.ipc?.host !== "127.0.0.1" || contract.ipc?.port !== 39400 || contract.ipc?.transport !== "websocket-json") {
       throw new Error("Crew release does not implement the native web contract");
+    }
+    // Beyond what the installer asks for: every file the contract itself lists.
+    // crew-web's page imports some (`public/transcript.js`), and Scaffold's
+    // paused view imports `detached.mjs`: one left out loads nothing.
+    for (const name of contractAssets(contract)) {
+      const metadata = await lstat(join(stage, "crew-web", name)).catch(() => null);
+      if (!metadata?.isFile() || metadata.size === 0) throw new Error(`Crew archive is missing crew-web/${name}, which its contract lists`);
     }
     await mkdir(join(stage, "bin"), { mode: 0o700 });
     await rename(join(stage, "comet"), join(stage, "bin/comet"));

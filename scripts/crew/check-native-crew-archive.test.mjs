@@ -12,10 +12,15 @@ import { checkArchive, checkManifest, sha256File } from "./check-native-crew-arc
 
 const version = "0.3.9-zgx.1";
 const prefix = `comet-${version}-linux-x86_64`;
+// (Crew main's `assets` as of 0.2.157: the page's transcript.js and the
+// paused view's detached.mjs among them.)
+const webAssets = ["server.mjs", "rpc.mjs", "detached.mjs", "package.json", "contract.json", "public/app.js",
+  "public/transcript.js", "public/index.html", "public/style.css"];
 const contract = {
   version: "crew.native.web.v1", crewSyncGeneration: "chat2", entrypoint: "web/server.mjs",
   packageDirectory: "crew-web", installDirectory: ".scaffold/crew/web", dataDirectory: ".scaffold/crew-data",
   ipc: { host: "127.0.0.1", port: 39400, transport: "websocket-json" },
+  assets: webAssets,
 };
 const helpOnly = "#!/bin/sh\ncase \"$*\" in \"--help\"|\"headless --help\") echo usage; exit 0 ;; *) exit 64 ;; esac\n";
 
@@ -25,7 +30,7 @@ function build(change = () => {}, { name = `${prefix}.tar.gz` } = {}) {
   const root = join(dir, "stage", prefix);
   mkdirSync(join(root, "crew-web/public"), { recursive: true });
   writeFileSync(join(root, "comet"), helpOnly, { mode: 0o755 });
-  for (const asset of ["server.mjs", "rpc.mjs", "package.json", "public/index.html", "public/app.js", "public/style.css"]) {
+  for (const asset of webAssets.filter((name) => name !== "contract.json")) {
     writeFileSync(join(root, "crew-web", asset), `// ${asset}\n`);
   }
   const text = `${JSON.stringify(contract, null, 2)}\n`;
@@ -75,6 +80,23 @@ test("every browser asset, both contracts alike, and the native contract", async
       writeFileSync(join(root, "crew-web/contract.json"), text);
       writeFileSync(join(root, "crew-web-contract.json"), text);
     }), /native web contract/);
+  }
+});
+
+// The archive of 2026-11-25 shipped crew-web's app.js, which imports
+// transcript.js, without it, and no detached.mjs for Scaffold's paused view.
+test("every file the contract lists, and only plain relative names", async () => {
+  await assert.rejects(check((root) => rmSync(join(root, "crew-web/public/transcript.js"))),
+    /missing crew-web\/public\/transcript.js, which its contract lists/);
+  await assert.rejects(check((root) => rmSync(join(root, "crew-web/detached.mjs"))),
+    /missing crew-web\/detached.mjs, which its contract lists/);
+  for (const [assets, why] of [[undefined, /lists no assets/], [[], /lists no assets/], [["../comet"], /unsafe asset/],
+    [["/etc/passwd"], /unsafe asset/], [["public//app.js"], /unsafe asset/]]) {
+    const text = JSON.stringify({ ...contract, assets });
+    await assert.rejects(check((root) => {
+      writeFileSync(join(root, "crew-web/contract.json"), text);
+      writeFileSync(join(root, "crew-web-contract.json"), text);
+    }), why);
   }
 });
 

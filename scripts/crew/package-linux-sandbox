@@ -6,8 +6,8 @@
 #   <out>/comet-<version>-linux-x86_64.tar.gz
 #     comet-<version>-linux-x86_64/
 #       comet                    this branch's `zeron`, the engine linked in
-#       crew-web/                Crew main's apps/web: contract.json, server.mjs,
-#                                rpc.mjs, package.json, public/{index.html,app.js,style.css}
+#       crew-web/                Crew main's apps/web: exactly the files its
+#                                contract.json lists (`assets`)
 #       crew-web-contract.json   crew-web/contract.json again (crew.native.web.v1)
 #   <out>/scaffold-manifest.json
 #     {schemaVersion: 2, releaseSurface: "scaffold",
@@ -84,10 +84,23 @@ git -C "$root" archive "$web_commit" apps/web | tar -x -C "$web"
 stage="$stage_root/$name"
 mkdir -p "$stage/crew-web/public"
 install -m 755 "$binary" "$stage/comet"
-for asset in server.mjs rpc.mjs package.json contract.json public/index.html public/app.js public/style.css; do
-  [[ -s "$web/apps/web/$asset" ]] || die "$web_ref has no apps/web/$asset"
+# Exactly the files crew-web's contract lists: its page imports some
+# (public/transcript.js), and Scaffold's paused view imports detached.mjs, so a
+# list of our own goes stale the day Crew adds one (2026-11-25: both missing).
+# (The contract first: the checker runs as a script when it's argv[1].)
+web_assets="$(node --input-type=module -e '
+  const [contractPath, checker] = process.argv.slice(1);
+  const { pathToFileURL } = await import("node:url");
+  const { readFileSync } = await import("node:fs");
+  const { contractAssets } = await import(pathToFileURL(checker).href);
+  for (const name of contractAssets(JSON.parse(readFileSync(contractPath, "utf8")))) console.log(name);
+' "$web/apps/web/contract.json" "$root/scripts/crew/check-native-crew-archive.mjs")" \
+  || die "$web_ref's apps/web/contract.json lists no usable assets"
+while IFS= read -r asset; do
+  [[ -s "$web/apps/web/$asset" ]] || die "$web_ref has no apps/web/$asset, which its contract lists"
+  mkdir -p "$(dirname "$stage/crew-web/$asset")"
   install -m 644 "$web/apps/web/$asset" "$stage/crew-web/$asset"
-done
+done <<< "$web_assets"
 install -m 644 "$stage/crew-web/contract.json" "$stage/crew-web-contract.json"
 
 mkdir -p "$out"
