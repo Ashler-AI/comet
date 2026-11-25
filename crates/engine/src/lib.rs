@@ -718,6 +718,21 @@ impl EngineRuntime {
         self.disconnect_edge();
         self.core.shutdown().await;
     }
+
+    /// `shutdown` for a host stopped on purpose (signal, IPC stop): each hosted
+    /// chat2 room's final tail sidecar goes out first, so a paused Scaffold
+    /// sandbox still shows how its last turn ended. Not for sign-out, whose
+    /// credentials are already revoked.
+    pub async fn shutdown_publishing_tails(&self, limit: std::time::Duration) {
+        // Capture the hosted rooms while their clients exist, then start
+        // nothing new while the tails go out: no queued row, no relay RPC, no
+        // room row. The revocation is the same one `shutdown` begins with.
+        let tails = self.core.doc_host.final_tails();
+        self.core.doc_host.pause_all_queues();
+        self.disconnect_edge();
+        self.core.doc_host.publish_final_tails(tails, limit).await;
+        self.core.shutdown().await;
+    }
 }
 
 impl Drop for EngineRuntime {
@@ -1170,12 +1185,16 @@ impl Engine {
             .sessions
             .set_ipc_token_file(zeron_rpc::ipc_auth::token_path(&config.data_dir));
 
-        tokio::select! {
-            result = &mut shutdown => result?,
+        let signed_out = tokio::select! {
+            result = &mut shutdown => {
+                result?;
+                false
+            }
             requested = stop_rx.recv() => {
                 if requested.is_some() {
                     tracing::info!("headless shutdown requested over IPC");
                 }
+                false
             }
             _ = wait_for_signed_out(&mut auth_state), if workspace_scope == WorkspaceScope::Synced => {
                 // Edge transports observe the same auth signal and close at
@@ -1184,11 +1203,20 @@ impl Engine {
                 runtime.disconnect_edge();
                 tracing::info!("headless authentication revoked; stopping synced runtime");
                 tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                true
             }
-        }
+        };
         tracing::info!("shutting down");
         server.abort();
-        runtime.shutdown().await;
+        if signed_out {
+            runtime.shutdown().await;
+        } else {
+            // A Scaffold pause stops this host with SIGTERM; the sandbox's
+            // agent view then reads the transcript from the tail alone.
+            runtime
+                .shutdown_publishing_tails(FINAL_TAIL_PUBLISH_LIMIT)
+                .await;
+        }
         Ok(())
     }
 }
@@ -1209,6 +1237,11 @@ async fn wait_for_signed_out(state: &mut tokio::sync::watch::Receiver<AuthState>
         }
     }
 }
+
+/// How long a deliberate headless stop may spend publishing final tails. The
+/// Scaffold harness waits up to 30 s for Crew's clean exit before refusing a
+/// checkpoint, so this stays well inside it.
+const FINAL_TAIL_PUBLISH_LIMIT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Ctrl-C or SIGTERM. systemd/launchd stop (and the auto-updater's service
 /// restart) deliver SIGTERM — without catching it the daemon dies mid-write
