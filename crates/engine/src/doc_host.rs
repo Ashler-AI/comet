@@ -728,13 +728,96 @@ struct TailPublishState {
     in_flight: bool,
     last_vv: Option<Vec<u8>>,
     last_published_at: Option<std::time::Instant>,
+    /// Woken when an in-flight publish ends: a final publish waits for it
+    /// rather than racing an older transcript's PUT to the same key.
+    settled: Arc<tokio::sync::Notify>,
 }
 
 struct TailInFlightGuard(Arc<Mutex<TailPublishState>>);
 impl Drop for TailInFlightGuard {
     fn drop(&mut self) {
-        lock(&self.0).in_flight = false;
+        let settled = {
+            let mut state = lock(&self.0);
+            state.in_flight = false;
+            state.settled.clone()
+        };
+        settled.notify_waiters();
     }
+}
+
+/// Hosted chat2 rooms whose tail sidecar may be stale at a graceful stop,
+/// captured while their room clients still exist (see
+/// [`DocHost::final_tails`]).
+pub struct FinalTails(Vec<Arc<ChatDocHandle>>);
+
+/// One `PUT /chat2/{chat}/tail`: materialize the last-64 joined messages off
+/// the network workers, enforce Edge's sidecar budget, send, and record what
+/// was published. `oplog_vv` is the version the caller read before
+/// materializing; recording it (never a later one) keeps a change that lands
+/// mid-publish due for the next pass. Returns whether Edge accepted the tail.
+async fn put_tail(
+    doc: &Arc<SessionDoc>,
+    http: &reqwest::Client,
+    edge: &EdgeConfig,
+    chat: &str,
+    tail_state: &Mutex<TailPublishState>,
+    oplog_vv: &[u8],
+    priority: zeron_sync::budget::Priority,
+) -> bool {
+    // A whale's last 64 joined messages can still contain its entire
+    // history. Materialization/encoding must not occupy a network worker.
+    let doc_for_tail = doc.clone();
+    let body = tokio::task::spawn_blocking(move || {
+        let tail =
+            zeron_doc::materialize_tail(&doc_for_tail, now_ms(), zeron_doc::TAIL_MESSAGE_COUNT)
+                .ok()?;
+        serde_json::to_vec(&tail).ok()
+    })
+    .await
+    .ok()
+    .flatten();
+    let Some(body) = body else {
+        return false;
+    };
+    if body.len() > MAX_TAIL_SIDECAR_BYTES {
+        tracing::debug!(
+            chat = %chat,
+            bytes = body.len(),
+            limit = MAX_TAIL_SIDECAR_BYTES,
+            "chat2: skipping oversized tail sidecar upload"
+        );
+        let mut state = lock(tail_state);
+        state.last_vv = Some(oplog_vv.to_vec());
+        state.last_published_at = Some(std::time::Instant::now());
+        return false;
+    }
+    let Ok(bearer) = edge.bearer().await else {
+        return false;
+    };
+    let url = format!("{}/chat2/{}/tail", edge.url.trim_end_matches('/'), chat);
+    let Ok(_permit) = zeron_sync::budget::shared().http(priority).await else {
+        return false;
+    };
+    let result = edge
+        .send(
+            http.put(&url)
+                .header("content-type", "application/json")
+                .body(body),
+            &bearer,
+        )
+        .await;
+    let now = std::time::Instant::now();
+    let succeeded = matches!(result, Ok(ref res) if res.status().is_success());
+    let too_large = matches!(
+        result,
+        Ok(ref res) if res.status() == reqwest::StatusCode::PAYLOAD_TOO_LARGE
+    );
+    let mut state = lock(tail_state);
+    state.last_published_at = Some(now);
+    if succeeded || too_large {
+        state.last_vv = Some(oplog_vv.to_vec());
+    }
+    succeeded
 }
 
 /// Whether a chat2 room's row log warrants a threshold checkpoint upload.
@@ -2985,8 +3068,6 @@ impl DocHost {
             due
         };
         if should_publish_tail {
-            // A whale's last 64 joined messages can still contain its entire
-            // history. Materialization/encoding must not occupy a network worker.
             let doc = handle.doc.clone();
             let writers = handle.writers.clone();
             let http = self.inner.http.clone();
@@ -2997,70 +3078,17 @@ impl DocHost {
                 let _in_flight = TailInFlightGuard(tail_state.clone());
                 let mut oplog_vv = oplog_vv;
                 loop {
-                    let doc_for_tail = doc.clone();
-                    let body = tokio::task::spawn_blocking(move || {
-                        let tail = zeron_doc::materialize_tail(
-                            &doc_for_tail,
-                            now_ms(),
-                            zeron_doc::TAIL_MESSAGE_COUNT,
-                        )
-                        .ok()?;
-                        serde_json::to_vec(&tail).ok()
-                    })
-                    .await
-                    .ok()
-                    .flatten();
-                    let Some(body) = body else {
-                        return;
-                    };
-                    if body.len() > MAX_TAIL_SIDECAR_BYTES {
-                        tracing::debug!(
-                            chat = %chat,
-                            bytes = body.len(),
-                            limit = MAX_TAIL_SIDECAR_BYTES,
-                            "chat2: skipping oversized tail sidecar upload"
-                        );
-                        let mut state = lock(&tail_state);
-                        state.last_vv = Some(oplog_vv);
-                        state.last_published_at = Some(std::time::Instant::now());
-                        return;
-                    }
-                    let Ok(bearer) = edge_tail.bearer().await else {
-                        return;
-                    };
-                    let url = format!(
-                        "{}/chat2/{}/tail",
-                        edge_tail.url.trim_end_matches('/'),
-                        chat
-                    );
-                    let Ok(_permit) = zeron_sync::budget::shared()
-                        .http(zeron_sync::budget::Priority::Background)
-                        .await
-                    else {
-                        return;
-                    };
-                    let result = edge_tail
-                        .send(
-                            http.put(&url)
-                                .header("content-type", "application/json")
-                                .body(body),
-                            &bearer,
-                        )
-                        .await;
-                    let now = std::time::Instant::now();
-                    let succeeded = matches!(result, Ok(ref res) if res.status().is_success());
-                    let too_large = matches!(
-                        result,
-                        Ok(ref res) if res.status() == reqwest::StatusCode::PAYLOAD_TOO_LARGE
-                    );
-                    {
-                        let mut state = lock(&tail_state);
-                        state.last_published_at = Some(now);
-                        if succeeded || too_large {
-                            state.last_vv = Some(oplog_vv.clone());
-                        }
-                    }
-                    if !succeeded || writers.load(Ordering::Acquire) > 0 {
+                    let published = put_tail(
+                        &doc,
+                        &http,
+                        &edge_tail,
+                        &chat,
+                        &tail_state,
+                        &oplog_vv,
+                        zeron_sync::budget::Priority::Background,
+                    )
+                    .await;
+                    if !published || writers.load(Ordering::Acquire) > 0 {
                         return;
                     }
                     let next_vv = doc.doc().oplog_vv().encode();
@@ -3076,6 +3104,98 @@ impl DocHost {
             return;
         }
         self.spawn_chat2_checkpoint(handle, "threshold");
+    }
+
+    /// The rooms a graceful stop must publish a final tail for: chat2 rooms
+    /// this engine hosts and has joined (the same set `chat2_maintenance`
+    /// serves). Take it before `disconnect_edge` drops the room clients;
+    /// whether each tail is stale is decided at publish time.
+    pub fn final_tails(&self) -> FinalTails {
+        if self.inner.config.edge.is_none() || self.inner.edge_disconnected.load(Ordering::Acquire) {
+            return FinalTails(Vec::new());
+        }
+        let handles: Vec<_> = lock(&self.inner.handles).values().cloned().collect();
+        FinalTails(
+            handles
+                .into_iter()
+                .filter(|handle| {
+                    !handle.retired.load(Ordering::Relaxed)
+                        && self.is_host(&handle.chat_id)
+                        && lock(&handle.chat2).is_some()
+                })
+                .collect(),
+        )
+    }
+
+    /// Publish each captured room's tail once, now, when its transcript has
+    /// changed since the last publish, bounded by `limit`. Thin readers read a
+    /// stopped host's transcript only from this sidecar: Scaffold's agent view
+    /// of a paused sandbox, and iOS. The periodic duty publishes at most every
+    /// 30 s while a run writes and only re-checks on a doc change, so a turn
+    /// that ends just before a stop never reached it (staging test 14,
+    /// 2026-11-24: its tail stopped mid-turn, without the final tool call and
+    /// answer). Best effort: a slow or unreachable Edge costs at most `limit`.
+    pub async fn publish_final_tails(&self, tails: FinalTails, limit: std::time::Duration) {
+        let Some(edge) = self.inner.config.edge.clone() else {
+            return;
+        };
+        let candidates = tails.0.len();
+        if candidates == 0 {
+            return;
+        }
+        let started = std::time::Instant::now();
+        let publishes = tails
+            .0
+            .into_iter()
+            .map(|handle| self.publish_final_tail(handle, edge.clone()));
+        match tokio::time::timeout(limit, futures::future::join_all(publishes)).await {
+            Ok(published) => tracing::info!(
+                candidates,
+                published = published.into_iter().filter(|published| *published).count(),
+                elapsed_ms = started.elapsed().as_millis() as u64,
+                "chat2: final tails published before stopping"
+            ),
+            Err(_) => tracing::warn!(
+                candidates,
+                limit_ms = limit.as_millis() as u64,
+                "chat2: final tail publish timed out; stopping without it"
+            ),
+        }
+    }
+
+    async fn publish_final_tail(&self, handle: Arc<ChatDocHandle>, edge: EdgeConfig) -> bool {
+        // A periodic publish still in flight could land an older transcript
+        // after this one: wait for it to settle, then decide.
+        let oplog_vv = loop {
+            let settled = lock(&handle.tail_publish).settled.clone();
+            let notified = settled.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            {
+                let mut state = lock(&handle.tail_publish);
+                if !state.in_flight {
+                    let oplog_vv = handle.doc.doc().oplog_vv().encode();
+                    if state.last_vv.as_deref() == Some(oplog_vv.as_slice()) {
+                        return false;
+                    }
+                    state.in_flight = true;
+                    break oplog_vv;
+                }
+            }
+            notified.await;
+        };
+        // Released on every exit, including the caller's timeout dropping us.
+        let _in_flight = TailInFlightGuard(handle.tail_publish.clone());
+        put_tail(
+            &handle.doc,
+            &self.inner.http,
+            &edge,
+            &handle.chat_id,
+            &handle.tail_publish,
+            &oplog_vv,
+            zeron_sync::budget::Priority::Interactive,
+        )
+        .await
     }
 
     /// Native profile migration: seed a never-opened stored document's chat2 room
