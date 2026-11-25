@@ -6,7 +6,9 @@ the daily-driver Crew Staging install, its profile, or the shared staging backen
 
 ## Pins
 
-- Upstream: `zeronsh/zeron` `e393c4a84` (main, 2026-11-19), merged in as `a3dad815f`.
+- Upstream: `zeronsh/zeron` `fbb4083a4` (main, 2026-11-24, after 0.3.20), merged in as
+  `e2f795b28` and `b1ebb2133` on 2026-11-25 ("Merged upstream 0.3.20", below). It was
+  `e393c4a84` (2026-11-19, merged in as `a3dad815f`) until then.
   The port started from `94ae5b10812abb854704bc014c2bcebdec64eac9` (v0.3.4, 2026-11-13);
   the 241 commits since (v0.3.8, the GPUI app's removal in #1499) merged with 19
   conflicts, 18 hunks of them content.
@@ -947,6 +949,104 @@ Earlier notes:
 - **Main risk:** sandboxes run Platform's pinned `comet headless` runtime (`scaffold.comet-runtime.v2`).
   A v0.3.4 desktop needs a v0.3.4-based runtime archive that Platform admits.
 - Create sends no idempotency key, so a lost response must be reconciled by session id and never re-created.
+
+### Upstream merges
+
+**Merged upstream 0.3.20 (2026-11-25).** `e393c4a84..fbb4083a4`: 81 commits, Zeron 0.3.10
+to 0.3.20 and two after, in two merges. `e2f795b28` had eight conflicts and `b1ebb2133`
+none.
+
+- **The unified Antigravity CLI** (#1577, upstream's 2026-11-23):
+  - Google's unified `antigravity` CLI replaces the standalone `agy_acp_server`. Zeron
+    pins 1.5.15 (`antigravity_archive()` in `crates/harness/src/acp/mod.rs`, a SHA-512
+    per target, eight targets). It keeps the legacy 1.5.0 pin trusted, so an old install
+    launches until it updates.
+  - It runs as `antigravity acp --disable-telemetry --gemini-dir <home> --app-data-dir
+    antigravity-acp`, with `AGY_CLI_DISABLE_AUTO_UPDATE=1`.
+  - Its login moves from `acp_token.json` to `antigravity-oauth-token` (migrated once,
+    `0600`). A Google sign-in can be a pasted code (`antigravity acp --login`).
+  - Zeron updates it from the ACP registry when it can verify the release (#1551): code
+    signature on macOS and Windows, a published SHA-256 on Linux. Upstream's own installs
+    are at 1.5.16 already (#1595).
+  - Checked here: the macOS arm64 pin downloads and matches its SHA-512. Its `antigravity`
+    is signed "Developer ID Application: Google LLC (EQHXZ8M8AV)", says `1.5.15`, and
+    writes nothing to an empty home.
+  - Upstream's #1595 is open: a login made in a terminal, which the unified CLI keeps in
+    the macOS Keychain, isn't detected. Zeron looks for Keychain account
+    `antigravity-acp`, and 1.5.16 writes `antigravity`.
+  - In a Crew build it shows only with own logins (`COMET_INFERENCE_MODE=local`). Crew's
+    managed agents are Claude Code, Codex and OMP: Crew's managed Antigravity (Agent Auth)
+    isn't ported, and a Crew sandbox runs OMP alone. Crew main still pins `agy_acp_server`
+    1.4.4.
+- **Conflicts**, each a Crew seam beside an upstream addition:
+  - the engine's `hyper` features (the MCP gateway's, and Crew's relay's, which serves);
+  - the CLI's hidden commands;
+  - the doc registry's modules;
+  - the engine registry's and RPC's fields;
+  - Cloud's model list: a Crew sandbox's OMP lists this engine's own catalog, never the
+    edge's or an agent's fallback;
+  - the provider card's props;
+  - Zeron v2's base hashes (upstream's, with the composer's blessed for the merged
+    default).
+- **Crew files brought in step:** OMP's question (`note`) and run request (`code_mode`,
+  `zeron_mcp_only`), and the shared login's capture (its provider argument).
+- **MCP servers** (upstream's Settings → MCP, the vault's connections, the engine's
+  gateway, `zeron mcp`) sync through Zeron Vault, and Crew's Edge has none. For a Scaffold
+  profile (`mcp_servers::McpServers::crew`):
+  - the engine keeps them on the device, with no vault client, so no run waits on a
+    listing that can't answer;
+  - it refuses an agent's request for a change, which nobody could answer;
+  - Settings → MCP isn't shown;
+  - an agent's "Only Zeron's MCP servers" reads "Only Crew's MCP servers": it hides the
+    agent's own servers and connectors, so it uses only Crew's tools.
+
+  Whether Crew offers MCP servers, on the device alone or with a vault of its own, is the
+  owner's call.
+- **Crew's wording:** upstream's ten new messages naming Zeron are kept with why (MCP's,
+  and Providers' Cloud key, which Crew doesn't offer). A kept key upstream dropped is gone.
+- **Brought in step after the merge** (`2680a9e11`): Crew's shared-account row test
+  passes upstream's new `cloud` argument, and Zeron v2's base records the merged default
+  composer (`ZERON_V2_BLESS=1 cargo test --bin zeron-zgx zeron_v2_is_in_step`). A new
+  test, `profile::crew::tests::a_scaffold_profile_s_mcp_servers_use_no_vault_and_take_no_request`,
+  fails with the MCP seam taken out.
+- **Tests** (on this Mac, the Rust code as of `2680a9e11`):
+  - `cargo check --workspace --tests`: clean.
+  - `cargo test -p zeron-engine --lib -- plugins::service crew_ doc_host::remote_delivery
+    mcp_servers:: harness_updates:: agent_accounts::`: 368 passed, 3 ignored. The new MCP
+    test: 1 passed.
+  - `-p zeron --test crew_sandbox_host`: 3 passed. `-p zeron-harness --lib -- crew_omp
+    acp::`: 133 passed. `--test crew_omp`: 17 passed, 1 ignored.
+  - zgx `cargo test --bin zeron-zgx`: 809 passed, 1 failed, 33 ignored. The failure,
+    `transcript_scroll_tests::a_synced_chat_scrolled_up_from_its_end_passes_through_every_message`,
+    is upstream's: its CI fails it the same way (run 45532385085, zgx-linux).
+  - zgx `--test design_lint --test leftovers`: 1 and 3 passed.
+  - Luau UI (`scripts/ci/test-zgx.sh ui`): 1,506 tests, 4 failed.
+    - Three are upstream's own, failing in its CI too: "an @ pick goes out as Zeron's
+      file mention", and `mention_launcher`'s "Tab and Shift+Tab go through the scopes…"
+      and "a click on the launcher's blank room keeps it…".
+    - The fourth is `thousands archived …`, which fails on "2,037" with this CLI's `i18n`
+      (Status, slice 6).
+  - Edge: unit 463, Crew's workerd 23, here and in the deploy's CI.
+- **Deployed on staging, 2026-11-25:**
+  - this branch's Edge, `crew-zgx-edge-staging-20261125-1` (version `4b68ab6b`);
+  - the Linux archive `0.3.20-zgx.1` (tag `crew-zgx-linux-0.3.20-zgx.1`, run
+    45546770301), in the image `scaffold-session-crew-zgx@sha256:23170297…` over the same
+    base as before (`scaffold-session@sha256:ea8fb0ee…`);
+  - harness-zgx revision 7, with that image. The new pod adopted both clean sandboxes
+    (`rcs_8892…`, `rcs_8b13…`, `session_adopted` within 30 s), and their saves went on:
+    a sandbox without Codex's links survives a rollout.
+- **Verified on staging** with a debug canary of `2680a9e11` (0.3.20):
+  - signed in as before, with no script error at launch;
+  - a new Cloud chat (`rcs_231b…`, host `zeron 0.3.20`, no link in its home): Platform
+    enrolled the host, the session was ready in 15.4 s, and its first reply came 25 s
+    after the send. Its restore save and each turn's save succeeded;
+  - a long reply streamed, and Stop ended it within a second;
+  - a chat on a 0.3.9 host (`rcs_8b13…`, adopted across the rollout) answered the 0.3.20
+    desktop in 11 s;
+  - no link dropped;
+  - Settings lists no MCP page, Providers lists Claude Code, Codex and OMP alone, and
+    Claude Code's settings read "Only Crew's MCP servers";
+  - the engine logged no vault call.
 
 ## Development loop
 
