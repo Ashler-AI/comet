@@ -2287,7 +2287,7 @@ mod tests {
                 { "label": "Opus weekly", "usedFraction": 1.2 },
                 { "usedFraction": 0.9 }
             ]
-        }), None);
+        }), None, false);
         assert_eq!(shared.field("error").map(text).as_deref(), Some("Needs attention"));
         let named: Vec<(Option<String>, Option<f64>, Option<f64>)> = match shared.field("windows") {
             Some(Value::List(list)) => list

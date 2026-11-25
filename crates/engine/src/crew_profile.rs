@@ -239,3 +239,55 @@ fn scaffold_store_conflict(first: &Path, second: &Path) -> EngineError {
         first.display(), second.display()
     ))
 }
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use zeron_rpc::{RpcError, methods};
+
+    use super::*;
+    use crate::doc_host::EdgeConfig;
+    use crate::mcp_servers::McpServers;
+
+    /// A Scaffold profile as `scaffold` opens one, without the verified
+    /// session it needs.
+    fn scaffold_profile(dir: &Path) -> EngineProfile {
+        EngineProfile {
+            scope: WorkspaceScope::Synced,
+            device_root: dir.to_path_buf(),
+            store_root: dir.join("store"),
+            uploads_root: dir.join("uploads"),
+            org_id: "project-1".into(),
+            user_id: "user-1".into(),
+            crew: CrewProfile { managed_scaffold: true, device_id_override: None, scaffold_profile_key: Some("key".into()) },
+        }
+    }
+
+    /// Upstream's MCP servers sync through Zeron Vault, which Crew's Edge has
+    /// none of: a Scaffold profile's make no vault client, even given an Edge
+    /// (each run would wait on a listing that can't answer), and an agent's
+    /// request for a change is refused, as a Crew build shows no Settings →
+    /// MCP to answer it in. A synced profile with the same Edge has its vault.
+    #[tokio::test]
+    async fn a_scaffold_profile_s_mcp_servers_use_no_vault_and_take_no_request() {
+        let dir = tempfile::tempdir().unwrap();
+        let edge = EdgeConfig::new("http://127.0.0.1:9", Arc::new(zeron_rpc::StaticToken("t".into())));
+        let crew = McpServers::new(&scaffold_profile(dir.path()), dir.path(), "dev-1", Some(&edge));
+        assert!(!crew.snapshot().vault_available);
+        let refused = crew
+            .handle_rpc(methods::REQUEST_MCP_CHANGE, serde_json::json!({ "action": "add", "preset": "linear" }))
+            .await;
+        match refused {
+            Err(RpcError::Failed(why)) => assert!(why.contains("Crew doesn't offer MCP servers"), "{why}"),
+            Err(other) => panic!("refused with {other}"),
+            Ok(_) => panic!("an agent's request was taken"),
+        }
+        // Its own servers still list (none here), as Crew's agent tools read them.
+        assert!(crew.handle_rpc(methods::LIST_MCP_SERVERS, serde_json::json!({})).await.is_ok());
+
+        let synced = EngineProfile::synced(dir.path(), "org-1", "user-1");
+        let zeron = McpServers::new(&synced, dir.path(), "dev-1", Some(&edge));
+        assert!(zeron.snapshot().vault_available);
+    }
+}
