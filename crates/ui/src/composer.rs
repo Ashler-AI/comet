@@ -496,7 +496,7 @@ const SCAFFOLD_OBSERVATION_RETRIES: usize = 5;
 /// One-second polls for the attached host's row and presence.
 const SCAFFOLD_HOST_ONLINE_POLLS: usize = 180;
 /// How long a send waits on the engine to resume a paused Scaffold session and attach its host.
-/// A resume still running past it is not an error: the queued message waits for its host.
+/// Past it the send gives the draft back: nothing was sent, and a later send asks again.
 const SCAFFOLD_RESUME_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 
 /// A recovered command releases its entry only once observation settles it;
@@ -6311,9 +6311,8 @@ pub struct Composer {
     /// Pre-admission only: dropping this task cannot discard an accepted send.
     host_wake_task: Option<Task<()>>,
     host_wake_target: Option<String>,
-    /// The Scaffold sandbox a send is resuming, while that resume runs: a paused session gets one
-    /// resume however many messages queue behind it.
-    scaffold_resume: Option<(String, Task<()>)>,
+    /// The chat whose send waits on its Scaffold sandbox resuming (the task is `host_wake_task`).
+    scaffold_resume: Option<String>,
     scaffold_command: Option<String>,
     scaffold_recovery_key: Option<String>,
     scaffold_admission: Option<String>,
@@ -8759,6 +8758,12 @@ impl Composer {
     }
 
     fn on_state_changed(&mut self, cx: &mut Context<Self>) {
+        // A resume rebinds the chat to the new epoch's host, so only leaving the chat ends that wait.
+        if self.scaffold_resume.as_ref().is_some_and(|chat| {
+            self.state.read(cx).selected_chat.as_deref() != Some(chat.as_str())
+        }) {
+            self.cancel_host_wake(cx);
+        }
         if self.host_wake_target.as_ref().is_some_and(|target| {
             let state = self.state.read(cx);
             state.active_device_id().as_ref() != Some(target)
@@ -9634,49 +9639,86 @@ impl Composer {
         }
     }
 
-    /// Resumes a paused Scaffold session and attaches its host: the engine's Attach resumes a paused
-    /// sandbox first. The message is already queued, and the host takes it once it is back.
-    fn resume_scaffold_host(&mut self, sandbox_id: String, scope: zeron_proto::CollaborationScope, cx: &mut Context<Self>) {
-        if self.scaffold_resume.as_ref().is_some_and(|(target, _)| *target == sandbox_id) {
+    /// A paused Scaffold session's chat stays bound to the paused epoch's host, and the relay refuses
+    /// a send to it at once ("device is offline (no recent presence)"): the message cannot queue
+    /// there. So hold the draft, resume the sandbox (the engine's Attach resumes it, then attaches
+    /// its new host), wait until the chat is bound to that host and it is online, then send.
+    fn resume_before_send(
+        &mut self,
+        sandbox_id: String,
+        scope: zeron_proto::CollaborationScope,
+        text: String,
+        queue: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(engine) = self.state.read(cx).engine().cloned() else {
+            self.show_error("Engine not connected", cx);
             return;
-        }
-        let Some(engine) = self.state.read(cx).engine().cloned() else { return };
+        };
+        let Some(chat_id) = self.state.read(cx).selected_chat.clone() else { return };
+        let key = self.current_key.clone();
         let params = serde_json::json!({
             "commandId": format!("{}:attach", uuid::Uuid::new_v4()),
-            "control": zeron_proto::ScaffoldEnvironmentControl::Attach { sandbox_id: sandbox_id.clone(), scope },
+            "control": zeron_proto::ScaffoldEnvironmentControl::Attach { sandbox_id, scope },
         });
-        let target = sandbox_id.clone();
-        let task = cx.spawn(async move |this, cx| {
-            let result = attachments::call_with_timeout(&engine, cx.background_executor(), "scaffold.control", params, SCAFFOLD_RESUME_TIMEOUT)
-                .await
-                .and_then(|value| serde_json::from_value::<crate::settings::crew::Outcome>(value).map_err(|e| e.to_string()));
-            this.update(cx, |composer, cx| {
-                if composer.scaffold_resume.as_ref().is_some_and(|(sandbox, _)| *sandbox == target) {
-                    composer.scaffold_resume = None;
+        self.scaffold_resume = Some(chat_id.clone());
+        self.input.update(cx, |input, cx| {
+            input.read_only = true;
+            cx.notify();
+        });
+        self.host_wake_task = Some(cx.spawn(async move |this, cx| {
+            let result: Result<(), String> = async {
+                let outcome = attachments::call_with_timeout(&engine, cx.background_executor(), "scaffold.control", params, SCAFFOLD_RESUME_TIMEOUT)
+                    .await
+                    .and_then(|value| serde_json::from_value::<crate::settings::crew::Outcome>(value).map_err(|e| e.to_string()))
+                    .map_err(|error| if error.ends_with("timed out") {
+                        "This session's sandbox is still resuming. Your draft is preserved; send it again in a moment.".to_string()
+                    } else {
+                        format!("This session's sandbox didn't resume: {}. Your draft is preserved.", error.trim().trim_end_matches('.'))
+                    })?;
+                if outcome.status == "rejected" {
+                    let reason = outcome.error.unwrap_or_else(|| "Scaffold refused to resume it.".into());
+                    return Err(format!("This session's sandbox didn't resume: {}. Your draft is preserved.", reason.trim().trim_end_matches('.')));
                 }
-                let refused = match result {
-                    Ok(outcome) if outcome.status == "rejected" => {
-                        Some(outcome.error.unwrap_or_else(|| "Scaffold refused to resume it.".into()))
-                    }
-                    // A timed-out resume may still finish, and the message waits for its host either way.
-                    Err(error) if !error.ends_with("timed out") => Some(error),
-                    _ => None,
-                };
-                if let Some(reason) = refused {
-                    let reason = reason.trim().trim_end_matches('.');
-                    composer.show_error(format!("This session's sandbox didn't resume: {reason}. Your message stays queued and sends once its host is back."), cx);
+                // The attach names the resumed host; Scaffold rebinds the chat to it each epoch.
+                let host = crate::settings::crew::attached_session(&outcome).map(|(_, device)| device.to_string());
+                for _ in 0..SCAFFOLD_HOST_ONLINE_POLLS {
+                    let ready = this.update(cx, |composer, cx| {
+                        let state = composer.state.read(cx);
+                        state.chats.iter().find(|chat| chat.id == chat_id).is_some_and(|chat| {
+                            host.as_ref().is_none_or(|host| chat.device_id == *host)
+                                && state.device_online(&chat.device_id, chrono::Utc::now())
+                        })
+                    }).map_err(|error| error.to_string())?;
+                    if ready { return Ok(()); }
+                    cx.background_executor().timer(Duration::from_secs(1)).await;
+                }
+                Err("This session's sandbox resumed, but its host isn't online yet. Your draft is preserved; send it again in a moment.".into())
+            }
+            .await;
+            this.update(cx, |composer, cx| {
+                composer.scaffold_resume = None;
+                composer.host_wake_task = None;
+                composer.input.update(cx, |input, cx| {
+                    input.read_only = false;
+                    cx.notify();
+                });
+                match result {
+                    Ok(()) if composer.current_key == key => composer.send_ready(text, queue, cx),
+                    Ok(()) => {}
+                    Err(error) => composer.show_error(error, cx),
                 }
                 cx.notify();
             })
             .ok();
-        });
-        self.scaffold_resume = Some((sandbox_id, task));
+        }));
         cx.notify();
     }
 
     fn cancel_host_wake(&mut self, cx: &mut Context<Self>) {
         self.host_wake_task = None;
         self.host_wake_target = None;
+        self.scaffold_resume = None;
         self.input.update(cx, |input, cx| {
             input.read_only = false;
             cx.notify();
@@ -9788,9 +9830,10 @@ impl Composer {
     fn send(&mut self, text: String, queue: bool, cx: &mut Context<Self>) {
         if self.sending || self.host_wake_task.is_some() || self.selected_provisioning(cx) { return; }
         // Scaffold pauses an idle session, and its chat stays bound to that sandbox's host. A send
-        // resumes the sandbox; the queued message reaches the host once it is back.
+        // resumes the sandbox and goes out once the resumed host is online.
         if let Some((sandbox_id, scope)) = self.resumable_scaffold_host(cx) {
-            self.resume_scaffold_host(sandbox_id, scope, cx);
+            self.resume_before_send(sandbox_id, scope, text, queue, cx);
+            return;
         }
         if self.pickers.read(cx).draft().scaffold_database.is_some()
             || self.scaffold_admission.is_some()
@@ -14438,7 +14481,12 @@ mod tests {
     // whose host is online, or whose sandbox failed, is resumed anyway; a refused resume is silent,
     // so the person waits on a message that cannot send.
     #[gpui::test]
-    fn send_to_a_paused_scaffold_chat_resumes_its_sandbox(cx: &mut gpui::TestAppContext) {
+    // A send to a paused Scaffold chat, against the ways it fails:
+    // R1 it goes to the paused epoch's host, which the relay refuses ("device is offline");
+    // R2 the draft is lost while the sandbox resumes, or when the resume fails;
+    // R3 it goes out before the resumed host is online;
+    // R4 leaving the chat mid-resume sends the held draft anyway.
+    fn send_to_a_paused_scaffold_chat_resumes_its_sandbox_then_sends(cx: &mut gpui::TestAppContext) {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -14447,83 +14495,127 @@ mod tests {
         let scope = serde_json::json!({
             "projectId": "ashler-staging", "deploymentId": "ashler-staging", "sessionId": "scaffold-chat",
         });
-        for case in ["paused", "online", "failed", "refused"] {
+        let draft = "Continue where you stopped";
+        for case in ["paused", "refused", "switched", "online", "failed"] {
             let (out, mut requests) = tokio::sync::mpsc::channel::<String>(256);
             let (replies, inbound) = tokio::sync::mpsc::channel::<String>(256);
             let state = cx.new(|_| AppState::new());
-            state.update(cx, |state, _| {
-                let host = "comet-scaffold-rcs_x-e1";
-                state.local_device_id = Some("controller".into());
-                // The sandbox's host registered when it ran; a paused one stops heartbeating.
-                let last_seen = if case == "online" { chrono::Utc::now() } else { chrono::Utc::now() - chrono::Duration::minutes(30) };
-                state.devices = vec![serde_json::from_value(serde_json::json!({
-                    "id": host, "name": "Scaffold", "platform": "linux", "version": "0.2.154", "lastSeenAt": last_seen,
-                })).unwrap()];
-                let lifecycle = if case == "failed" { "failed" } else { "starting" };
-                state.chats = vec![serde_json::from_value(serde_json::json!({
-                    "id": "scaffold-chat", "deviceId": host, "cwd": "/workspace/ashler-platform",
+            let chat = |id: &str, host: &str, lifecycle: &str| -> zeron_proto::Chat {
+                serde_json::from_value(serde_json::json!({
+                    "id": id, "deviceId": host, "cwd": "/workspace/ashler-platform",
                     "archived": false, "createdAt": chrono::Utc::now(),
                     "config": { "harness": "omp", "model": "openai-codex/gpt-5.6-terra", "sandbox": "danger-full-access" },
                     "crew": {
-                        "ownerSubject": "owner@example.com", "scope": scope, "sessionId": "scaffold-chat",
+                        "ownerSubject": "owner@example.com", "scope": scope, "sessionId": id,
                         "environment": {
                             "source": { "kind": "scaffold", "sandbox_id": "rcs_x", "lifecycle": lifecycle, "lifecycle_epoch": 1 },
                             "ownerPrincipal": "owner@example.com", "scope": scope,
                         },
                     },
-                })).unwrap()];
+                })).unwrap()
+            };
+            let device = |id: &str, last_seen: chrono::DateTime<chrono::Utc>| -> zeron_proto::Device {
+                serde_json::from_value(serde_json::json!({
+                    "id": id, "name": "Scaffold", "platform": "linux", "version": "0.2.156", "lastSeenAt": last_seen,
+                })).unwrap()
+            };
+            state.update(cx, |state, _| {
+                state.local_device_id = Some("controller".into());
+                // The sandbox's host registered when it ran; a paused one stops heartbeating.
+                let last_seen = if case == "online" { chrono::Utc::now() } else { chrono::Utc::now() - chrono::Duration::minutes(30) };
+                state.devices = vec![device("comet-scaffold-rcs_x-e1", last_seen)];
+                let lifecycle = if case == "failed" { "failed" } else { "starting" };
+                state.chats = vec![chat("scaffold-chat", "comet-scaffold-rcs_x-e1", lifecycle), chat("other-chat", "controller", "starting")];
                 state.selected_chat = Some("scaffold-chat".into());
                 state.set_test_engine(crate::state::EngineHandle::from_test_client(zeron_rpc::RpcClient::new(out, inbound)));
             });
             let composer = cx.new(|cx| Composer::new(state.clone(), cx));
             composer.update(cx, |composer, cx| {
-                composer.input.update(cx, |input, cx| input.set_text("Continue where you stopped", cx));
+                composer.input.update(cx, |input, cx| input.set_text(draft, cx));
                 composer.on_state_changed(cx);
             });
             cx.run_until_parked();
             composer.update(cx, |composer, cx| composer.on_submit(cx));
-            let mut controls = Vec::new();
+            let mut controls: Vec<zeron_rpc::ClientFrame> = Vec::new();
             let mut commands = 0;
-            for _ in 0..6 {
-                runtime.block_on(async { tokio::task::yield_now().await });
-                cx.run_until_parked();
-                while let Ok(frame) = requests.try_recv() {
-                    let frame: zeron_rpc::ClientFrame = serde_json::from_str(&frame).unwrap();
-                    let reply = match frame.method.as_deref() {
-                        Some(methods::QUEUE_COMMAND) => {
-                            commands += 1;
-                            serde_json::json!({ "commandId": "queued" })
-                        }
-                        Some("scaffold.control") => {
-                            controls.push(frame.params.clone());
-                            // A resume in flight stays unanswered while the message queues.
-                            if case != "refused" { continue; }
-                            serde_json::json!({
-                                "commandId": frame.params["commandId"], "status": "rejected",
-                                "error": "Scaffold refused the resume.",
-                            })
-                        }
-                        _ => continue,
-                    };
-                    let reply = zeron_rpc::ServerFrame { id: frame.id, ok: Some(reply), ..Default::default() };
-                    replies.try_send(serde_json::to_string(&reply).unwrap()).unwrap();
-                }
-            }
-            assert_eq!(commands, 1, "{case}: the message still queues for the chat's host");
-            match case {
-                "paused" | "refused" => {
-                    assert_eq!(controls.len(), 1, "{case}: one resume for the send");
-                    assert_eq!(controls[0]["control"], serde_json::json!({ "operation": "attach", "sandbox_id": "rcs_x", "scope": scope }));
-                    assert!(controls[0]["commandId"].as_str().is_some_and(|id| id.ends_with(":attach")));
-                    let failure = composer.read_with(cx, |composer, _| composer.failure.as_deref().unwrap_or_default().to_string());
-                    if case == "refused" {
-                        assert!(failure.contains("Scaffold refused the resume."), "{failure}");
-                    } else {
-                        assert!(failure.is_empty(), "a resume in flight is not an error: {failure}");
+            let mut pump = |cx: &mut gpui::TestAppContext, controls: &mut Vec<zeron_rpc::ClientFrame>, commands: &mut usize| {
+                for _ in 0..6 {
+                    runtime.block_on(async { tokio::task::yield_now().await });
+                    cx.run_until_parked();
+                    while let Ok(frame) = requests.try_recv() {
+                        let frame: zeron_rpc::ClientFrame = serde_json::from_str(&frame).unwrap();
+                        let reply = match frame.method.as_deref() {
+                            Some(methods::QUEUE_COMMAND) => {
+                                *commands += 1;
+                                serde_json::json!({ "commandId": "queued" })
+                            }
+                            Some("scaffold.control") => {
+                                let refused = case == "refused";
+                                controls.push(frame.clone());
+                                // A resume in flight stays unanswered until the case answers it.
+                                if !refused { continue; }
+                                serde_json::json!({ "commandId": frame.params["commandId"], "status": "rejected", "error": "Scaffold refused the resume." })
+                            }
+                            _ => continue,
+                        };
+                        let reply = zeron_rpc::ServerFrame { id: frame.id, ok: Some(reply), ..Default::default() };
+                        replies.try_send(serde_json::to_string(&reply).unwrap()).unwrap();
                     }
                 }
-                _ => assert!(controls.is_empty(), "{case}: nothing to resume, {controls:?}"),
+            };
+            pump(cx, &mut controls, &mut commands);
+            let held = |cx: &mut gpui::TestAppContext| composer.read_with(cx, |composer, cx| {
+                (composer.input.read(cx).text().to_string(), composer.input.read(cx).read_only, composer.failure.clone().unwrap_or_default())
+            });
+            match case {
+                "online" | "failed" => {
+                    assert!(controls.is_empty(), "{case}: nothing to resume");
+                    assert_eq!(commands, 1, "{case}: sent at once");
+                    continue;
+                }
+                _ => {}
             }
+            assert_eq!(controls.len(), 1, "{case}: one resume for the send");
+            assert_eq!(controls[0].params["control"], serde_json::json!({ "operation": "attach", "sandbox_id": "rcs_x", "scope": scope }));
+            assert_eq!(commands, 0, "{case}: nothing goes to the paused host (R1)");
+            if case == "refused" {
+                let (text, read_only, failure) = held(cx);
+                assert!(failure.contains("Scaffold refused the resume."), "{failure}");
+                assert_eq!((text.as_str(), read_only), (draft, false), "the draft comes back (R2)");
+                continue;
+            }
+            let (text, read_only, _) = held(cx);
+            assert_eq!((text.as_str(), read_only), (draft, true), "held while the sandbox resumes (R2)");
+            if case == "switched" {
+                state.update(cx, |state, _| state.selected_chat = Some("other-chat".into()));
+                composer.update(cx, |composer, cx| composer.on_state_changed(cx));
+            }
+            let attach = controls.pop().unwrap();
+            let confirmed = zeron_rpc::ServerFrame {
+                id: attach.id,
+                ok: Some(serde_json::json!({ "commandId": attach.params["commandId"], "status": "confirmed" })),
+                ..Default::default()
+            };
+            replies.try_send(serde_json::to_string(&confirmed).unwrap()).unwrap();
+            pump(cx, &mut controls, &mut commands);
+            cx.executor().advance_clock(Duration::from_secs(2));
+            pump(cx, &mut controls, &mut commands);
+            if case == "switched" {
+                assert_eq!(commands, 0, "leaving the chat ends the wait (R4)");
+                assert!(composer.read_with(cx, |composer, _| composer.scaffold_resume.is_none() && composer.host_wake_task.is_none()));
+                continue;
+            }
+            assert_eq!(commands, 0, "resumed but its host is not online yet (R3)");
+            // Scaffold rebinds the chat to the resumed epoch's host, which then comes online.
+            state.update(cx, |state, _| {
+                state.chats[0].device_id = "comet-scaffold-rcs_x-e2".into();
+                state.devices.push(device("comet-scaffold-rcs_x-e2", chrono::Utc::now()));
+            });
+            cx.executor().advance_clock(Duration::from_secs(2));
+            pump(cx, &mut controls, &mut commands);
+            assert_eq!(commands, 1, "sent once the resumed host is online");
+            let (_, read_only, failure) = held(cx);
+            assert!(!read_only && failure.is_empty(), "{failure}");
         }
     }
 
