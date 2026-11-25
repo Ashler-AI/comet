@@ -3869,6 +3869,7 @@ impl DocHost {
             let http = self.inner.http.clone();
             let edge_tail = edge.clone();
             let chat = chat_id.clone();
+            let host = self.clone();
             self.spawn_worker(async move {
                 let Ok(bearer) = edge_tail.bearer().await else {
                     return;
@@ -3884,6 +3885,11 @@ impl DocHost {
                 else {
                     return;
                 };
+                // Crew: once reachability is revoked (a stop, a sign-out), an
+                // older tail must not land after a stop's final one (crew_final_tail).
+                if host.inner.edge_disconnected.load(Ordering::Acquire) {
+                    return;
+                }
                 let _ = http
                     .put(&url)
                     .bearer_auth(&bearer)
@@ -8565,6 +8571,11 @@ mod sync_lifecycle_tests;
 
 #[path = "doc_host_delivery.rs"]
 mod remote_delivery;
+
+// Crew: a hosted chat's final tail before a graceful stop (Crew main #243).
+#[path = "crew_final_tail.rs"]
+mod crew_final_tail;
+pub use crew_final_tail::FinalTails;
 
 #[path = "doc_host_attachments.rs"]
 mod attachment_store;

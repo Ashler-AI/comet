@@ -988,6 +988,25 @@ impl EngineRuntime {
         self.core.shutdown().await;
     }
 
+    /// Crew (Crew main #243): `shutdown` for a host stopped on purpose (a
+    /// signal, the IPC stop): each hosted chat2 room's final tail goes out
+    /// first, so a paused Scaffold sandbox still shows how its last turn ended
+    /// (crew_final_tail.rs). Not for sign-out, whose credentials are revoked.
+    pub async fn shutdown_publishing_tails(&self, limit: std::time::Duration) {
+        self.stop_notifier();
+        self.core
+            .doc_host
+            .checkpoint_relayed_chats_before_stop(std::time::Duration::from_secs(5))
+            .await;
+        // The rooms while their clients exist; then nothing new starts (no
+        // queued row, no relay RPC) while the tails go out.
+        let tails = self.core.doc_host.final_tails();
+        self.core.doc_host.pause_all_queues();
+        self.disconnect_edge();
+        self.core.doc_host.publish_final_tails(tails, limit).await;
+        self.core.shutdown().await;
+    }
+
     fn stop_notifier(&self) {
         if let Some(task) = self
             .notifier
@@ -1696,7 +1715,10 @@ impl Engine {
             .auth()
             .quiesce_refresh(std::time::Duration::from_secs(10))
             .await;
-        runtime.shutdown().await;
+        // Crew: hosted chats' final tails first (a sign-out above already
+        // revoked reachability, and publishes none), within the Scaffold
+        // harness's 30 s clean-exit wait.
+        runtime.shutdown_publishing_tails(std::time::Duration::from_secs(5)).await;
         Ok(())
     }
 }

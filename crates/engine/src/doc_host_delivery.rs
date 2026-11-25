@@ -178,6 +178,14 @@ async fn deliver(weak: std::sync::Weak<DocHostInner>, chat: &str) {
         let accepted = match sent {
             Ok(response) if response.status().is_success() => {
                 awaiting_credits = false;
+                // Crew: queued for a sandbox host that isn't connected (a paused
+                // sandbox's last host, its row not yet moved to the paused
+                // epoch's): wake the sandbox, whose next host finds the send.
+                if crate::crew_cloud::is_sandbox_host(&target)
+                    && response.json::<serde_json::Value>().await.ok().is_some_and(|body| body["delivered"] == false)
+                {
+                    host.crew_wake(chat, &target);
+                }
                 true
             }
             // Another owner's device (403) or a chat id its room refuses

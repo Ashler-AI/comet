@@ -592,6 +592,70 @@ async fn a_send_to_a_paused_sandbox_resumes_it() {
     host.shutdown_workers().await;
 }
 
+/// A send made before the chat's row learned of the pause: its nudge goes to
+/// the last host's device room, which that host claimed, so the Edge queues it
+/// (200, `delivered: false`) rather than answering 404. The sandbox is woken
+/// all the same, and the chat moves to the resumed epoch's host, whose boot
+/// finds the waiting send.
+#[tokio::test]
+async fn a_send_queued_for_a_paused_sandbox_s_last_host_resumes_it() {
+    use std::sync::atomic::{AtomicU8, Ordering};
+
+    use crate::doc_host::{DocHost, DocHostConfig, EdgeConfig};
+    fn answer(status: &str, epoch: u64) -> String {
+        let mut value = sandbox_value(status);
+        value["lifecycleEpoch"] = json!(epoch);
+        json!({"ok": true, "sandbox": value}).to_string()
+    }
+    let phase = Arc::new(AtomicU8::new(0));
+    let platform = phase.clone();
+    let (origin, requests) = serve(move |request, _| {
+        if request.starts_with("POST /api/code-sandboxes/sandbox-a/resume ") {
+            platform.store(1, Ordering::SeqCst);
+            return (200, answer("resuming", 3));
+        }
+        if request.starts_with("GET /api/code-sandboxes/sandbox-a ") {
+            return match platform.load(Ordering::SeqCst) {
+                0 => (200, answer("paused", 2)),
+                _ => (200, answer("resuming", 3)),
+            };
+        }
+        // The last host's room, claimed when it connected: the nudge waits there.
+        if request.starts_with(&format!("POST /device/{DEVICE}/nudge ")) {
+            return (200, json!({"delivered": false, "queued": true}).to_string());
+        }
+        (404, "{}".into())
+    })
+    .await;
+    let Fixture { cloud, workspace, store, .. } = fixture(&origin, Some("harness-zgx"));
+    let resumes = || requests.lock().unwrap().iter().filter(|request| request.starts_with("POST /api/code-sandboxes/sandbox-a/resume ")).count();
+    // The row as the sandbox last ran: epoch 1's host.
+    let running = serde_json::from_value::<scaffold::Sandbox>(sandbox_value("ready"))
+        .unwrap()
+        .into_environment(&controller().scope(SESSION))
+        .unwrap();
+    assert!(cloud.publish(&controller(), &running, None, None).unwrap());
+    assert_eq!(workspace.chat(SESSION).unwrap().unwrap().device_id, DEVICE);
+
+    let host = DocHost::new(
+        store.clone(),
+        DocHostConfig { device_id: "desktop".into(), default_harness: HarnessId::Mock, edge: Some(EdgeConfig::with_static_token(&origin, "test")) },
+    );
+    host.set_workspace(workspace.clone());
+    host.set_crew_cloud(&cloud);
+    store.schedule_sync_job(SESSION, "remote-wake").unwrap();
+    let resumed_host = "comet-scaffold-sandbox-a-e3";
+    let moved = tokio::time::timeout(Duration::from_secs(20), async {
+        while workspace.chat(SESSION).unwrap().unwrap().device_id != resumed_host {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await;
+    assert!(moved.is_ok(), "the queued send resumed its sandbox, and its row moved to the resumed epoch's host");
+    assert_eq!(resumes(), 1);
+    host.shutdown_workers().await;
+}
+
 /// A row is never re-homed from another device, bound to another sandbox,
 /// or moved back to an older epoch.
 #[tokio::test]

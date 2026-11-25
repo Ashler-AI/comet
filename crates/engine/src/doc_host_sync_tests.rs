@@ -12,6 +12,9 @@ enum Hold {
     /// The room accepts the socket but answers HELLO only on release: a
     /// slow link's opening join.
     Hello,
+    /// Crew: tail sidecar PUTs are received but answered only on release: an
+    /// Edge that stalls while a host is stopping (crew_final_tail).
+    Tail,
 }
 
 struct Relay {
@@ -21,6 +24,10 @@ struct Relay {
     joins_by_chat: Arc<Mutex<HashMap<String, usize>>>,
     rows_requests: Arc<AtomicUsize>,
     received: Arc<Mutex<HashMap<String, loro::LoroDoc>>>,
+    /// Crew: tail sidecar PUTs received, counted before any hold.
+    tail_requests: Arc<AtomicUsize>,
+    /// Crew: every accepted tail sidecar body, per chat, in arrival order.
+    tails: Arc<Mutex<HashMap<String, Vec<Vec<u8>>>>>,
     task: tokio::task::JoinHandle<()>,
 }
 
@@ -50,6 +57,10 @@ async fn relay(hold: Hold) -> Relay {
     let requested = rows_requests.clone();
     let received = Arc::new(Mutex::new(HashMap::<String, loro::LoroDoc>::new()));
     let received_by_peer = received.clone();
+    let tail_requests = Arc::new(AtomicUsize::new(0));
+    let tail_requested = tail_requests.clone();
+    let tails = Arc::new(Mutex::new(HashMap::<String, Vec<Vec<u8>>>::new()));
+    let tails_by_peer = tails.clone();
     let task = tokio::spawn(async move {
         let mut peers = tokio::task::JoinSet::new();
         loop {
@@ -62,6 +73,8 @@ async fn relay(hold: Hold) -> Relay {
                     let joined_by_chat = joined_by_chat.clone();
                     let requested = requested.clone();
                     let received = received_by_peer.clone();
+                    let tail_requested = tail_requested.clone();
+                    let tails = tails_by_peer.clone();
                     let mut gate = gate.clone();
                     peers.spawn(async move {
                         // Inspect without consuming the websocket upgrade.
@@ -77,7 +90,24 @@ async fn relay(hold: Hold) -> Relay {
                         };
                         if !headers.contains("upgrade: websocket") {
                             stream.read_exact(&mut buffer[..length]).await.unwrap();
-                            if headers.lines().next().unwrap().contains("/checkpoint") {
+                            let request_line = headers.lines().next().unwrap();
+                            if request_line.starts_with("put ") && request_line.contains("/tail ") {
+                                // Crew: the tail sidecar, kept as sent (crew_final_tail).
+                                let length = headers
+                                    .lines()
+                                    .find_map(|line| line.strip_prefix("content-length:"))
+                                    .and_then(|value| value.trim().parse::<usize>().ok())
+                                    .unwrap_or(0);
+                                let mut body = vec![0; length];
+                                if stream.read_exact(&mut body).await.is_err() { return }
+                                tail_requested.fetch_add(1, Ordering::SeqCst);
+                                if matches!(hold, Hold::Tail) {
+                                    let _ = gate.wait_for(|released| *released).await;
+                                }
+                                let chat = request_line.split('/').nth(2).unwrap().to_owned();
+                                lock(&tails).entry(chat).or_default().push(body);
+                                let _ = stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await;
+                            } else if request_line.contains("/checkpoint") {
                                 if matches!(hold, Hold::Checkpoint) {
                                     let _ = gate.wait_for(|released| *released).await;
                                 }
@@ -143,6 +173,8 @@ async fn relay(hold: Hold) -> Relay {
         joins_by_chat,
         rows_requests,
         received,
+        tail_requests,
+        tails,
         task,
     }
 }
@@ -1932,4 +1964,142 @@ async fn reopening_a_stale_relayed_chat_brings_what_its_host_finished_meanwhile(
     assert_eq!(lock(&handle.reopen).asked_at, asked_at);
     assert!(lock(&handle.reopen).pending.is_none());
     viewer.shutdown_workers().await;
+}
+
+// Crew: a hosted chat's final tail before a graceful stop (Crew main #243,
+// crew_final_tail.rs). Failure modes:
+// F1 a turn that ends within a second of the stop (before the quiesce tick's
+//    tail publish) never reaches the Edge's tail, so a paused sandbox's
+//    readers see the run stop mid-turn;
+// F2 a stalled Edge holds the stop past its limit;
+// F3 a viewer publishes its copy over the tail of a room another device hosts.
+
+/// What a host's last turn leaves in its doc, and so what a tail published
+/// before the host stops must contain.
+fn final_answer(id: &str) -> zeron_doc::SessionMessageEntry {
+    zeron_doc::SessionMessageEntry {
+        id: id.into(),
+        role: zeron_doc::MessageRole::Assistant,
+        parts: vec![zeron_doc::MessagePart::Text {
+            id: format!("{id}-text"),
+            text: "Counted 308 lines.".into(),
+        }],
+        created_at: 2,
+        device_id: "host".into(),
+        status: None,
+        continuation_of: None,
+        duration_ms: None,
+    }
+}
+
+/// The entry ids of every tail the relay accepted for `chat`, oldest first.
+fn tail_ids(relay: &Relay, chat: &str) -> Vec<Vec<String>> {
+    lock(&relay.tails)
+        .get(chat)
+        .into_iter()
+        .flatten()
+        .map(|body| {
+            let tail: serde_json::Value = serde_json::from_slice(body).unwrap();
+            tail["messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|entry| entry["id"].as_str().unwrap().to_owned())
+                .collect()
+        })
+        .collect()
+}
+
+/// F1 (Crew's staging test 14, 2026-11-24: a paused sandbox's tail ended mid-turn).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn final_tail_carries_the_turn_that_ended_just_before_the_stop() {
+    let _budget_guard = SYNC_TEST_LOCK.lock().await;
+    let relay = relay(Hold::Checkpoint).await;
+    relay.release.send_replace(true);
+    let dir = tempfile::tempdir().unwrap();
+    let store = Arc::new(DocsStore::open(dir.path()).unwrap());
+    let host = host(store, &relay);
+    let handle = host.open("hosted-tail").unwrap();
+    // A run writing keeps its room's client (an idle one retires).
+    let run = handle.writer();
+    until(|| lock(&handle.chat2).is_some()).await;
+    run.push_message(&final_answer("final-answer")).unwrap();
+    // The stop comes at once, before the next quiesce tick: the rooms first,
+    // then reachability revoked, as `shutdown_publishing_tails` does.
+    let tails = host.final_tails();
+    assert_eq!(tails.0.len(), 1, "the hosted, joined room is captured");
+    host.disconnect_edge();
+    // The quiesce tick passes; its tail, unsent before the revocation, stays unsent.
+    tokio::time::sleep(Duration::from_millis(1_500)).await;
+    let before = tail_ids(&relay, "hosted-tail");
+    assert!(!before.iter().flatten().any(|id| id == "final-answer"), "{before:?}");
+
+    host.publish_final_tails(tails, Duration::from_secs(5)).await;
+
+    let published = tail_ids(&relay, "hosted-tail");
+    assert!(
+        published.last().is_some_and(|ids| ids.iter().any(|id| id == "final-answer")),
+        "{published:?}"
+    );
+    // Revoked already (a sign-out): nothing more is captured, or published.
+    assert!(host.final_tails().0.is_empty());
+    drop(run);
+    host.shutdown_workers().await;
+}
+
+/// F2.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn final_tail_publish_gives_up_at_its_limit_on_a_stalled_edge() {
+    let _budget_guard = SYNC_TEST_LOCK.lock().await;
+    let relay = relay(Hold::Tail).await;
+    let dir = tempfile::tempdir().unwrap();
+    let store = Arc::new(DocsStore::open(dir.path()).unwrap());
+    let host = host(store, &relay);
+    let handle = host.open("stalled-tail").unwrap();
+    until(|| lock(&handle.chat2).is_some()).await;
+    handle.doc.push_message(&final_answer("final-answer")).unwrap();
+    let tails = host.final_tails();
+    host.disconnect_edge();
+
+    let started = std::time::Instant::now();
+    host.publish_final_tails(tails, Duration::from_millis(300)).await;
+    let elapsed = started.elapsed();
+
+    assert!(elapsed < Duration::from_secs(2), "the stop waited {elapsed:?} on a stalled Edge");
+    // The Edge received the PUT: the publish was tried, then abandoned.
+    until(|| relay.tail_requests.load(Ordering::SeqCst) >= 1).await;
+    relay.release.send_replace(true);
+    host.shutdown_workers().await;
+}
+
+/// F3.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn final_tails_skip_rooms_another_device_hosts() {
+    let _budget_guard = SYNC_TEST_LOCK.lock().await;
+    let relay = relay(Hold::Checkpoint).await;
+    relay.release.send_replace(true);
+    let dir = tempfile::tempdir().unwrap();
+    let store = Arc::new(DocsStore::open(dir.path()).unwrap());
+    let workspace = workspace(store.clone());
+    workspace
+        .create_chat("viewed-tail", None, Some("another-host"), None, None)
+        .unwrap();
+    workspace
+        .create_chat("hosted-tail", None, Some("host"), None, None)
+        .unwrap();
+    let host = host(store, &relay);
+    host.set_workspace(workspace);
+    let viewed = host.open("viewed-tail").unwrap();
+    let hosted = host.open("hosted-tail").unwrap();
+    until(|| lock(&viewed.chat2).is_some() && lock(&hosted.chat2).is_some()).await;
+    viewed.doc.push_message(&final_answer("viewer-copy")).unwrap();
+    hosted.doc.push_message(&final_answer("host-answer")).unwrap();
+    let tails = host.final_tails();
+    host.disconnect_edge();
+
+    host.publish_final_tails(tails, Duration::from_secs(5)).await;
+
+    assert_eq!(tail_ids(&relay, "viewed-tail"), Vec::<Vec<String>>::new());
+    assert!(tail_ids(&relay, "hosted-tail").iter().flatten().any(|id| id == "host-answer"));
+    host.shutdown_workers().await;
 }
