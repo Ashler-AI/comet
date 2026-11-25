@@ -12,20 +12,27 @@ the daily-driver Crew Staging install, its profile, or the shared staging backen
   The port started from `94ae5b10812abb854704bc014c2bcebdec64eac9` (v0.3.4, 2026-11-13);
   the 241 commits since (v0.3.8, the GPUI app's removal in #1499) merged with 19
   conflicts, 18 hunks of them content.
-- Crew: `Ashler-AI/comet` `888bd9447` (0.2.155, 2026-11-24). It was `1932df84d` (0.2.151)
-  until 2026-11-24. From the twelve commits between, Crew's sandbox behaviour is ported:
+- Crew: `Ashler-AI/comet` `e886844d4` (0.2.157, 2026-11-24). It was `888bd9447` (0.2.155)
+  until 2026-11-25, and `1932df84d` (0.2.151) until 2026-11-24. Crew's sandbox behaviour
+  is ported:
   - #231: a command is never relayed to a sandbox's host;
-  - #237: a send to a paused sandbox resumes it.
+  - #237: a send to a paused sandbox resumes it;
+  - #243: a deliberate headless stop publishes each hosted chat's final tail
+    (`crew_final_tail.rs`, "Synced with Crew 0.2.157" below);
+  - #242's aim, that a send to a paused sandbox reaches its resumed host, through the
+    engine's wake (#237's), which now also wakes on a send the Edge only queued;
+  - #239, crew-web's paused view: crew-web comes in the Linux archive, which now ships
+    every file its contract lists.
 
   Not ported:
   - #233, client-side bandwidth fixes in upstream's own engine files (chat2 tail
     uploads, diff sidecars) and in `crew_directory`, which the port hasn't;
-  - #234, Antigravity's computer use (no Antigravity here);
+  - #234, Antigravity's computer use, and #240, managed Antigravity's persistent home
+    (no managed Antigravity here);
   - #227, the app's name and link scheme, which the port has its own of;
-  - crew-web's #229 and #236, which a sandbox gets from the Linux archive, packaged from
-    `origin/main`'s `apps/web`.
+  - #242 itself, which is the GPUI composer's.
 - Platform: the task branch `czhen/crew-zgx-harness` sits on `ashler-platform`
-  `master` (rebased 2026-11-24, from 2026-11-21's).
+  `master` `51a030e31` (rebased 2026-11-25, from 2026-11-24's).
 - Branch: `crew/zgx-thin-port`, on `origin` (pushing it is approved).
 - Crew's last upstream import is `a0468502a` (v0.2.129+1, squashed by PR #152),
   not the git merge base v0.2.113. Compare each Crew file with that version, and
@@ -939,6 +946,77 @@ together changed under the port:
   `scaffold-staging`. Master now carries the harness tier itself: native Crew in harness
   sessions (#15857), runner Web and Tilt (#15858), asynchronous pause (#15861), and the
   harness under `/opt/scaffold` (#15851).
+
+**Synced with Crew 0.2.157 and Platform master (2026-11-25).** Crew main's paused-session
+work (#239, #242, #243) and Platform's (the paused agent view, #16744, #16739), in the port:
+
+- **Found and fixed: a port sandbox's crew-web loaded nothing.**
+  - `package-linux-sandbox` copied a list of crew-web's files of its own. Crew main then
+    added two: crew-web's page imports `public/transcript.js` (#236), and Scaffold's paused
+    view imports `detached.mjs` (#239). Neither was in the archive.
+  - The packager now ships exactly the files crew-web's `contract.json` lists (`assets`).
+    `check-native-crew-archive.mjs` refuses an archive missing any of them, on top of the
+    installer's own list, and so refuses `0.3.20-zgx.1`.
+- **A deliberate headless stop publishes each hosted chat's final tail** (Crew main #243,
+  `crew_final_tail.rs`):
+  - This host publishes a room's tail on its doc-quiesce tick, a second after a change.
+    Scaffold pauses a sandbox by stopping its Crew right after the run, so a turn that
+    ended within that second never reached the tail. The tail is all a paused sandbox's
+    agent view and iOS read.
+  - On a signal or the IPC stop, the engine captures the hosted, joined, stored rooms,
+    freezes queues and revokes reachability as before. It then publishes each room's tail
+    once, within 5 s, inside the harness's 30 s clean-exit wait.
+  - A periodic tail still unsent at the revocation is dropped, so an older transcript
+    can't land after the final one. A sign-out publishes nothing.
+  - Seams: the module's include and that drop in `doc_host.rs`;
+    `EngineRuntime::shutdown_publishing_tails` and the headless stop in `lib.rs`.
+  - Tests (`doc_host_sync_tests.rs`): F1, the final tail carries a turn that ended just
+    before the stop; F2, a stalled Edge can't hold the stop past its limit; F3, a room
+    another device hosts is never published over.
+- **A send the Edge only queued wakes the sandbox too.** The port's wake (#237's) fires
+  on a nudge's 404: the paused epoch's host never connected, so its device room is
+  unclaimed. A send made before the chat's row moved to the paused epoch goes to the last
+  host's room instead. That host claimed the room, so the Edge queues the nudge (200,
+  `delivered: false`), and nothing woke the sandbox. Now that answer for a sandbox host
+  wakes it as well. Its resumed host finds the send at boot. Test:
+  `a_send_queued_for_a_paused_sandbox_s_last_host_resumes_it`.
+- **Not ported:** #242 itself (the GPUI composer's), and #240 (managed Antigravity's
+  persistent home; no managed Antigravity here).
+- **Platform:** the task branch is rebased onto `master` `51a030e31` (backup
+  `czhen/crew-zgx-harness-pre-rebase-20261125`). Its two conflicts were `index.ts`'s
+  imports from `./crew-edge`, both union. Master's paused agent view
+  (`crew-web-paused.ts`) serves the shared `harness` region alone, and reads the tail from
+  the default chat2 Edge. A harness-zgx session's view still resumes the session to show
+  it.
+  - Master's chart now mounts users' GitHub PATs into every harness (#16592), and
+    `deploy-harness-crew-zgx.mjs` refuses any volume. Its values leave the bundle out
+    (`userGithubPatSecretName: ""`, `0e1405d4b`), so a port sandbox doesn't push as its
+    user. It never has.
+- **Tests:** engine `-- crew_ doc_host:: plugins::service mcp_servers:: profile::`, 237
+  passed, 1 ignored, the four new ones among them. `crew_sandbox_host` 3 passed.
+  `check-native-crew-archive.test.mjs` 7 passed. Platform: the Crew region tests 25 and
+  `build-crew-zgx-session-image.test.mjs` 3 passed, on the rebased branch.
+- **Deployed on staging, 2026-11-25:**
+  - the Linux archive `0.3.20-zgx.2` (tag `crew-zgx-linux-0.3.20-zgx.2`, run
+    45652462133), with every crew-web file its contract lists;
+  - the image `scaffold-session-crew-zgx@sha256:ef611198…`, over the shared staging
+    harness's base (`scaffold-session@sha256:bc1ba161…`, Platform `966d2f7d`: #16744,
+    #16739, Crew 0.2.157);
+  - harness-zgx revision 8, with that image and `966d2f7d`'s harness. The new pod adopted
+    `rcs_231b…`, `rcs_8892…` and `rcs_8b13…`.
+- **Verified on staging:** a new Cloud chat (`rcs_9ac0…`) answered in 21 s. Its host is
+  `0.3.20-zgx.2`. Its crew-web has `detached.mjs` and `public/transcript.js` installed
+  and is serving. Platform enrolled the host, and its saves succeeded. Its home has no
+  link.
+- **Not verified live:** the final tail at a stop, and a send resuming a paused sandbox.
+  Both need a sandbox stopped or paused, and the idle sweep pauses `rcs_c8dc…` from
+  about 22:23Z today, `rcs_8b13…` from 23:03Z and `rcs_8892…` from 23:22Z. `rcs_c8dc…`'s
+  pause should now finish, with #16744. `rcs_64af…` is failed in the control plane since
+  05:00Z: its pause never finished.
+- **Seen, for Platform:** a port sandbox's turns don't move its `last_activity_at`.
+  `rcs_8b13…` still reads 2026-11-24 23:03Z after a turn at 11-25 05:47Z, so the idle
+  sweep pauses a sandbox 24 h after its last recorded activity even while it's in use.
+  A send resumes it.
 
 Earlier notes:
 
