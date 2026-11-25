@@ -67,8 +67,10 @@ pub mod local_import;
 pub mod keep_running;
 pub mod heap;
 pub mod managed;
+pub mod mcp_servers;
 mod hosted_models;
 mod model_catalogs;
+pub mod model_publish;
 mod plugin_agents;
 pub mod plugins;
 pub mod profile;
@@ -82,6 +84,7 @@ pub mod runner;
 pub mod wake_trace;
 pub mod wake_update;
 pub mod self_schedule;
+pub mod sign_in_catalog;
 pub mod sessions;
 pub mod source_control;
 pub mod spaces;
@@ -112,6 +115,7 @@ pub use diff_sync::{
 };
 pub use doc_host::{ChatDocHandle, DocHost, DocHostConfig, EdgeConfig};
 pub use instance_lock::InstanceLock;
+pub use mcp_servers::McpServers;
 pub use profile::EngineProfile;
 pub use project_actions::ProjectActionsStore;
 pub use registry::{HarnessDescriptor, HarnessRegistry, default_registry};
@@ -220,6 +224,8 @@ pub struct EngineCore {
     pub local_import: Option<local_import::LocalImporter>,
     /// Plugins under `{data}/plugins/` (the plugins contract).
     pub plugins: plugins::Plugins,
+    /// Managed external MCP servers (Vault + local store + OAuth + loopback gateway).
+    pub mcp_servers: Arc<mcp_servers::McpServers>,
     workspace_scope: WorkspaceScope,
     /// Auth service (attached by [`Engine::run`]; a lazy dev-mode instance otherwise).
     auth: std::sync::Mutex<Option<Auth>>,
@@ -328,6 +334,15 @@ impl EngineCore {
                 edge: edge.clone(),
             },
         );
+        // A new version on trial may yet be undone, and a Cloud machine looking
+        // for a release would cut off whatever started now: neither starts
+        // work until it's decided (`update_trial`, `wake_update`). Said before
+        // the host is given anything to run: a message waiting on disk drains
+        // as soon as it has its sessions, while the rest is being assembled.
+        let holds_work = zeron_update::transaction::in_trial() || wake_update::armed();
+        if holds_work {
+            doc_host.hold_work();
+        }
         let workspace = WorkspaceHost::open(
             store,
             WorkspaceHostConfig {
@@ -342,6 +357,12 @@ impl EngineCore {
             },
         )?;
         doc_host.set_workspace(workspace.clone());
+        // A Cloud machine is made for one chat: it runs each agent as the
+        // person chose for Cloud, which the account's registry holds.
+        if runner::is_cloud_platform() {
+            let workspace = workspace.clone();
+            registry.follow_cloud_choices(move |harness| workspace.cloud_agent_choices(harness));
+        }
         doc_host.set_sessions(sessions.clone());
         sessions.follow_chat_deletions(workspace.watch_chats());
         let plugins = plugins::Plugins::new(data_dir, &device_id);
@@ -387,15 +408,12 @@ impl EngineCore {
             )));
         }
         sessions.set_plugins(plugins.clone());
+        let mcp_servers = mcp_servers::McpServers::new(&profile, data_dir, &device_id, edge.as_ref());
+        sessions.set_mcp_servers(mcp_servers.clone());
         sessions.set_doc_host(doc_host.clone());
-        // A new version on trial may yet be undone, and recovering clears the
-        // journals' marks of what to resume, which a rollback doesn't restore.
-        // It waits for the commit (`update_trial`), with all other new work.
-        // A Cloud machine looking for a release does the same (`wake_update`): an
-        // update would cut off whatever started now.
-        if zeron_update::transaction::in_trial() || wake_update::armed() {
-            doc_host.hold_work();
-        } else {
+        // Recovering clears the journals' marks of what to resume, which a
+        // rollback doesn't restore: it waits with all other new work.
+        if !holds_work {
             match sessions.recover_stale() {
                 Ok(0) => {}
                 Ok(recovered) => tracing::info!(recovered, "stale sessions recovered on boot"),
@@ -551,6 +569,7 @@ impl EngineCore {
             device_id,
             local_import,
             plugins,
+            mcp_servers,
             workspace_scope: profile.scope(),
             auth: std::sync::Mutex::new(None),
             links: std::sync::Mutex::new(None),
@@ -587,6 +606,7 @@ impl EngineCore {
     /// Attach the auth service (before building the RPC service / relays).
     pub fn set_auth(&self, auth: Auth) {
         self.plugins.attach_auth(auth.clone());
+        self.mcp_servers.attach_auth(auth.clone());
         *self
             .auth
             .lock()
@@ -726,7 +746,8 @@ impl EngineCore {
         .with_commands(self.commands.clone())
         .with_harness_updates(self.harness_updates.clone())
         .with_viewport_focus(self.viewport_focus.clone())
-        .with_plugins(self.plugins.clone());
+        .with_plugins(self.plugins.clone())
+        .with_mcp_servers(self.mcp_servers.clone());
         if let Some(links) = self.links() {
             rpc = rpc.with_links(links);
         }
@@ -805,6 +826,7 @@ impl EngineCore {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .take();
         self.plugins.shutdown();
+        self.mcp_servers.shutdown();
         self.previews.shutdown().await;
         self.harness_updates.shutdown().await;
         // A run interruption transitions its chat to Idle, and Idle normally
@@ -1282,6 +1304,15 @@ impl Engine {
         // backs ListGithubRepos / CloneRepo); the heartbeat feeds idle sleep.
         // Attached before the host relay so relayed RPCs see the broker.
         if let Some(identity) = auth.runner_identity() {
+            // A Cloud machine's agents run on its newest Node: the image's
+            // default `node` can be older than npm-distributed agents need.
+            if runner::is_cloud_platform()
+                && let Some((dir, (major, minor, patch))) = zeron_harness::newest_node_dir()
+            {
+                tracing::info!(dir = %dir.display(), version = %format!("{major}.{minor}.{patch}"),
+                    "agents run on the machine's newest Node");
+                zeron_harness::prefer_node_dir(dir);
+            }
             let tokens: Arc<dyn zeron_rpc::TokenSource> = Arc::new(auth.clone());
             wake_trace::report_to(identity.edge_url(), tokens.clone());
             let broker = credentials::CredentialBroker::new(
@@ -1291,6 +1322,20 @@ impl Engine {
             );
             core.registry.set_run_environment(Arc::new(broker.clone()));
             broker.start();
+            // Each agent's models as this machine's credentials list them,
+            // kept on the edge for every device's picker while Cloud sleeps.
+            let publisher = model_publish::ModelPublisher::new(
+                &core.registry,
+                Arc::new(model_publish::EdgeSink::new(
+                    identity.edge_url(),
+                    tokens.clone(),
+                )),
+            );
+            core.registry
+                .set_catalog_publisher(Arc::new(publisher.clone()));
+            // Connected agents' catalogs, published soon after a boot, so a
+            // picker lists them before their first run here.
+            publisher.prime();
             let sessions = core.sessions.clone();
             let commands = core.commands.clone();
             let activity = runner::RelayActivity::default();
@@ -1507,6 +1552,7 @@ impl Engine {
     pub async fn run(self) -> anyhow::Result<()> {
         let mut config = self.config;
         tracing::info!(data_dir = %config.data_dir.display(), "engine starting");
+        sessions::expect_ipc_port(true);
 
         std::fs::create_dir_all(&config.data_dir)?;
         update_trial::boot(&config.data_dir)?;

@@ -23,6 +23,7 @@ local activity_page = require("@app/screens/settings/activity")
 local notifications = require("@app/screens/settings/notifications")
 local profile = require("@app/screens/settings/profile")
 local providers = require("@app/screens/settings/providers")
+local mcp_page = require("@app/screens/settings/mcp")
 local devices = require("@app/screens/settings/devices")
 local projects_page = require("@app/screens/settings/projects")
 local files = require("@app/screens/settings/files")
@@ -80,6 +81,13 @@ add(if crew.on then require("@app/screens/settings/crew_account") else profile, 
 add(browser, "global", "Browser")
 add(browser_history, "clock-circle", "Browser")
 add(providers, "widget", "Devices")
+-- (Crew: no MCP servers yet. They sync through Zeron Vault, and Crew's Edge
+-- has none: the engine keeps a Scaffold profile's on the device alone.)
+if crew.on then
+	search.unindex(mcp_page.ID)
+else
+	add(mcp_page, "remote-server", "Devices", true)
+end
 add(devices, "laptop", "Devices")
 add(projects_page, "folder-with-files", "Devices")
 if crew.on then

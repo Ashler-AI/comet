@@ -62,6 +62,15 @@ export const REPAIR_ENGINE_SCRIPT = `#!/bin/sh
 # Zeron Cloud: put back a missing zeron-engine (edge/src/cloud/install-script.ts).
 home="\${ZERON_CLOUD_HOME:-$HOME}"
 cur="$home/.zeron/app/current"
+# A \`current\` naming no installed version (a machine restored from a snapshot
+# got back the link from before an update that had removed its version):
+# pointed at the newest version installed, or the unit can't start at all.
+if [ ! -x "$cur/zeron" ]; then
+  best="$(ls -1 "$home/.zeron/app" 2>/dev/null | grep -E '^[0-9]+[.][0-9]+[.][0-9]+' | sort -V |
+    while read -r v; do [ -x "$home/.zeron/app/$v/zeron" ] && echo "$v"; done | tail -n 1)"
+  [ -n "$best" ] && ln -sfn "$home/.zeron/app/$best" "$cur" &&
+    echo "zeron cloud: current named a missing version; now $best"
+fi
 [ -x "$cur/zeron" ] || exit 0
 [ -f "$cur/zeron-engine" ] && exit 0
 dest="$(readlink -f "$cur")" || exit 0
@@ -95,11 +104,15 @@ echo "zeron cloud: put back zeron-engine for $ver"
  */
 export const ENSURE_REPAIR =
   `{ h="\${ZERON_CLOUD_HOME:-$HOME}"; r="$h/.zeron/repair-engine"; ` +
-  `dd="\${ZERON_CLOUD_UNIT_DIR:-/etc/systemd/system}/${CLOUD_UNIT_NAME}.d"; ` +
+  `dd="\${ZERON_CLOUD_UNIT_DIR:-/etc/systemd/system}/${CLOUD_UNIT_NAME}.d"; c=0; ` +
   `t="$(mktemp)" && printf %s '${btoa(REPAIR_ENGINE_SCRIPT)}' | base64 -d >"$t" && ` +
   `{ cmp -s "$t" "$r" || install -m 0700 "$t" "$r"; } && ` +
   `printf '[Service]\\nExecStartPre=-%s\\n' "$r" >"$t" && ` +
-  `{ cmp -s "$t" "$dd/repair-engine.conf" || { sudo mkdir -p "$dd" && sudo install -m 0644 "$t" "$dd/repair-engine.conf" && sudo systemctl daemon-reload; }; }; ` +
+  `{ cmp -s "$t" "$dd/repair-engine.conf" || { sudo mkdir -p "$dd" && sudo install -m 0644 "$t" "$dd/repair-engine.conf" && c=1; }; } && ` +
+  // A unit written before OOMPolicy=continue was in it gets it as a drop-in.
+  `printf '[Service]\\nOOMPolicy=continue\\n' >"$t" && ` +
+  `{ cmp -s "$t" "$dd/oom-policy.conf" || { sudo mkdir -p "$dd" && sudo install -m 0644 "$t" "$dd/oom-policy.conf" && c=1; }; } && ` +
+  `{ [ "$c" = 0 ] || sudo systemctl daemon-reload; }; ` +
   `rm -f "$t"; } >/dev/null 2>&1 || true`;
 
 export const CLOUD_INSTALL_SCRIPT = `#!/bin/sh
@@ -204,6 +217,10 @@ EnvironmentFile=$data/env
 ExecStart=$app/current/zeron headless
 Restart=always
 RestartSec=1
+# A program an agent runs that the kernel kills for memory dies alone: the
+# engine (and every chat on the machine) carries on. systemd's default stops
+# the whole unit, so one runaway build or test restarted the engine.
+OOMPolicy=continue
 
 [Install]
 WantedBy=multi-user.target

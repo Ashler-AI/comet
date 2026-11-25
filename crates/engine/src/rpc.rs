@@ -195,6 +195,10 @@ struct QueueMessageParams {
     /// chat's row waits until they're in the edge's store.
     #[serde(default)]
     transfers: Vec<crate::uploads::AttachmentTransfer>,
+    /// Chat config picked when this message was queued (e.g. a provider or
+    /// model switch made while the previous turn was still running).
+    #[serde(default)]
+    config: Option<ChatConfig>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -940,6 +944,8 @@ pub struct EngineRpc {
     viewport_focus: crate::desktop_notify::ViewportFocus,
     /// The plugins service (absent in bare test assemblies).
     plugins: Option<crate::plugins::Plugins>,
+    /// Managed external MCP servers (absent in bare test assemblies).
+    mcp_servers: Option<std::sync::Arc<crate::mcp_servers::McpServers>>,
     /// Crew: a Scaffold desktop's sandboxes behind the Cloud RPCs.
     crew_cloud: Option<std::sync::Arc<crate::crew_cloud::CrewCloud>>,
     engine_info: EngineInfo,
@@ -1004,6 +1010,7 @@ impl EngineRpc {
             credentials: None,
             viewport_focus: Default::default(),
             plugins: None,
+            mcp_servers: None,
             crew_cloud: None,
             engine_info,
         }
@@ -1018,6 +1025,15 @@ impl EngineRpc {
     /// Attach the plugins service (the Plugin* methods).
     pub fn with_plugins(mut self, plugins: crate::plugins::Plugins) -> Self {
         self.plugins = Some(plugins);
+        self
+    }
+
+    /// Attach the managed external MCP servers service.
+    pub fn with_mcp_servers(
+        mut self,
+        mcp_servers: std::sync::Arc<crate::mcp_servers::McpServers>,
+    ) -> Self {
+        self.mcp_servers = Some(mcp_servers);
         self
     }
 
@@ -1238,18 +1254,40 @@ impl EngineRpc {
                 if !harnesses.contains(&p.harness) {
                     return Some(Err(RpcError::Failed(match self.crew_cloud {
                         Some(_) => "Crew's sandboxes run OMP only".into(),
-                        None => "Cloud runs Codex and Claude Code only".into(),
+                        None => format!(
+                            "{} doesn't run on Cloud",
+                            zeron_proto::providers::provider_name(p.harness)
+                        ),
                     })));
                 }
-                // What Cloud's machines run: the edge's list (the last one read,
-                // when it's out of reach), as a phone reads it. This computer's
-                // own catalog only before either: it fails where an agent isn't
-                // installed or signed in here, and Cloud's are signed in on the
-                // machine.
-                if self.crew_cloud.is_none()
-                    && let Some(models) = self.cloud_models(p.harness).await
-                {
+                // Crew: a sandbox's OMP lists this engine's own catalog, never
+                // the edge's or an agent's fallback.
+                if self.crew_cloud.is_some() {
+                    return Some(self.handle(method, local(&[])).await);
+                }
+                // What Cloud's machines run: the edge's list for the accounts
+                // Cloud runs the agent on (the last one read, when it's out of
+                // reach), as a phone reads it.
+                if let Some(models) = self.cloud_models(p.harness).await {
                     return Some(RpcReply::value(&models));
+                }
+                // Nothing discovered for Cloud yet (signed in before Cloud
+                // kept a list at sign-in, and no machine has run it): the
+                // agent's own fallback models, so it can be picked for its
+                // first Cloud run, which publishes the real ones. This
+                // computer's own catalog only for an agent with none: it's
+                // whatever account this computer is signed in to (Antigravity
+                // signed in here to an account offered only Flash listed that
+                // for Cloud's), and fails where the agent isn't here at all.
+                let fallback = self
+                    .registry
+                    .resolve(p.harness)
+                    .map(|harness| harness.fallback_models())
+                    .unwrap_or_default();
+                if !fallback.is_empty() {
+                    tracing::info!(harness = p.harness.as_str(),
+                        "Cloud models: fallback list until Cloud discovers one");
+                    return Some(RpcReply::value(&fallback));
                 }
                 Some(self.handle(method, local(&[])).await)
             }
@@ -1257,6 +1295,20 @@ impl EngineRpc {
                 self.handle(method, local(&["chatId", "spaceId", "path"]))
                     .await,
             ),
+            // How the person runs each agent on Cloud: the account's, held by
+            // its registry for every Cloud machine (never one machine's, made
+            // for one chat), so answered here for Cloud and any of its
+            // machines. (A Cloud machine itself only reads them.)
+            methods::GET_NATIVE_SUBAGENTS
+            | methods::SET_NATIVE_SUBAGENTS
+            | methods::GET_CODE_MODE
+            | methods::SET_CODE_MODE
+            | methods::GET_ZERON_MCP_ONLY
+            | methods::SET_ZERON_MCP_ONLY
+                if !crate::runner::is_cloud_platform() =>
+            {
+                Some(self.cloud_agent_settings(method, local(&[])))
+            }
             _ if account => Some(Err(RpcError::Failed(
                 crate::cloud_client::ACCOUNT_DEVICE_HAS_NO_ENGINE.into(),
             ))),
@@ -1264,13 +1316,78 @@ impl EngineRpc {
         }
     }
 
-    /// Cloud's models for `harness`: the edge's list, kept on disk as it's
-    /// read, else the last one kept. `None` before the edge was ever read, or
-    /// with nothing listed for it.
+    /// Settings → Providers' agent settings for Cloud, read and made on the
+    /// account's registry rows (`cloudAgents`): the same answers this
+    /// device's own give, over the agents Cloud runs.
+    fn cloud_agent_settings(&self, method: &str, params: serde_json::Value) -> Result<RpcReply, RpcError> {
+        use crate::registry::{CLOUD_HARNESS_IDS, CodeModeSettings, NativeSubagentSettings, ZeronMcpOnlySettings};
+        use zeron_doc::CloudAgentChoice;
+        let ws = &self.workspace;
+        let can = |supports: fn(HarnessId) -> bool| -> Vec<HarnessId> {
+            CLOUD_HARNESS_IDS.iter().copied().filter(|id| supports(*id)).collect()
+        };
+        let chosen = |of: &[HarnessId], choice: CloudAgentChoice, on: bool| -> Vec<HarnessId> {
+            of.iter().copied().filter(|id| ws.cloud_agent_choices(*id).get(choice) == Some(on)).collect()
+        };
+        let choice = match method {
+            methods::GET_NATIVE_SUBAGENTS | methods::SET_NATIVE_SUBAGENTS => CloudAgentChoice::NativeSubagents,
+            methods::GET_CODE_MODE | methods::SET_CODE_MODE => CloudAgentChoice::CodeMode,
+            _ => CloudAgentChoice::ZeronMcpOnly,
+        };
+        let supports: fn(HarnessId) -> bool = match choice {
+            CloudAgentChoice::NativeSubagents => zeron_harness::switches_native_subagents,
+            CloudAgentChoice::CodeMode => zeron_harness::supports_code_mode,
+            CloudAgentChoice::ZeronMcpOnly => zeron_harness::supports_zeron_mcp_only,
+        };
+        let agents = can(supports);
+        if matches!(method, methods::SET_NATIVE_SUBAGENTS | methods::SET_CODE_MODE | methods::SET_ZERON_MCP_ONLY) {
+            // This device's own app or CLI alone: the room takes these rows
+            // from no Cloud machine, so one mustn't have them written by
+            // asking a computer it can reach.
+            if !zeron_rpc::caller().is_local() {
+                return Err(RpcError::Failed(format!(
+                    "{method}: how agents run on Cloud is changed in Zeron's own window"
+                )));
+            }
+            let p: SetHarnessEnabledParams = parse_params(params)?;
+            if !agents.contains(&p.harness) {
+                return Err(RpcError::Failed(format!(
+                    "{} can't change that on Cloud",
+                    zeron_proto::providers::provider_name(p.harness)
+                )));
+            }
+            ws.set_cloud_agent_choice(p.harness, choice, p.enabled);
+        }
+        match choice {
+            CloudAgentChoice::NativeSubagents => RpcReply::value(&NativeSubagentSettings {
+                off: chosen(&agents, choice, false),
+                switchable: agents,
+            }),
+            CloudAgentChoice::CodeMode => RpcReply::value(&CodeModeSettings {
+                enabled: chosen(&agents, choice, true),
+                supported: agents,
+            }),
+            CloudAgentChoice::ZeronMcpOnly => RpcReply::value(&ZeronMcpOnlySettings {
+                on: chosen(&agents, choice, true),
+                supported: agents,
+            }),
+        }
+    }
+
+    /// Cloud's models for `harness`: the edge's lists, kept on disk as they're
+    /// read, else the last ones kept; of them, the catalog discovered with the
+    /// accounts Cloud runs it on now, else its newest
+    /// ([`crate::cloud_client::CloudModelLists::for_harness`]). `None` before
+    /// the edge was ever read, or with nothing listed for it.
     async fn cloud_models(&self, harness: HarnessId) -> Option<Vec<zeron_proto::Model>> {
         let key = serde_json::to_value(harness).ok()?.as_str()?.to_owned();
         let path = self.repos.data_dir().join("cloud-models.json");
-        let listed = match self.cloud().models().await {
+        let cloud = self.cloud();
+        let (listed, accounts) = tokio::join!(
+            cloud.models(),
+            crate::cloud_accounts::active_accounts(&cloud, harness)
+        );
+        let listed = match listed {
             Ok(listed) => {
                 if let Ok(bytes) = serde_json::to_vec(&listed) {
                     if let Err(error) = std::fs::write(&path, bytes) {
@@ -1282,10 +1399,10 @@ impl EngineRpc {
             Err(error) => {
                 tracing::debug!(%error, "Cloud's models: the last list kept");
                 let bytes = std::fs::read(&path).ok()?;
-                serde_json::from_slice(&bytes).ok()?
+                serde_json::from_slice::<crate::cloud_client::CloudModelLists>(&bytes).ok()?
             }
         };
-        let models = crate::cloud_client::cloud_models(listed.get(&key)?);
+        let models = crate::cloud_client::cloud_models(listed.for_harness(&key, accounts.as_deref())?);
         (!models.is_empty()).then_some(models)
     }
 
@@ -1337,6 +1454,7 @@ impl EngineRpc {
         space_id: Option<&str>,
         device_id: Option<&str>,
         parent_chat_id: Option<&str>,
+        child_kind: Option<zeron_proto::ChildKind>,
         branch: Option<&str>,
         cloud: bool,
         reach: Option<zeron_proto::CloudReach>,
@@ -1399,7 +1517,7 @@ impl EngineRpc {
             }
             let started = self
                 .cloud()
-                .create_child_session(chat_id, parent, branch, config)
+                .create_child_session(chat_id, parent, branch, config, child_kind)
                 .await
                 .map_err(|e| RpcError::Failed(format!("Couldn't start a Cloud session: {e}")))?;
             self.await_chat_row(chat_id).await?;
@@ -2721,6 +2839,10 @@ fn forwardable(method: &str) -> bool {
             | methods::SET_COMMIT_CREDIT
             | methods::GET_NATIVE_SUBAGENTS
             | methods::SET_NATIVE_SUBAGENTS
+            | methods::GET_CODE_MODE
+            | methods::SET_CODE_MODE
+            | methods::GET_ZERON_MCP_ONLY
+            | methods::SET_ZERON_MCP_ONLY
             | methods::SET_HARNESS_ENABLED
             | methods::LIST_MODELS
             | methods::LIST_SKILLS
@@ -2858,6 +2980,11 @@ fn forwardable(method: &str) -> bool {
             | methods::CHECK_PLUGIN_UPDATES
             | methods::UPDATE_PLUGIN
             | methods::PLUGIN_STATUS
+            // Managed MCP servers: read-only views/refresh are forwardable;
+            // mutations and OAuth flows stay local-only (`zeron_rpc::local_only`).
+            | methods::LIST_MCP_SERVERS
+            | methods::WATCH_MCP_SERVERS
+            | methods::REFRESH_MCP_SERVERS
     )
 }
 
@@ -2879,6 +3006,7 @@ fn is_stream_method(method: &str) -> bool {
             | methods::UPDATE_STATUS
             | methods::WATCH_HARNESS_UPDATES
             | methods::WATCH_PLUGINS
+            | methods::WATCH_MCP_SERVERS
     )
 }
 
@@ -3517,9 +3645,15 @@ impl RpcService for EngineRpc {
                 let reply = self.forward(&target, method, params).await;
                 return reply.map_err(|error| remote_plugins::older_engine(&target, method, error));
             }
-            // Settings → Providers' Cloud: its logins live in the vault.
-            if crate::cloud_accounts::is_cloud_accounts_target(&target)
-                && crate::cloud_accounts::handles(method)
+            // Settings → Providers' Cloud, and a Cloud chat's composer (its
+            // session machine): Cloud's logins live in the vault, the same
+            // for every machine, so they're read there — never by dialing a
+            // machine, which may be asleep. (A Cloud machine itself has no
+            // user bearer for the vault: it forwards as before.)
+            if crate::cloud_accounts::handles(method)
+                && (crate::cloud_accounts::is_cloud_accounts_target(&target)
+                    || (target.starts_with(zeron_proto::CLOUD_DEVICE_PREFIX)
+                        && !crate::runner::is_cloud_platform()))
             {
                 return Box::pin(crate::cloud_accounts::dispatch(
                     self.cloud(),
@@ -3619,6 +3753,12 @@ impl RpcService for EngineRpc {
             };
             return Box::pin(async move { plugins.dispatch(method, params).await }).await;
         }
+        if crate::mcp_servers::handles(method) {
+            let Some(mcp_servers) = self.mcp_servers.clone() else {
+                return Err(RpcError::Failed("MCP servers aren't available here".into()));
+            };
+            return Box::pin(async move { mcp_servers.handle_rpc(method, params).await }).await;
+        }
         if crate::acp_registry::handles(method) {
             return Box::pin(crate::acp_registry::dispatch(
                 &self.registry,
@@ -3712,6 +3852,22 @@ impl RpcService for EngineRpc {
                     .set_native_subagents(p.harness, p.enabled)
                     .map_err(RpcError::Failed)?;
                 RpcReply::value(&self.registry.native_subagent_settings())
+            }
+            methods::GET_CODE_MODE => RpcReply::value(&self.registry.code_mode_settings()),
+            methods::GET_ZERON_MCP_ONLY => RpcReply::value(&self.registry.zeron_mcp_only_settings()),
+            methods::SET_ZERON_MCP_ONLY => {
+                let p: SetHarnessEnabledParams = parse_params(params)?;
+                self.registry
+                    .set_zeron_mcp_only(p.harness, p.enabled)
+                    .map_err(RpcError::Failed)?;
+                RpcReply::value(&self.registry.zeron_mcp_only_settings())
+            }
+            methods::SET_CODE_MODE => {
+                let p: SetHarnessEnabledParams = parse_params(params)?;
+                self.registry
+                    .set_code_mode(p.harness, p.enabled)
+                    .map_err(RpcError::Failed)?;
+                RpcReply::value(&self.registry.code_mode_settings())
             }
             methods::SET_HARNESS_ENABLED => {
                 let include = include_registry(&params);
@@ -4174,14 +4330,28 @@ impl RpcService for EngineRpc {
             }
             methods::QUEUE_MESSAGE => {
                 let p: QueueMessageParams = parse_params(params)?;
+                if let Some(cfg) = &p.config {
+                    let switching = self
+                        .workspace
+                        .chat(&p.chat_id)
+                        .map_err(|e| RpcError::Failed(e.to_string()))?
+                        .and_then(|chat| chat.config)
+                        .is_some_and(|current| current.harness != cfg.harness);
+                    if switching && !self.host_switches_providers(&p.chat_id) {
+                        return Err(RpcError::Failed(
+                            "This chat's computer needs a newer Zeron to switch provider".into(),
+                        ));
+                    }
+                }
                 let id = self
                     .doc_host
-                    .queue_message_with_transfers(
+                    .queue_message_with_config(
                         &p.chat_id,
                         &p.text,
                         p.attachments,
                         p.hold_for_turn_end,
                         p.transfers,
+                        p.config,
                     )
                     .map_err(|e| RpcError::Failed(e.to_string()))?;
                 RpcReply::value(&serde_json::json!({ "id": id }))
@@ -4718,6 +4888,7 @@ impl RpcService for EngineRpc {
                         space_id.as_deref(),
                         device_id.as_deref(),
                         parent_chat_id.as_deref(),
+                        *child_kind,
                         branch.as_deref().filter(|b| !b.is_empty()),
                         *cloud,
                         cloud_reach.filter(|_| zeron_rpc::caller().is_local()),

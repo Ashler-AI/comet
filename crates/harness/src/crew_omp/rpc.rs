@@ -643,6 +643,7 @@ impl Dialogs {
             multi_select: false,
             prefill: frame.get("prefill").and_then(Value::as_str).filter(|_| free_text).map(str::to_owned),
             multiline: method == "editor",
+            note: None,
         };
         // OMP's `timeout` is in milliseconds: 0 is none, and a negative one
         // has run out already. One too large for a Duration is none.

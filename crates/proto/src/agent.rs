@@ -455,7 +455,10 @@ impl AccessMode {
 
     /// Resolve the requested mode against an agent's capabilities. Auto
     /// falls back only to a stricter offered mode; None means the run must
-    /// be refused. Other unsupported modes retain their legacy fallback.
+    /// be refused. Supervised and Auto-accept edits, when not offered but
+    /// Auto is, run in Auto (an agent with a reviewer must not turn a
+    /// request for more oversight into full access). Other unsupported
+    /// modes retain their legacy fallback to full access.
     pub fn honored_by(self, modes: &[AccessMode]) -> Option<AccessMode> {
         if modes.contains(&self) {
             return Some(self);
@@ -464,6 +467,11 @@ impl AccessMode {
             return [AccessMode::AutoAcceptEdits, AccessMode::Supervised]
                 .into_iter()
                 .find(|mode| modes.contains(mode));
+        }
+        if matches!(self, AccessMode::Supervised | AccessMode::AutoAcceptEdits)
+            && modes.contains(&AccessMode::Auto)
+        {
+            return Some(AccessMode::Auto);
         }
         Some(AccessMode::FullAccess)
     }
@@ -615,6 +623,23 @@ pub struct RunRequest {
     /// changing anything. Honored by harnesses that advertise it.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub plan: bool,
+    /// Code Mode: enable the provider's scriptable JavaScript tool-calling
+    /// runtime (Settings → Providers). Stamped by the HOST engine before a
+    /// run launches, like `mcp` and `extra_mcp`; honored by drivers that
+    /// support it (`zeron_harness::supports_code_mode`). Additive +
+    /// serde-defaulted for wire compat.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub code_mode: bool,
+    /// Load only the MCP servers this request carries (`mcp`, `extra_mcp`):
+    /// the agent's own (its user config's servers, its account's
+    /// connectors such as ChatGPT apps or claude.ai's) stay off for the
+    /// run, so they don't double Zeron's managed servers and their tool
+    /// tokens. Stamped by the host from Settings → Providers like
+    /// `code_mode`; honored by drivers that support it
+    /// (`zeron_harness::supports_zeron_mcp_only`). Additive +
+    /// serde-defaulted for wire compat.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub zeron_mcp_only: bool,
     /// Harness-native session id to resume, if any.
     pub resume: Option<String>,
     /// Absolute paths of image attachments already staged on the run device
@@ -674,6 +699,8 @@ impl std::fmt::Debug for RunRequest {
             auto_approve,
             access,
             plan,
+            code_mode,
+            zeron_mcp_only,
             resume,
             attachments,
             worktree,
@@ -692,6 +719,8 @@ impl std::fmt::Debug for RunRequest {
             .field("auto_approve", auto_approve)
             .field("access", access)
             .field("plan", plan)
+            .field("code_mode", code_mode)
+            .field("zeron_mcp_only", zeron_mcp_only)
             .field("resume", resume)
             .field("attachments", attachments)
             .field("worktree", worktree)
@@ -1174,6 +1203,11 @@ pub struct UserInputQuestion {
     pub prefill: Option<String>,
     #[serde(default)]
     pub multiline: bool,
+    /// A short note from the agent's reviewer on why this is asked. Already
+    /// included in `question` for clients that only read text; a client that
+    /// knows the field can show it apart from what is asked.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -1415,6 +1449,19 @@ mod tests {
             AutoAcceptEdits.honored_by(&AccessMode::ALL),
             Some(AutoAcceptEdits)
         );
+    }
+
+    #[test]
+    fn stricter_modes_run_in_auto_when_only_auto_is_offered() {
+        use AccessMode::*;
+        let auto_and_full = [Auto, FullAccess];
+        assert_eq!(Supervised.honored_by(&auto_and_full), Some(Auto));
+        assert_eq!(AutoAcceptEdits.honored_by(&auto_and_full), Some(Auto));
+        assert_eq!(Auto.honored_by(&auto_and_full), Some(Auto));
+        assert_eq!(FullAccess.honored_by(&auto_and_full), Some(FullAccess));
+        // Full-only agents keep the legacy fallback.
+        assert_eq!(Supervised.honored_by(&[FullAccess]), Some(FullAccess));
+        assert_eq!(AutoAcceptEdits.honored_by(&[FullAccess]), Some(FullAccess));
     }
 
     #[test]

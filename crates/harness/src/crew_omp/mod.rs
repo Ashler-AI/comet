@@ -878,6 +878,8 @@ mod tests {
             worktree: None,
             mcp: None,
             extra_mcp: Vec::new(),
+            code_mode: false,
+            zeron_mcp_only: false,
             env: Default::default(),
         }
     }

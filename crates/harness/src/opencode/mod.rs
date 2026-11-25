@@ -445,7 +445,9 @@ impl OpencodeHarness {
         cwd: Option<&str>,
         mcp: Option<&zeron_proto::McpServer>,
     ) -> Result<Server, HarnessError> {
-        self.server_with_env(cwd, mcp, &[], &Default::default(), AccessMode::FullAccess)
+        // (A Cloud machine's credential keys for OpenCode: crate::catalog_env.)
+        let env = crate::catalog_env::get(self.id());
+        self.server_with_env(cwd, mcp, &[], &env, AccessMode::FullAccess)
             .await
     }
 
@@ -460,7 +462,15 @@ impl OpencodeHarness {
         run_env: &std::collections::BTreeMap<String, String>,
         access: AccessMode,
     ) -> Result<Server, HarnessError> {
-        if let Some(base) = &self.base_url {
+        // A Cloud machine's logins for OpenCode ride the run environment but
+        // never reach the server's process: they're installed through its
+        // credential API once it's up (`credentials`).
+        let mut run_env = run_env.clone();
+        let logins = run_env
+            .remove(credentials::CREDENTIALS_ENV)
+            .map(|raw| credentials::parse(&raw))
+            .transpose()?;
+        let mut server = if let Some(base) = &self.base_url {
             if !extra_mcp.is_empty() {
                 tracing::warn!(
                     target: "zeron_harness::opencode",
@@ -468,19 +478,27 @@ impl OpencodeHarness {
                     "attached to an existing opencode server; plugin MCP servers are skipped"
                 );
             }
-            return Ok(Server::attached(base.clone()));
+            Server::attached(base.clone())
+        } else {
+            let exe = self.resolve_executable()?;
+            Server::spawn_with_extras(
+                &exe,
+                cwd,
+                self.startup_timeout,
+                mcp,
+                extra_mcp,
+                &run_env,
+                access,
+            )
+            .await?
+        };
+        if let Some(logins) = logins
+            && let Err(error) = credentials::install(&server, &logins).await
+        {
+            server.shutdown(self.kill_grace).await;
+            return Err(error);
         }
-        let exe = self.resolve_executable()?;
-        Server::spawn_with_extras(
-            &exe,
-            cwd,
-            self.startup_timeout,
-            mcp,
-            extra_mcp,
-            run_env,
-            access,
-        )
-        .await
+        Ok(server)
     }
 
     /// One short-lived server answers both discovery calls. Also primes the
@@ -4749,6 +4767,7 @@ fn map_questions(props: &Value) -> Vec<(String, UserInputQuestion)> {
                     Some((
                         key,
                         UserInputQuestion {
+                            note: None,
                             id: new_message_id(),
                             header: q
                                 .get("header")
@@ -5637,6 +5656,9 @@ impl SseDecoder {
     }
 }
 
+mod credentials;
+pub use credentials::CREDENTIALS_ENV;
+
 #[cfg(test)]
 mod tests;
 
@@ -5807,8 +5829,9 @@ fn mcp_config(
     Ok(config.to_string())
 }
 
-/// [`mcp_config`] for Zeron's own server and then each plugin server
-/// ([`RunRequest::extra_mcp`]); the inherited config passes through
+/// [`mcp_config`] for each extra server ([`RunRequest::extra_mcp`]) and then
+/// Zeron's own server (inserted last so an extra named `"zeron"` cannot
+/// overwrite Zeron's built-in server); the inherited config passes through
 /// untouched when there are none.
 fn mcp_configs(
     inherited: Option<String>,
@@ -5817,7 +5840,7 @@ fn mcp_configs(
     protocol: Protocol,
 ) -> Result<Option<String>, HarnessError> {
     let mut inline = inherited;
-    for server in mcp.into_iter().chain(extras) {
+    for server in extras.iter().chain(mcp) {
         inline = Some(mcp_config(inline.as_deref(), server, protocol)?);
     }
     Ok(inline)
@@ -6011,7 +6034,7 @@ mod mcp_injection_tests {
             mcp_configs(Some("{\"model\":\"keep\"}".into()), None, &[], Protocol::V1).unwrap(),
             Some("{\"model\":\"keep\"}".into())
         );
-        for (protocol, servers) in [(Protocol::V1, "/mcp"), (Protocol::V2, "/mcp/servers")] {
+        for (protocol, pointer) in [(Protocol::V1, "/mcp"), (Protocol::V2, "/mcp/servers")] {
             let inline = mcp_configs(
                 Some(r#"{"model":"keep"}"#.into()),
                 Some(&zeron),
@@ -6022,7 +6045,7 @@ mod mcp_injection_tests {
             .unwrap();
             let config: Value = serde_json::from_str(&inline).unwrap();
             assert_eq!(config["model"], "keep");
-            let servers = config.pointer(servers).unwrap();
+            let servers = config.pointer(pointer).unwrap();
             assert_eq!(
                 servers["zeron"]["command"],
                 json!(["/opt/zeron/zeron", "mcp"])
@@ -6034,6 +6057,29 @@ mod mcp_injection_tests {
             );
             assert_eq!(plugin["environment"], json!({ "FOCUS": "1" }));
             assert_eq!(plugin["type"], "local");
+
+            // An extra server named "zeron" must never overwrite Zeron's built-in server.
+            let colliding = zeron_proto::McpServer {
+                name: "zeron".into(),
+                command: "/tmp/impostor".into(),
+                args: vec![],
+                env: Default::default(),
+                http: None,
+            };
+            let guarded = mcp_configs(None, Some(&zeron), &[colliding, extra.clone()], protocol)
+                .unwrap()
+                .unwrap();
+            let config: Value = serde_json::from_str(&guarded).unwrap();
+            let servers = config.pointer(pointer).unwrap();
+            assert_eq!(
+                servers["zeron"]["command"],
+                json!(["/opt/zeron/zeron", "mcp"]),
+                "built-in zeron server must win over colliding extra"
+            );
+            assert_eq!(
+                servers["plugin-focus"]["command"],
+                json!(["/data/plugins/.loaded/focus/0123/bin/server", "--stdio"])
+            );
         }
     }
 

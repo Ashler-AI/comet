@@ -100,6 +100,8 @@ fn request(mode: &str, work: &Path) -> RunRequest {
         auto_approve: true,
         access: Default::default(),
         plan: false,
+        code_mode: false,
+        zeron_mcp_only: false,
         resume: None,
         attachments: Vec::new(),
         worktree: None,

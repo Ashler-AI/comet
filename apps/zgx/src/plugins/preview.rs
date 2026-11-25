@@ -82,7 +82,6 @@ pub const BLOCKED: &[&str] = &[
     // (An API key, and what an agent's keys are called.)
     "agents.add_key",
     // (The API key every Cloud machine's agent uses, kept by the vault.)
-    "agents.cloud_key",
     "agents.rename",
     "agents.sign_in",
     "agents.sign_out",
@@ -108,6 +107,14 @@ pub const BLOCKED: &[&str] = &[
     // (What a Cloud chat reaches: the person's own choice.)
     "cloud.set_reach",
     "cloud.set_session_reach",
+    // Managed MCP servers and their OAuth/credential flows.
+    "mcp.upsert",
+    "mcp.set_enabled",
+    "mcp.delete",
+    "mcp.start_auth",
+    "mcp.cancel_auth",
+    "mcp.disconnect_auth",
+    "mcp.resolve_request",
 ];
 
 pub fn blocked(action: &str) -> bool {

@@ -161,7 +161,7 @@ impl AgentAccounts {
             }
             Provider::Openai => {
                 let start = self
-                    .start_capture_login(HarnessId::Codex, keep_in(captured.clone()))
+                    .start_capture_login(HarnessId::Codex, None, keep_in(captured.clone()))
                     .await?;
                 (start, None)
             }

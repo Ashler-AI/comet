@@ -212,6 +212,14 @@ struct RunHandle {
     /// server, so with no IPC port served ([`Inner::zeron_mcp`] returns
     /// `None`) the provider keeps its subagents.
     side_chats_only: bool,
+    /// Launched with Code Mode enabled (Settings → Providers): a parked
+    /// session whose setting has since flipped is replaced before its next
+    /// turn.
+    code_mode: bool,
+    /// Launched with only Zeron's MCP servers (Settings → Providers): its
+    /// MCP servers are fixed at launch, so a parked session whose setting
+    /// has since flipped is replaced before its next turn.
+    zeron_mcp_only: bool,
 }
 
 /// Which CLI binary a run of `harness` launches now: its real path, size and
@@ -288,6 +296,9 @@ struct Inner {
     /// Rung as the port is recorded: what a run revived on boot, while the
     /// engine is still being assembled, waits on ([`SessionsEngine::ipc_port_ready`]).
     ipc_ready: tokio::sync::Notify,
+    /// This engine will serve one ([`expect_ipc_port`]): every run started
+    /// before it does waits for it, not only one revived on boot.
+    ipc_expected: std::sync::atomic::AtomicBool,
     /// Set when this engine will serve no port at all
     /// ([`SessionsEngine::set_no_ipc_port`]): that wait ends at once.
     ipc_none: std::sync::atomic::AtomicBool,
@@ -343,6 +354,9 @@ struct Inner {
     turn_listener: OnceLock<TurnListener>,
     /// Plugins whose native MCP servers local runs get (absent in bare tests).
     plugins: OnceLock<crate::plugins::Plugins>,
+    /// Managed external MCP servers (Vault + local) stamped into runs and served
+    /// through the loopback MCP Gateway (absent in bare tests).
+    mcp_servers: OnceLock<Arc<crate::mcp_servers::McpServers>>,
     /// New chats' warm starts, by the id the chat will be created with
     /// ([`warm_start`]).
     warm: Mutex<HashMap<String, warm_start::WarmStart>>,
@@ -467,6 +481,18 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
+/// Whether engines made from here on serve an IPC port ([`expect_ipc_port`]).
+static IPC_EXPECTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// This process's engine serves an IPC port, once it's assembled
+/// ([`SessionsEngine::set_ipc_port`]): runs started before then wait for it.
+/// Said before assembly, which may start one. Never by an embedder that
+/// serves none (an in-process engine), whose runs go on without.
+#[doc(hidden)]
+pub fn expect_ipc_port(expected: bool) {
+    IPC_EXPECTED.store(expected, std::sync::atomic::Ordering::Release);
+}
+
 #[derive(Clone)]
 pub struct SessionsEngine {
     inner: Arc<Inner>,
@@ -492,6 +518,9 @@ impl SessionsEngine {
                 cancelled_sends: Mutex::new(HashMap::new()),
                 user_stops: Mutex::new(HashMap::new()),
                 ipc_port: std::sync::atomic::AtomicU16::new(0),
+                ipc_expected: std::sync::atomic::AtomicBool::new(
+                    IPC_EXPECTED.load(std::sync::atomic::Ordering::Acquire),
+                ),
                 ipc_ready: tokio::sync::Notify::new(),
                 ipc_none: std::sync::atomic::AtomicBool::new(false),
                 ipc_token_file: Mutex::new(None),
@@ -515,6 +544,7 @@ impl SessionsEngine {
                 scratch_root: OnceLock::new(),
                 turn_listener: OnceLock::new(),
                 plugins: OnceLock::new(),
+                mcp_servers: OnceLock::new(),
                 warm: Mutex::new(HashMap::new()),
                 warm_leases: Mutex::new(None),
             }),
@@ -551,28 +581,7 @@ impl SessionsEngine {
     /// revived run went out with no Zeron tools (its agent read them as gone,
     /// and a parent woken by its children's reports couldn't answer them).
     async fn ipc_port_ready(&self, limit: std::time::Duration) {
-        let deadline = tokio::time::Instant::now() + limit;
-        loop {
-            // (Made before the check: `notify_waiters` reaches a `Notified`
-            // from its making, polled or not.)
-            let rung = self.inner.ipc_ready.notified();
-            // (Acquire: the bearer, recorded before the port, is seen too.)
-            let port = self
-                .inner
-                .ipc_port
-                .load(std::sync::atomic::Ordering::Acquire);
-            if port != 0
-                || self
-                    .inner
-                    .ipc_none
-                    .load(std::sync::atomic::Ordering::Acquire)
-            {
-                return;
-            }
-            if tokio::time::timeout_at(deadline, rung).await.is_err() {
-                return;
-            }
-        }
+        self.inner.ipc_port_ready(limit).await;
     }
 
     /// Record where the served port's bearer lives (`{data_dir}/ipc-token`).
@@ -592,6 +601,22 @@ impl SessionsEngine {
         &self,
         service: Arc<dyn zeron_rpc::RpcService>,
     ) -> std::io::Result<()> {
+        let external = self
+            .inner
+            .mcp_servers
+            .get()
+            .map(crate::mcp_servers::McpServers::gateway);
+        self.serve_mcp_endpoint_with_external(service, external)
+            .await
+    }
+
+    /// Like [`Self::serve_mcp_endpoint`], with an explicit external MCP proxy
+    /// override.
+    pub async fn serve_mcp_endpoint_with_external(
+        &self,
+        service: Arc<dyn zeron_rpc::RpcService>,
+        external: Option<Arc<dyn zeron_mcp::http::ExternalMcpProxy>>,
+    ) -> std::io::Result<()> {
         let factory: zeron_mcp::http::ToolsFactory = Arc::new(move |origin: &zeron_mcp::Origin| {
             let chat = origin.chat_id.clone().unwrap_or_default();
             Arc::new(zeron_mcp::Tools::new(Arc::new(zeron_mcp::Zeron::with_client(
@@ -599,7 +624,7 @@ impl SessionsEngine {
                 origin.clone(),
             ))))
         });
-        let endpoint = zeron_mcp::http::McpHttpServer::bind(factory).await?;
+        let endpoint = zeron_mcp::http::McpHttpServer::bind_with_external(factory, external).await?;
         *lock(&self.inner.mcp_endpoint) = Some(Arc::new(endpoint));
         Ok(())
     }
@@ -622,6 +647,12 @@ impl SessionsEngine {
     /// Wire the plugins service: local runs get its native MCP servers.
     pub fn set_plugins(&self, plugins: crate::plugins::Plugins) {
         let _ = self.inner.plugins.set(plugins);
+    }
+
+    /// Wire the managed external MCP servers service: runs get enabled remote
+    /// (gateway) and stdio servers stamped into `extra_mcp`.
+    pub fn set_mcp_servers(&self, mcp_servers: Arc<crate::mcp_servers::McpServers>) {
+        let _ = self.inner.mcp_servers.set(mcp_servers);
     }
 
     /// Wire the doc host (called once at engine assembly; the two services are mutually
@@ -1022,12 +1053,42 @@ impl SessionsEngine {
         lock(&self.inner.runs).get(chat_id).map(|h| h.runtime_config.harness_id)
     }
 
+    /// Whether the chat's live turn (if one is in flight) already runs with
+    /// `config`'s harness, model, reasoning, and model options — i.e., whether
+    /// a queued row carrying `config` may steer into the live turn rather than
+    /// waiting for or starting a fresh turn on the new configuration.
+    pub fn live_run_matches_config(
+        &self,
+        chat_id: &str,
+        config: &zeron_proto::ChatConfig,
+    ) -> bool {
+        if !self.turn_in_flight(chat_id) {
+            return true;
+        }
+        let runs = lock(&self.inner.runs);
+        let Some(handle) = runs.get(chat_id) else {
+            return true;
+        };
+        let r = &handle.runtime_config.request;
+        handle.runtime_config.harness_id == config.harness
+            && r.model == config.model
+            && r.reasoning == config.reasoning
+            && r.model_options == config.model_options
+    }
+
     /// Mark the provider-switch seam for a send about to run on `harness_id`
     /// now, with its message, rather than once the dispatch has replaced the
     /// outgoing provider's runtime (seconds later). Idempotent: the dispatch's
     /// own note finds the seam already written.
-    pub fn note_provider_switch(&self, chat_id: &str, harness_id: HarnessId, doc: &ChatDocHandle) {
-        self.inner.note_provider_switch(chat_id, harness_id, doc);
+    pub fn note_provider_switch(
+        &self,
+        chat_id: &str,
+        harness_id: HarnessId,
+        doc: &ChatDocHandle,
+        before_message_id: Option<&str>,
+    ) {
+        self.inner
+            .note_provider_switch(chat_id, harness_id, doc, before_message_id);
     }
 
     /// Whether an accepted agent update gates the chat's live run, so a new
@@ -1228,6 +1289,11 @@ impl SessionsEngine {
             tracing::info!(chat = %chat_id, "auto-resume skipped: the chat moved on");
             return Ok(String::new());
         }
+        // Code Mode is owned by this host's provider settings and stamped in
+        // `drive_run`; normalize here so parked-session routing and mid-turn
+        // guards go through `code_mode_changed`.
+        request.code_mode = false;
+        request.zeron_mcp_only = false;
         let routed = lock(&self.inner.runs).get(chat_id).map(|h| {
             (
                 h.run_id.clone(),
@@ -1241,6 +1307,8 @@ impl SessionsEngine {
                 h.binary.clone(),
                 h.runtime_config.harness.clone(),
                 h.side_chats_only,
+                h.code_mode,
+                h.zeron_mcp_only,
             )
         });
         if let Some((
@@ -1255,6 +1323,8 @@ impl SessionsEngine {
             binary,
             live_harness,
             side_chats_only,
+            code_mode,
+            zeron_mcp_only,
         )) = routed
         {
             if idle {
@@ -1267,8 +1337,8 @@ impl SessionsEngine {
                 };
             }
             // A parked session started with another account (Cloud), from a
-            // CLI binary since updated, or with native subagents since
-            // switched: replace it.
+            // CLI binary since updated, or with native subagents or Code Mode
+            // since switched: replace it.
             let route = if self
                 .credential_changed(chat_id, harness_id, credential.as_deref())
                 .await
@@ -1276,6 +1346,8 @@ impl SessionsEngine {
                     .binary_changed(chat_id, harness_id, live_harness, binary.as_deref())
                     .await
                 || self.native_subagents_changed(chat_id, harness_id, side_chats_only)
+                || self.code_mode_changed(chat_id, harness_id, code_mode)
+                || self.zeron_mcp_only_changed(chat_id, harness_id, zeron_mcp_only)
             {
                 None
             } else {
@@ -1421,7 +1493,7 @@ impl SessionsEngine {
             // has changed provider: mark the seam above this message, before
             // the resume lookup below turns the foreign session id away.
             self.inner
-                .note_provider_switch(chat_id, harness_id, &handle);
+                .note_provider_switch(chat_id, harness_id, &handle, Some(&user_id));
             handle.write_user_message(&user_id, &request.prompt, now_ms())?;
         }
         let credential = self.inner.registry.run_credential(harness_id, Some(chat_id)).await;
@@ -1433,6 +1505,8 @@ impl SessionsEngine {
                 .flatten()
         };
         let side_chats_only = self.inner.side_chats_only(chat_id, harness_id);
+        let code_mode = self.inner.registry.code_mode(harness_id);
+        let zeron_mcp_only = self.inner.zeron_mcp_only(harness_id);
 
         // Engine-owned resume (zeron sessions.ts:736 — every dispatch read the
         // chat's stored harness session): callers always send `resume: None`;
@@ -1595,6 +1669,8 @@ impl SessionsEngine {
                 credential,
                 binary,
                 side_chats_only,
+                code_mode,
+                zeron_mcp_only,
             },
         );
         drop(runs);
@@ -1656,6 +1732,8 @@ impl SessionsEngine {
             },
             turn,
             side_chats_only,
+            code_mode,
+            zeron_mcp_only,
             title,
         ));
         Ok(run_id)
@@ -1737,6 +1815,47 @@ impl SessionsEngine {
         }
         tracing::info!(chat = %chat_id, harness = ?harness_id,
             "native subagents switched; replacing the parked session");
+        true
+    }
+
+    /// Whether a session parked between turns launched with Code Mode
+    /// otherwise than a run would launch now (Settings → Providers). Same
+    /// guards as [`Self::credential_changed`].
+    fn code_mode_changed(
+        &self,
+        chat_id: &str,
+        harness_id: HarnessId,
+        started_code_mode: bool,
+    ) -> bool {
+        let code_mode = self.inner.registry.code_mode(harness_id);
+        if started_code_mode == code_mode
+            || self.turn_in_flight(chat_id)
+            || self.holds_background_work(chat_id)
+        {
+            return false;
+        }
+        tracing::info!(chat = %chat_id, harness = ?harness_id,
+            "code mode switched; replacing the parked session");
+        true
+    }
+
+    /// Whether a session parked between turns launched with "Only Zeron's
+    /// MCP servers" otherwise than a run would launch now (Settings →
+    /// Providers). Same guards as [`Self::code_mode_changed`].
+    fn zeron_mcp_only_changed(
+        &self,
+        chat_id: &str,
+        harness_id: HarnessId,
+        started: bool,
+    ) -> bool {
+        if started == self.inner.zeron_mcp_only(harness_id)
+            || self.turn_in_flight(chat_id)
+            || self.holds_background_work(chat_id)
+        {
+            return false;
+        }
+        tracing::info!(chat = %chat_id, harness = ?harness_id,
+            "MCP servers switched; replacing the parked session");
         true
     }
 
@@ -2495,6 +2614,8 @@ impl SessionsEngine {
                     auto_approve: false,
                     access: Default::default(),
                     plan: false,
+                    code_mode: false,
+                    zeron_mcp_only: false,
                     attachments: Vec::new(),
                     resume: None,
                     worktree: None,
@@ -3113,6 +3234,12 @@ impl Inner {
             .is_some_and(|handle| handle.continues_with_sent_message())
     }
 
+    /// Whether a run of `harness_id` gets only Zeron's MCP servers, its own
+    /// hidden: the person's choice in Settings → Providers (off until then).
+    pub(super) fn zeron_mcp_only(&self, harness_id: HarnessId) -> bool {
+        self.registry.zeron_mcp_only(harness_id)
+    }
+
     /// Whether a run of `chat_id` launches without its provider's own
     /// subagents (Settings → Providers), delegating through side chats
     /// instead. Never for a chat that has a parent: delegation is one level
@@ -3128,6 +3255,25 @@ impl Inner {
                         .flatten()
                         .is_some_and(|chat| chat.parent_chat_id.is_some())
             })
+    }
+
+    /// [`SessionsEngine::ipc_port_ready`].
+    async fn ipc_port_ready(&self, limit: std::time::Duration) {
+        let deadline = tokio::time::Instant::now() + limit;
+        loop {
+            // (Made before the check: `notify_waiters` reaches a `Notified`
+            // from its making, polled or not.)
+            let rung = self.ipc_ready.notified();
+            // (Acquire: the bearer, recorded before the port, is seen too.)
+            if self.ipc_port.load(std::sync::atomic::Ordering::Acquire) != 0
+                || self.ipc_none.load(std::sync::atomic::Ordering::Acquire)
+            {
+                return;
+            }
+            if tokio::time::timeout_at(deadline, rung).await.is_err() {
+                return;
+            }
+        }
     }
 
     /// Zeron's own MCP server for a run of `chat_id`, stamped with the
@@ -3241,6 +3387,45 @@ impl Inner {
             },
             None,
         ))
+    }
+
+    /// Before a run's servers are collected: the vault's MCP connections
+    /// listed again when stale, so one added on another device is there.
+    pub(super) async fn refresh_mcp_servers_for_run(&self) {
+        if let Some(mcp_servers) = self.mcp_servers.get() {
+            mcp_servers.refresh_for_run().await;
+        }
+    }
+
+    /// Collect all extra MCP servers stamped onto an agent run: allowed
+    /// plugins' native MCP servers plus managed external MCP servers (remote
+    /// servers routed via the loopback MCP Gateway + local stdio servers).
+    /// Names are deduplicated and `"zeron"` is always reserved.
+    pub(super) fn extra_mcp_servers(
+        &self,
+        grant: Option<&zeron_mcp::http::Grant>,
+    ) -> Vec<zeron_proto::McpServer> {
+        let mut out = self
+            .plugins
+            .get()
+            .map(crate::plugins::Plugins::native_mcp_servers)
+            .unwrap_or_default();
+        let mut seen: std::collections::HashSet<String> = out
+            .iter()
+            .map(|s| s.name.clone())
+            .collect();
+        seen.insert("zeron".to_owned());
+
+        if let Some(mcp_servers) = self.mcp_servers.get() {
+            let endpoint = lock(&self.mcp_endpoint).clone();
+            let token = grant.map(zeron_mcp::http::Grant::token);
+            for server in mcp_servers.extra_mcp_servers(endpoint.as_deref(), token) {
+                if seen.insert(server.name.clone()) {
+                    out.push(server);
+                }
+            }
+        }
+        out
     }
 
     fn workspace(&self) -> Option<crate::workspace_host::WorkspaceHost> {
@@ -3684,7 +3869,13 @@ impl Inner {
     /// [`Self::resume_for`]. On the first switch, the outgoing provider's
     /// session is recorded as having seen the whole transcript so far, so a
     /// switch back can resume it.
-    fn note_provider_switch(&self, chat_id: &str, harness_id: HarnessId, doc: &ChatDocHandle) {
+    fn note_provider_switch(
+        &self,
+        chat_id: &str,
+        harness_id: HarnessId,
+        doc: &ChatDocHandle,
+        before_message_id: Option<&str>,
+    ) {
         let entries = doc.doc().read_entries().unwrap_or_default();
         let owned = || self.owned_session(chat_id);
         let previous = match crate::doc_host::latest_switch(&entries) {
@@ -3728,6 +3919,7 @@ impl Inner {
             (previous, &label(previous)),
             (harness_id, &label(harness_id)),
             now_ms(),
+            before_message_id,
         ) {
             Ok(true) => tracing::info!(
                 chat = %chat_id,
@@ -3807,50 +3999,6 @@ impl Inner {
                 })?
             }
         };
-        let history: Vec<_> = entries[..end]
-            .iter()
-            .map(|entry| {
-                let text = entry
-                    .parts
-                    .iter()
-                    .filter_map(|part| match part {
-                        zeron_doc::MessagePart::Text { text, .. } => Some(text.clone()),
-                        zeron_doc::MessagePart::Tool { call, output, .. } => Some(format!(
-                            "Tool: {}\n{}",
-                            serde_json::to_string(call).unwrap_or_default(),
-                            clip_chars(
-                                output.as_deref().unwrap_or_default(),
-                                HISTORY_TOOL_OUTPUT_CHARS
-                            )
-                        )),
-                        _ => None,
-                    })
-                    .collect::<Vec<_>>()
-                    .join("\n");
-                (entry.role, clip_chars(&text, HISTORY_MESSAGE_CHARS))
-            })
-            .filter(|(_, text)| !text.is_empty())
-            .map(|(role, text)| serde_json::json!({ "role": role, "text": text }))
-            .collect();
-        // Newest messages win the budget: what was just said matters most.
-        let mut budget = HISTORY_REPLAY_CHARS;
-        let mut kept = history
-            .iter()
-            .rev()
-            .take_while(|message| {
-                let cost = message.to_string().len();
-                let fits = cost <= budget;
-                budget = budget.saturating_sub(cost);
-                fits
-            })
-            .count();
-        // A single message over the whole budget still goes out (clipped).
-        kept = kept.max(1.min(history.len()));
-        let omitted = history.len() - kept;
-        let history = &history[omitted..];
-        if history.is_empty() {
-            return None;
-        }
         let intro = if watermark.is_some() {
             "While you were away, this conversation continued with a different AI provider. The messages you missed are below; answer the final request as the continuation of the whole conversation. Tool calls listed below ran on the other provider — do not assume their state is still live."
         } else if switched {
@@ -3858,17 +4006,93 @@ impl Inner {
         } else {
             "Continue this side conversation using the following prior conversation as context."
         };
-        let omitted_note = if omitted > 0 {
-            format!("({omitted} earlier messages omitted for length.)\n")
-        } else {
-            String::new()
-        };
-        Some(format!(
-            "{intro}\n{omitted_note}<conversation>\n{}\n</conversation>\n\n{}",
-            serde_json::to_string(history).unwrap_or_default(),
-            prompt
-        ))
+        format_history_prompt(&entries[..end], prompt, intro)
     }
+
+    /// `prompt` wrapped with the chat's prior transcript (`current` excluded)
+    /// for recovering into a fresh provider session when the old one is lost
+    /// or corrupted. Returns `None` for native slash commands or empty history.
+    fn recovery_history_prompt(
+        &self,
+        doc: &SessionDoc,
+        harness_id: HarnessId,
+        prompt: &str,
+        current: Option<&str>,
+    ) -> Option<String> {
+        if native_command(prompt, harness_id) {
+            return None;
+        }
+        let mut entries = doc.read_entries().unwrap_or_default();
+        entries.retain(|entry| Some(entry.id.as_str()) != current);
+        format_history_prompt(
+            &entries,
+            prompt,
+            "Your previous session could not be restored, so this turn is continuing in a fresh session. The earlier conversation is below as context; answer the final request as the direct continuation of that conversation. Tool calls listed below ran in the previous session — do not assume their state is still live.",
+        )
+    }
+}
+
+/// Format `entries` within [`HISTORY_REPLAY_CHARS`] (newest messages win) in
+/// front of `prompt`, or `None` if `entries` carry no replayable text/tools.
+fn format_history_prompt(
+    entries: &[zeron_doc::SessionMessageEntry],
+    prompt: &str,
+    intro: &str,
+) -> Option<String> {
+    let history: Vec<_> = entries
+        .iter()
+        .map(|entry| {
+            let text = entry
+                .parts
+                .iter()
+                .filter_map(|part| match part {
+                    zeron_doc::MessagePart::Text { text, .. } => Some(text.clone()),
+                    zeron_doc::MessagePart::Tool { call, output, .. } => Some(format!(
+                        "Tool: {}\n{}",
+                        serde_json::to_string(call).unwrap_or_default(),
+                        clip_chars(
+                            output.as_deref().unwrap_or_default(),
+                            HISTORY_TOOL_OUTPUT_CHARS
+                        )
+                    )),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            (entry.role, clip_chars(&text, HISTORY_MESSAGE_CHARS))
+        })
+        .filter(|(_, text)| !text.is_empty())
+        .map(|(role, text)| serde_json::json!({ "role": role, "text": text }))
+        .collect();
+    // Newest messages win the budget: what was just said matters most.
+    let mut budget = HISTORY_REPLAY_CHARS;
+    let mut kept = history
+        .iter()
+        .rev()
+        .take_while(|message| {
+            let cost = message.to_string().len();
+            let fits = cost <= budget;
+            budget = budget.saturating_sub(cost);
+            fits
+        })
+        .count();
+    // A single message over the whole budget still goes out (clipped).
+    kept = kept.max(1.min(history.len()));
+    let omitted = history.len() - kept;
+    let history = &history[omitted..];
+    if history.is_empty() {
+        return None;
+    }
+    let omitted_note = if omitted > 0 {
+        format!("({omitted} earlier messages omitted for length.)\n")
+    } else {
+        String::new()
+    };
+    Some(format!(
+        "{intro}\n{omitted_note}<conversation>\n{}\n</conversation>\n\n{}",
+        serde_json::to_string(history).unwrap_or_default(),
+        prompt
+    ))
 }
 
 /// Whether the provider routes this prompt as a native command: a command
@@ -4073,6 +4297,11 @@ fn resume_rejected(error: &str) -> bool {
         "conversation not found",
         "session not found",
         "thread not found",
+        "failed to setup trajectory",
+        "failed to load/create db trajectory",
+        "donech for checkpoint",
+        "file is not a database",
+        "database disk image is malformed",
     ]
     .iter()
     .any(|phrase| error.contains(phrase))
@@ -4576,6 +4805,8 @@ async fn drive_run(
     resume_state: RunResumeState,
     turn: TurnControl,
     side_chats_only: bool,
+    code_mode: bool,
+    zeron_mcp_only: bool,
     mut title: Option<crate::titles::TitleAfterFirstOutput>,
 ) {
     let device_id = inner.device_id.clone();
@@ -4614,15 +4845,22 @@ async fn drive_run(
             taken = inner.take_warm(&chat_id, harness_id) => taken,
         }
     };
-    // Launched with native subagents switched otherwise than now: its Zeron
-    // server and the CLI's flags are another runtime's.
-    if warm
-        .as_ref()
-        .is_some_and(|taken| taken.parked.side_chats_only != side_chats_only)
-        && let Some(taken) = warm.take()
+    // Launched with native subagents or Code Mode switched otherwise than now:
+    // its Zeron server and the CLI's flags are another runtime's.
+    if let Some(reason) = warm.as_ref().and_then(|taken| {
+        if taken.parked.side_chats_only != side_chats_only {
+            Some("native subagents switched")
+        } else if taken.parked.code_mode != code_mode {
+            Some("code mode switched")
+        } else if taken.parked.zeron_mcp_only != zeron_mcp_only {
+            Some("MCP servers switched")
+        } else {
+            None
+        }
+    }) && let Some(taken) = warm.take()
     {
         inner
-            .discard_taken(harness.as_ref(), &chat_id, taken, "native subagents switched")
+            .discard_taken(harness.as_ref(), &chat_id, taken, reason)
             .await;
     }
     if let Some(taken) = warm.as_mut()
@@ -4631,6 +4869,17 @@ async fn drive_run(
         request.mcp = taken.parked.mcp.take();
         _mcp_grant = taken.parked.grant.take();
     }
+    // A message that waited out a restart (an update's, on a Cloud machine it
+    // woke) starts its run while the engine is still being assembled: the run
+    // waits for the tools it's about to serve. Without them it went out with
+    // no Zeron tools and no MCP servers, and its session kept running so.
+    if request.mcp.is_none() && inner.ipc_expected.load(std::sync::atomic::Ordering::Acquire) {
+        tokio::select! {
+            biased;
+            _ = controls.interrupt.cancelled() => {}
+            () = inner.ipc_port_ready(std::time::Duration::from_secs(10)) => {}
+        }
+    }
     if request.mcp.is_none()
         && let Some((server, grant)) =
             inner.zeron_mcp(&chat_id, side_chats_only, harness.wakes_on_background())
@@ -4638,13 +4887,12 @@ async fn drive_run(
         request.mcp = Some(server);
         _mcp_grant = grant;
     }
-    // Plugins' native MCP servers come from this host's own allowed plugins,
-    // run from their verified snapshots — never from what a sender put here.
-    request.extra_mcp = inner
-        .plugins
-        .get()
-        .map(crate::plugins::Plugins::native_mcp_servers)
-        .unwrap_or_default();
+    // Plugins' native MCP servers and managed external MCP servers come from
+    // this host's own configuration — never from what a sender put here.
+    inner.refresh_mcp_servers_for_run().await;
+    request.extra_mcp = inner.extra_mcp_servers(_mcp_grant.as_ref());
+    request.code_mode = code_mode;
+    request.zeron_mcp_only = zeron_mcp_only;
     // The MCP servers the agent starts from this run's config: the only
     // children it may hold when stopped idle (see the reaper).
     let mut known_servers: Vec<zeron_harness::process::KnownServer> = request
@@ -4695,6 +4943,17 @@ async fn drive_run(
             .fork_history_sent
             .store(true, std::sync::atomic::Ordering::Release);
     }
+    // If a resumed provider session is lost or corrupted on disk, give the
+    // driver the prior transcript to replay into the fresh fallback session so
+    // the conversation continues with context instead of starting blank.
+    if !resume_state.idle && request.resume.is_some() && !carried_history {
+        controls.turn.set_recovery_prompt(inner.recovery_history_prompt(
+            &doc,
+            harness_id,
+            &request.prompt,
+            Some(&resume_state.user_message_id),
+        ));
+    }
     // Startup can stop before the SDK saves user text, with no new session
     // ID or receipt. Bridge that unacknowledged tail from our transcript;
     // a fresh session needs all prior user text, not just the latest tail.
@@ -4732,12 +4991,23 @@ async fn drive_run(
         }
     }
     let mut prepared_events = std::collections::VecDeque::new();
-    // The provider lost the conversation this run was meant to resume: the
-    // reply opens by saying it starts over in a new session.
+    // The provider lost the conversation this run was meant to resume: carry
+    // the chat's prior transcript into the fresh session and note it.
     if !resume_state.idle
         && resumed_session.is_none()
         && lock(&inner.fresh_start_notices).remove(&chat_id)
     {
+        if !carried_history
+            && let Some(prompt) = inner.recovery_history_prompt(
+                &doc,
+                harness_id,
+                &request.prompt,
+                Some(&resume_state.user_message_id),
+            )
+        {
+            request.prompt = prompt;
+            carried_history = true;
+        }
         prepared_events.push_back(AgentEvent::Error {
             message: FRESH_START_NOTICE.into(),
         });
@@ -7159,6 +7429,8 @@ mod tests {
             auto_approve: true,
             access: Default::default(),
             plan: false,
+            code_mode: false,
+            zeron_mcp_only: false,
             resume: None,
             attachments: Vec::new(),
             worktree: None,

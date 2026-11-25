@@ -64,6 +64,11 @@
         "offline": "Crew can't reach the registry right now: this is the list from earlier.",
         "unavailable_hint": "Crew can't reach it right now. Try again in a moment.",
         "failed_offline": "Crew can't reach {device}. Nothing was changed."
+      },
+      "zeron_mcp_only": {
+        "label": "Only Crew's MCP servers",
+        "description": "Hide {name}'s own MCP servers and connectors, so it uses only Crew's tools, without duplicates or extra tokens.",
+        "unavailable": "{name} can't hide its own MCP servers, so it keeps them beside Crew's."
       }
     },
     "devices": {

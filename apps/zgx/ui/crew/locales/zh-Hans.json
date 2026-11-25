@@ -59,6 +59,11 @@
         "offline": "Crew 目前无法连接到注册表：以下是之前的列表。",
         "unavailable_hint": "Crew 目前无法连接到它。请稍后重试。",
         "failed_offline": "Crew 无法连接到 {device}。未做任何更改。"
+      },
+      "zeron_mcp_only": {
+        "label": "仅使用 Crew 的 MCP 服务器",
+        "description": "隐藏 {name} 自带的 MCP 服务器和连接器，让它只使用 Crew 的工具，避免重复和多余的 token。",
+        "unavailable": "{name} 无法隐藏自带的 MCP 服务器，会与 Crew 的一起使用。"
       }
     },
     "devices": {

@@ -61,6 +61,8 @@ impl Rig {
             worktree: None,
             mcp: None,
             extra_mcp: Vec::new(),
+            code_mode: false,
+            zeron_mcp_only: false,
             env: BTreeMap::from([
                 ("OMP_ARGV_LOG".to_owned(), log("argv")),
                 ("OMP_ENV_LOG".to_owned(), log("env")),
