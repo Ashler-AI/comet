@@ -509,12 +509,42 @@ fn recovered_scaffold_command_settled(outcome: &crate::settings::crew::Outcome, 
 
 /// A prompt submitted into a Scaffold session whose sandbox is still starting.
 /// It is the only copy: the session's provisional echo shows the same text.
+/// Anything sent into the session before its sandbox is up joins it.
 struct ScaffoldLaunch {
     chat_id: String,
     message_id: String,
+    created_at: i64,
     text: String,
     attachments: Vec<StagedAttachment>,
     attachment_draft: Option<AttachmentDraft>,
+}
+
+/// A message for a session whose Scaffold sandbox paused. It shows in the transcript under
+/// `message_id` at once and goes out once the sandbox is back; anything sent before then joins it.
+struct ScaffoldOutbound {
+    message_id: String,
+    created_at: i64,
+    text: String,
+    attachments: Vec<StagedAttachment>,
+    resolved: crate::pickers::ResolvedRunConfig,
+}
+
+/// Messages sent while a Scaffold sandbox starts or resumes go out together, as one message.
+fn join_scaffold_text(first: &str, next: &str) -> String {
+    [first, next].into_iter().filter(|text| !text.trim().is_empty()).collect::<Vec<_>>().join("\n\n")
+}
+
+fn scaffold_echo(message_id: &str, created_at: i64, text: &str) -> SessionMessageEntry {
+    SessionMessageEntry {
+        id: message_id.to_string(),
+        role: zeron_doc::MessageRole::User,
+        parts: vec![MessagePart::Text { id: "t0".into(), text: text.to_string() }],
+        created_at,
+        device_id: "local".into(),
+        status: None,
+        continuation_of: None,
+        duration_ms: None,
+    }
 }
 
 /// What the send button is right now.
@@ -6313,8 +6343,10 @@ pub struct Composer {
     /// Pre-admission only: dropping this task cannot discard an accepted send.
     host_wake_task: Option<Task<()>>,
     host_wake_target: Option<String>,
-    /// The chat whose queued send waits on its Scaffold sandbox resuming (the task is `send_task`).
-    scaffold_resume: Option<String>,
+    /// Per chat: the message waiting on its paused Scaffold sandbox (see [`ScaffoldOutbound`]).
+    scaffold_outbox: HashMap<String, ScaffoldOutbound>,
+    /// Chats whose Scaffold sandbox is resuming for their outbox.
+    scaffold_resuming: HashSet<String>,
     scaffold_command: Option<String>,
     scaffold_recovery_key: Option<String>,
     scaffold_admission: Option<String>,
@@ -6639,7 +6671,8 @@ impl Composer {
             boat_wake_cancel: None,
             host_wake_task: None,
             host_wake_target: None,
-            scaffold_resume: None,
+            scaffold_outbox: HashMap::new(),
+            scaffold_resuming: HashSet::new(),
             interrupting: HashSet::new(),
             interrupt_tasks: HashMap::new(),
             editing_queued: None,
@@ -9134,7 +9167,7 @@ impl Composer {
     /// New chats need a runnable agent, but may target the device's home
     /// directory without a project. Existing chats carry their own run config.
     fn send_blocked(&self, cx: &App) -> bool {
-        if self.sending || self.selected_provisioning(cx) { return true; }
+        if self.sending { return true; }
         if self.queue_edit_finishing {
             return true;
         }
@@ -9350,9 +9383,11 @@ impl Composer {
         let chat_id = self.scaffold_session.clone().unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
         let message_id = uuid::Uuid::new_v4().to_string();
         let text = self.input.read(cx).text().to_string();
+        let created_at = chrono::Utc::now().timestamp_millis();
         let launch = ScaffoldLaunch {
             chat_id: chat_id.clone(),
             message_id: message_id.clone(),
+            created_at,
             text: text.clone(),
             attachments: self.attachments.remove(&self.current_key).unwrap_or_default(),
             attachment_draft: self.attachment_drafts.remove(&self.current_key),
@@ -9371,16 +9406,7 @@ impl Composer {
             parent_chat_id: None, crew: None,
         };
         self.state.update(cx, |state, _| state.begin_provisioning_chat(placeholder, ProvisioningPhase::Creating));
-        let echo = SessionMessageEntry {
-            id: message_id.clone(),
-            role: zeron_doc::MessageRole::User,
-            parts: vec![MessagePart::Text { id: "t0".into(), text }],
-            created_at: chrono::Utc::now().timestamp_millis(),
-            device_id: "local".into(),
-            status: None,
-            continuation_of: None,
-            duration_ms: None,
-        };
+        let echo = scaffold_echo(&message_id, created_at, &text);
         self.publish_send(&chat_id, true, false, echo, cx);
         cx.notify();
         cx.spawn(async move |this, cx| {
@@ -9507,7 +9533,7 @@ impl Composer {
                             attachments::call_with_timeout(&engine, cx.background_executor(), methods::MUTATE,
                                 serde_json::json!({"op": "setChatConfig", "chatId": session, "config": config}),
                                 std::time::Duration::from_secs(30)).await?;
-                            return Ok((session, config));
+                            return Ok((session, config, device));
                         }
                         cx.background_executor().timer(std::time::Duration::from_secs(1)).await;
                     }
@@ -9517,7 +9543,7 @@ impl Composer {
             this.update(cx, |composer, cx| {
                 let Some(launch) = composer.scaffold_launch.take() else { return };
                 match result {
-                    Ok((session, config)) if session == launch.chat_id => composer.complete_scaffold_launch(launch, config, cx),
+                    Ok((session, config, host)) if session == launch.chat_id => composer.complete_scaffold_launch(launch, config, host, cx),
                     Ok(_) => composer.abandon_scaffold_launch(launch, "Crew attached another session than the one opened. Reconcile in Sandboxes; nothing was sent.".into(), cx),
                     Err(error) => composer.abandon_scaffold_launch(launch, error, cx),
                 }
@@ -9526,40 +9552,266 @@ impl Composer {
         }).detach();
     }
 
-    /// The host is online: replace the provisional echo with the one real send.
-    fn complete_scaffold_launch(&mut self, launch: ScaffoldLaunch, config: zeron_proto::ChatConfig, cx: &mut Context<Self>) {
+    /// The host is online: send the session's first message to it, whichever chat is on screen. Its
+    /// provisional echo already shows the text and becomes the sent message (same id).
+    fn complete_scaffold_launch(&mut self, launch: ScaffoldLaunch, config: zeron_proto::ChatConfig, host: String, cx: &mut Context<Self>) {
         let chat = launch.chat_id.clone();
-        let selected = self.state.update(cx, |state, cx| {
-            state.remove_echo(&chat, &launch.message_id);
-            state.end_pending_send(&chat, &launch.message_id);
-            state.apply_chat_config(&chat, config);
+        self.state.update(cx, |state, cx| {
+            state.apply_chat_config(&chat, config.clone());
             state.finish_provisioning_chat(&chat, cx);
+            // Provisioning outlasts the delivery grace; the send starts now.
+            state.retry_pending_send(&chat, chrono::Utc::now());
             cx.notify();
-            state.selected_chat.as_deref() == Some(chat.as_str())
         });
-        let mut attachments = launch.attachments;
-        attachments.extend(self.attachments.remove(&chat).unwrap_or_default());
-        if !attachments.is_empty() { self.attachments.insert(chat.clone(), attachments); }
         if let Some(draft) = launch.attachment_draft { self.attachment_drafts.insert(chat.clone(), draft); }
-        // Sending targets the visible session. A user who moved on, or whose
-        // composer is busy elsewhere, finds the prompt as that session's draft.
-        if selected && self.current_key == chat && !self.sending && self.host_wake_task.is_none()
-            && self.input.read(cx).text().is_empty() {
-            self.send(launch.text, false, cx);
-            if self.sending { self.scaffold_admission = Some(chat); }
-        } else {
-            if self.current_key == chat {
-                let typed = self.input.read(cx).text().to_string();
-                let text = [launch.text, typed].into_iter().filter(|text| !text.is_empty()).collect::<Vec<_>>().join("\n\n");
-                self.input.update(cx, |input, cx| input.set_text(text, cx));
-            } else {
-                let draft = self.drafts.remove(&chat).unwrap_or_default();
-                let text = [launch.text, draft].into_iter().filter(|text| !text.is_empty()).collect::<Vec<_>>().join("\n\n");
-                self.drafts.insert(chat.clone(), text);
-            }
-            self.failure = Some("Crew sandbox is ready. Your prompt is in its composer; nothing was sent.".into());
-            self.failure_key = Some(chat);
+        let resolved = crate::pickers::ResolvedRunConfig {
+            harness: Some(config.harness),
+            model: config.model,
+            reasoning: config.reasoning,
+            model_options: config.model_options,
+            access: config.access,
+            plan: config.plan,
+        };
+        let outbound = ScaffoldOutbound {
+            message_id: launch.message_id,
+            created_at: launch.created_at,
+            text: launch.text,
+            attachments: launch.attachments,
+            resolved,
+        };
+        self.deliver_scaffold_message(chat, host, outbound, true, cx);
+    }
+
+    /// A send while the selected session's sandbox is being created joins its first message.
+    fn join_scaffold_launch(&mut self, text: String, cx: &mut Context<Self>) {
+        let chat = self.current_key.clone();
+        if self.scaffold_launch.as_ref().is_none_or(|launch| launch.chat_id != chat) {
+            return;
         }
+        if references_require_update(&text, false)
+            || !self.staged_appshots().is_empty()
+            || !self.staged_comments(cx).is_empty()
+        {
+            self.show_error("Local file/skill references, app captures and review comments cannot be sent to a new sandbox. Attach file bytes instead; your draft is preserved.", cx);
+            return;
+        }
+        let attachments = self.attachments.remove(&chat).unwrap_or_default();
+        let Some(launch) = self.scaffold_launch.as_mut() else { return };
+        launch.text = join_scaffold_text(&launch.text, &text);
+        launch.attachments.extend(attachments);
+        let echo = scaffold_echo(&launch.message_id, launch.created_at, &launch.text);
+        let message_id = launch.message_id.clone();
+        self.input.update(cx, |input, cx| input.set_text("", cx));
+        self.drafts.remove(&chat);
+        self.failure = None;
+        self.state.update(cx, |state, cx| {
+            state.remove_echo(&chat, &message_id);
+            state.push_echo(&chat, echo);
+            cx.notify();
+        });
+        cx.notify();
+    }
+
+    /// A send to a session whose Scaffold sandbox paused. Its chat is still bound to a host that is
+    /// gone, so the message shows in the transcript as Queued at once, the sandbox resumes, and the
+    /// message goes out once the resumed host is online. Anything sent before then joins it, under
+    /// the same resume.
+    fn queue_for_scaffold_resume(
+        &mut self,
+        sandbox_id: String,
+        scope: zeron_proto::CollaborationScope,
+        text: String,
+        cx: &mut Context<Self>,
+    ) {
+        let chat = self.current_key.clone();
+        if chat.is_empty() {
+            return;
+        }
+        if references_require_update(&text, false)
+            || !self.staged_appshots().is_empty()
+            || !self.staged_comments(cx).is_empty()
+        {
+            self.show_error("Local file/skill references, app captures and review comments cannot wait for a paused sandbox. Attach file bytes instead; your draft is preserved.", cx);
+            return;
+        }
+        let attachments = self.attachments.remove(&chat).unwrap_or_default();
+        let resolved = self.pickers.read(cx).resolved(cx);
+        self.input.update(cx, |input, cx| input.set_text("", cx));
+        self.drafts.remove(&chat);
+        self.failure = None;
+        let first = !self.scaffold_outbox.contains_key(&chat);
+        let outbound = self.scaffold_outbox.entry(chat.clone()).or_insert_with(|| ScaffoldOutbound {
+            message_id: uuid::Uuid::new_v4().to_string(),
+            created_at: chrono::Utc::now().timestamp_millis(),
+            text: String::new(),
+            attachments: Vec::new(),
+            resolved,
+        });
+        outbound.text = join_scaffold_text(&outbound.text, &text);
+        outbound.attachments.extend(attachments);
+        let echo = scaffold_echo(&outbound.message_id, outbound.created_at, &outbound.text);
+        let message_id = outbound.message_id.clone();
+        if first {
+            self.publish_send(&chat, false, false, echo, cx);
+        } else {
+            self.state.update(cx, |state, cx| {
+                state.remove_echo(&chat, &message_id);
+                state.push_echo(&chat, echo);
+                cx.notify();
+            });
+        }
+        if self.scaffold_resuming.insert(chat.clone()) {
+            let engine = self.state.read(cx).engine().cloned();
+            cx.spawn(async move |this, cx| {
+                let resumed = match &engine {
+                    Some(engine) => Self::resume_scaffold_host(&this, cx, engine, &chat, sandbox_id, scope).await,
+                    None => Err("Engine not connected".to_string()),
+                };
+                this.update(cx, |composer, cx| {
+                    composer.scaffold_resuming.remove(&chat);
+                    if let Some(outbound) = composer.scaffold_outbox.remove(&chat) {
+                        match resumed {
+                            Ok(host) => composer.deliver_scaffold_message(chat, host, outbound, false, cx),
+                            Err(error) => composer.return_scaffold_message(&chat, outbound, error, cx),
+                        }
+                    }
+                    cx.notify();
+                })
+                .ok();
+            })
+            .detach();
+        }
+        cx.notify();
+    }
+
+    /// A Scaffold session's sandbox is back: send its message to that host as an ordinary run,
+    /// whichever chat is on screen. `initial`: a new session's first message, whose admission is
+    /// tracked like the composer's own first send, so an uncertain outcome is never sent twice.
+    fn deliver_scaffold_message(
+        &mut self,
+        chat: String,
+        host: String,
+        outbound: ScaffoldOutbound,
+        initial: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(engine) = self.state.read(cx).engine().cloned() else {
+            self.return_scaffold_message(&chat, outbound, "Engine not connected".into(), cx);
+            return;
+        };
+        let cwd = self
+            .state
+            .read(cx)
+            .chats
+            .iter()
+            .find(|row| row.id == chat)
+            .and_then(|row| row.cwd.clone())
+            .unwrap_or_else(|| ".".to_string());
+        if initial {
+            self.scaffold_admission = Some(chat.clone());
+            crate::settings::update(crate::settings::SavePolicy::Immediate, cx, |settings| {
+                settings.crew_pending_prompts.insert(chat.clone(), outbound.message_id.clone());
+            });
+        }
+        cx.spawn(async move |this, cx| {
+            let mut admission_attempted = false;
+            let result: Result<(), String> = async {
+                let mut attachment_paths = Vec::new();
+                for attachment in &outbound.attachments {
+                    let upload_id = uuid::Uuid::new_v4().to_string();
+                    let path = attachments::upload_attachment(
+                        &engine,
+                        cx.background_executor(),
+                        Some(host.as_str()),
+                        &chat,
+                        &upload_id,
+                        attachment,
+                        None,
+                    )
+                    .await
+                    .map_err(|_| "Couldn't upload the attachment — the session's sandbox may be offline.".to_string())?;
+                    attachments::seed_staged(&host, &path, attachment);
+                    attachment_paths.push(path);
+                }
+                let resolved = &outbound.resolved;
+                let command = SessionCommandPayload::Run {
+                    request: RunRequest {
+                        mcp: None,
+                        prompt: attachments::with_attachments(&outbound.text, &attachment_paths),
+                        harness: resolved.harness,
+                        model: resolved.model.clone(),
+                        reasoning: resolved.reasoning,
+                        model_options: resolved.model_options.clone(),
+                        cwd,
+                        sandbox: SandboxLevel::WorkspaceWrite,
+                        auto_approve: false,
+                        access: resolved.access,
+                        plan: resolved.plan,
+                        resume: None,
+                        attachments: attachment_paths,
+                        worktree: None,
+                        env: Default::default(),
+                    },
+                    message_id: outbound.message_id.clone(),
+                };
+                let command = serde_json::to_value(&command).map_err(|e| format!("Send failed: {e}"))?;
+                admission_attempted = true;
+                attachments::call_with_timeout(
+                    &engine,
+                    cx.background_executor(),
+                    methods::QUEUE_COMMAND,
+                    serde_json::json!({ "chatId": chat, "command": command, "targetDeviceId": host }),
+                    std::time::Duration::from_secs(30),
+                )
+                .await
+                .map(|_| ())
+                .map_err(|e| format!("Send failed: {e}"))
+            }
+            .await;
+            this.update(cx, |composer, cx| {
+                if initial && (result.is_ok() || !admission_attempted) {
+                    crate::settings::update(crate::settings::SavePolicy::Immediate, cx, |settings| {
+                        if settings.crew_pending_prompts.get(&chat) == Some(&outbound.message_id) {
+                            settings.crew_pending_prompts.remove(&chat);
+                        }
+                    });
+                    if composer.scaffold_session.as_deref() == Some(chat.as_str()) {
+                        composer.finish_scaffold_provisioning(cx);
+                    }
+                }
+                if let Err(error) = result {
+                    composer.return_scaffold_message(&chat, outbound, error, cx);
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// A Scaffold message that could not go out returns to its session's composer with the reason.
+    fn return_scaffold_message(&mut self, chat: &str, outbound: ScaffoldOutbound, error: String, cx: &mut Context<Self>) {
+        self.state.update(cx, |state, cx| {
+            state.remove_echo(chat, &outbound.message_id);
+            state.end_pending_send(chat, &outbound.message_id);
+            cx.notify();
+        });
+        if self.current_key == chat {
+            let typed = self.input.read(cx).text().to_string();
+            let text = join_scaffold_text(&outbound.text, &typed);
+            self.input.update(cx, |input, cx| input.set_text(text, cx));
+        } else {
+            let draft = self.drafts.remove(chat).unwrap_or_default();
+            self.drafts.insert(chat.to_string(), join_scaffold_text(&outbound.text, &draft));
+        }
+        if !outbound.attachments.is_empty() {
+            let mut restored = outbound.attachments;
+            restored.extend(self.attachments.remove(chat).unwrap_or_default());
+            self.attachments.insert(chat.to_string(), restored);
+        }
+        self.failure = Some(error.into());
+        self.failure_key = Some(chat.to_string());
+        cx.notify();
     }
 
     /// Provisioning settled without a host: close the provisional session and
@@ -9814,7 +10066,18 @@ impl Composer {
     }
 
     fn send(&mut self, text: String, queue: bool, cx: &mut Context<Self>) {
-        if self.sending || self.host_wake_task.is_some() || self.selected_provisioning(cx) { return; }
+        if self.sending || self.host_wake_task.is_some() { return; }
+        // A Scaffold session whose sandbox is starting or resuming takes the message at once: it
+        // shows in the transcript, the composer stays free, and it goes out to that session once its
+        // sandbox is up, whichever chat is on screen then.
+        if self.selected_provisioning(cx) {
+            self.join_scaffold_launch(text, cx);
+            return;
+        }
+        if let Some((sandbox_id, scope)) = self.resumable_scaffold_host(cx) {
+            self.queue_for_scaffold_resume(sandbox_id, scope, text, cx);
+            return;
+        }
         if self.pickers.read(cx).draft().scaffold_database.is_some()
             || self.scaffold_admission.is_some()
             || self
@@ -9950,10 +10213,6 @@ impl Composer {
                 .map(|c| c.device_id.clone())
                 .or_else(|| target_device_id.clone())
         };
-        // Scaffold pauses an idle session, and its chat stays bound to a host that is gone. The
-        // send reads Queued in the transcript at once (that host is offline), resumes the sandbox,
-        // and goes out to the resumed host once Crew sees it online.
-        let paused_scaffold = if is_new { None } else { self.resumable_scaffold_host(cx) };
         // Presence trails a Boat sleep by up to its online window, so a send
         // that skipped the wake above can still find the host dark.
         let dark_boat_host = host_device_id
@@ -10143,9 +10402,6 @@ impl Composer {
         self.drafts.remove(&self.current_key);
         self.failure = None;
         self.sending = true;
-        if paused_scaffold.is_some() {
-            self.scaffold_resume = Some(chat_id.clone());
-        }
         let wake_cancel = wake_binding.as_ref().map(|_| {
             let (cancel, receive) = futures::channel::oneshot::channel();
             self.boat_wake_cancel = Some((wake_binding.as_ref().unwrap().0.clone(), cancel));
@@ -10161,19 +10417,7 @@ impl Composer {
         self.send_task = Some(cx.spawn(async move |this, cx| {
             let mut admission_attempted = false;
             let mut send_started = wake_binding.is_none();
-            let mut host_device_id = host_device_id;
             let result: Result<Option<String>, String> = async {
-                if let Some((sandbox_id, scope)) = paused_scaffold {
-                    let resumed = Self::resume_scaffold_host(&this, cx, &engine, &chat_id, sandbox_id, scope).await;
-                    this.update(cx, |composer, cx| {
-                        if composer.scaffold_resume.as_deref() == Some(chat_id.as_str()) {
-                            composer.scaffold_resume = None;
-                        }
-                        cx.notify();
-                    })
-                    .ok();
-                    host_device_id = Some(resumed?);
-                }
                 let mut wake_transport = None;
                 if let Some((target, boat)) = &wake_binding {
                     let wake_executor = cx.background_executor().clone();
@@ -12230,9 +12474,7 @@ impl Render for Composer {
                     "Send will connect to the selected Boat host first.".into()
                 } else if offline {
                     "Offline — messages will send when you're back online.".into()
-                } else if self.scaffold_resume.is_some()
-                    && self.scaffold_resume.as_deref() == state.selected_chat.as_deref()
-                {
+                } else if state.selected_chat.as_ref().is_some_and(|chat| self.scaffold_resuming.contains(chat)) {
                     "Resuming this session's sandbox. Your message sends once it's back.".into()
                 } else if self.resumable_scaffold_host(cx).is_some() {
                     "Send will resume this session's sandbox.".into()
@@ -13893,9 +14135,8 @@ mod tests {
         composer.on_state_changed(cx);
         assert_eq!(composer.current_key, "session");
         assert_eq!(composer.button_mode(cx), SendButtonMode::Send, "nothing to stop yet");
-        assert!(composer.send_blocked(cx));
         ScaffoldLaunch {
-            chat_id: "session".into(), message_id: "provisional".into(), text: "keep my prompt".into(),
+            chat_id: "session".into(), message_id: "provisional".into(), created_at: 0, text: "keep my prompt".into(),
             attachments: vec![attachments::stage_png_bytes("draft.png".into(), Vec::new())], attachment_draft: None,
         }
     }
@@ -13931,11 +14172,24 @@ mod tests {
     }
 
     #[gpui::test]
-    fn ready_scaffold_launch_never_sends_behind_a_user_who_moved_on(cx: &mut gpui::TestAppContext) {
+    // A new Scaffold session's first message, once its sandbox is up. Failure modes:
+    // L1 it stays in the session's composer when the person moved to another chat (staging
+    //    2026-11-27: "this session started, but didn't send"), so it reads as unsent;
+    // L2 it goes to the chat on screen instead of its own session, or not to its sandbox's host;
+    // L3 it goes out as a second copy beside its provisional echo instead of becoming that message;
+    // L4 its attachment is dropped on the way.
+    fn ready_scaffold_launch_sends_its_first_message_after_the_user_moved_on(cx: &mut gpui::TestAppContext) {
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let _guard = runtime.enter();
         let directory = tempfile::tempdir().unwrap();
         cx.update(|cx| crate::settings::init(Default::default(), directory.path(), cx));
+        let (out, mut requests) = tokio::sync::mpsc::channel::<String>(256);
+        let (replies, inbound) = tokio::sync::mpsc::channel::<String>(256);
         let state = cx.new(|_| AppState::new());
-        let composer = cx.new(|cx| Composer::new(state, cx));
+        state.update(cx, |state, _| {
+            state.set_test_engine(crate::state::EngineHandle::from_test_client(zeron_rpc::RpcClient::new(out, inbound)));
+        });
+        let composer = cx.new(|cx| Composer::new(state.clone(), cx));
         composer.update(cx, |composer, cx| {
             let launch = provisioning_launch(composer, cx);
             composer.state.update(cx, |state, cx| state.select_chat(None, cx));
@@ -13945,12 +14199,65 @@ mod tests {
                 model_options: Default::default(), sandbox: SandboxLevel::WorkspaceWrite,
                 access: Default::default(), plan: false,
             };
-            composer.complete_scaffold_launch(launch, config, cx);
-            assert!(!composer.sending);
+            composer.complete_scaffold_launch(launch, config, "comet-scaffold-host".into(), cx);
+        });
+        let mut runs = Vec::new();
+        for _ in 0..8 {
+            runtime.block_on(async { tokio::task::yield_now().await });
+            cx.run_until_parked();
+            while let Ok(frame) = requests.try_recv() {
+                let frame: zeron_rpc::ClientFrame = serde_json::from_str(&frame).unwrap();
+                let reply = match frame.method.as_deref() {
+                    Some(methods::UPLOAD_COMMIT) => serde_json::json!({ "path": "/workspace/.uploads/draft.png" }),
+                    Some(methods::UPLOAD_CHUNK) => serde_json::json!({}),
+                    Some(methods::QUEUE_COMMAND) => {
+                        runs.push(frame.params.clone());
+                        serde_json::json!({ "commandId": "queued" })
+                    }
+                    _ => continue,
+                };
+                let reply = zeron_rpc::ServerFrame { id: frame.id, ok: Some(reply), ..Default::default() };
+                replies.try_send(serde_json::to_string(&reply).unwrap()).unwrap();
+            }
+        }
+        assert_eq!(runs.len(), 1, "the first message goes out though the person moved on (L1)");
+        assert_eq!((runs[0]["chatId"].as_str(), runs[0]["targetDeviceId"].as_str()),
+            (Some("session"), Some("comet-scaffold-host")), "to its own session, on its sandbox's host (L2)");
+        assert_eq!(runs[0]["command"]["messageId"], "provisional", "as its provisional echo (L3)");
+        let prompt = runs[0]["command"]["request"]["prompt"].as_str().unwrap_or_default().to_string();
+        assert!(prompt.starts_with("keep my prompt"), "{prompt}");
+        assert!(prompt.contains("/workspace/.uploads/draft.png"), "with its attachment (L4): {prompt}");
+        composer.read_with(cx, |composer, cx| {
+            assert!(composer.drafts.get("session").is_none_or(String::is_empty), "nothing waits in its composer (L1)");
+            assert!(composer.failure.is_none(), "{:?}", composer.failure);
             assert!(!composer.state.read(cx).is_provisioning("session"));
-            assert_eq!(composer.drafts.get("session").map(String::as_str), Some("keep my prompt"));
-            assert_eq!(composer.attachments.get("session").map(Vec::len), Some(1));
-            assert_eq!(composer.failure_key.as_deref(), Some("session"));
+        });
+    }
+
+    #[gpui::test]
+    // A send while a new session's sandbox is being created. Failure modes:
+    // J1 the composer refuses it, so the person waits for the sandbox before typing on;
+    // J2 it is lost, or goes out as a message of its own that races the first one;
+    // J3 the transcript keeps showing only the first message.
+    fn a_send_while_a_scaffold_sandbox_starts_joins_its_first_message(cx: &mut gpui::TestAppContext) {
+        let directory = tempfile::tempdir().unwrap();
+        cx.update(|cx| crate::settings::init(Default::default(), directory.path(), cx));
+        let state = cx.new(|_| AppState::new());
+        let composer = cx.new(|cx| Composer::new(state, cx));
+        composer.update(cx, |composer, cx| {
+            let mut launch = provisioning_launch(composer, cx);
+            launch.attachments.clear();
+            composer.scaffold_launch = Some(launch);
+            composer.input.update(cx, |input, cx| input.set_text("and run the tests", cx));
+            composer.on_submit(cx);
+            assert_eq!(composer.input.read(cx).text(), "", "the composer takes it (J1)");
+            let joined = "keep my prompt\n\nand run the tests";
+            assert_eq!(composer.scaffold_launch.as_ref().map(|launch| launch.text.as_str()), Some(joined),
+                "it joins the first message (J2)");
+            let echoes = composer.state.read(cx).pending_echoes();
+            assert_eq!(echoes.iter().map(|echo| echo.id.as_str()).collect::<Vec<_>>(), ["provisional"]);
+            assert!(matches!(&echoes[0].parts[..], [MessagePart::Text { text, .. }] if text == joined),
+                "and the transcript shows both (J3)");
         });
     }
 
@@ -14507,6 +14814,8 @@ mod tests {
     // Q5 the resume shows the unstyled "Connecting to host… Cancel" row;
     // Q6 a refused resume loses the message instead of handing the draft back with the reason.
     // Q7 a resume slower than the two-minute delivery grace turns the queued message Not delivered.
+    // Q8 the composer stays busy while the sandbox resumes, so the next message has to wait, or it
+    //    starts a second resume, or goes out on its own before the first.
     // A chat whose host is online, or whose sandbox failed, sends at once without a resume.
     fn send_to_a_paused_scaffold_chat_queues_it_resumes_the_sandbox_then_delivers(cx: &mut gpui::TestAppContext) {
         let runtime = tokio::runtime::Builder::new_current_thread()
@@ -14609,8 +14918,8 @@ mod tests {
             });
             assert_eq!(echoes.len(), 1, "{case}: the message shows in the transcript (Q2)");
             assert!(reads_queued, "{case}: and reads Queued while the sandbox resumes (Q2)");
-            assert!(composer.read_with(cx, |composer, _| composer.host_wake_task.is_none()
-                && composer.scaffold_resume.as_deref() == Some("scaffold-chat")), "{case}: one styled resume status (Q5)");
+            assert!(composer.read_with(cx, |composer, _| composer.host_wake_task.is_none()), "{case}: no host-wake row (Q5)");
+            assert!(composer.read_with(cx, |composer, _| !composer.sending), "{case}: the composer is not busy (Q8)");
             // A resume that has run for longer than the delivery grace still reads Queued.
             state.update(cx, |state, _| state.begin_pending_send("scaffold-chat", &echoes[0], chrono::Utc::now() - chrono::Duration::seconds(200)));
             assert!(state.read_with(cx, |state, _| state.send_undelivered("scaffold-chat", chrono::Utc::now())));
@@ -14618,6 +14927,19 @@ mod tests {
             pump(cx, &mut controls, &mut queued);
             assert!(state.read_with(cx, |state, _| !state.send_undelivered("scaffold-chat", chrono::Utc::now())
                 && state.send_queued("scaffold-chat", chrono::Utc::now())), "{case}: a slow resume keeps the message Queued (Q7)");
+            let follow_up = "Also run the tests";
+            if case == "paused" {
+                composer.update(cx, |composer, cx| {
+                    composer.input.update(cx, |input, cx| input.set_text(follow_up, cx));
+                    composer.on_submit(cx);
+                });
+                pump(cx, &mut controls, &mut queued);
+                let (text, _, failure) = composer_state(cx);
+                assert_eq!((text.as_str(), failure.as_str()), ("", ""), "the next message is taken too (Q8)");
+                assert_eq!(controls.len(), 1, "under the same resume (Q8)");
+                assert!(queued.is_empty(), "and nothing goes out yet (Q8)");
+                assert_eq!(state.read_with(cx, |state, _| state.pending_echoes().len()), 1, "it joins the first message (Q8)");
+            }
             if case == "switched" {
                 state.update(cx, |state, _| state.selected_chat = Some("other-chat".into()));
                 composer.update(cx, |composer, cx| composer.on_state_changed(cx));
@@ -14638,7 +14960,7 @@ mod tests {
                 assert!(failure.contains("Scaffold refused the resume."), "{failure}");
                 assert_eq!((text.as_str(), read_only), (draft, false), "the draft comes back (Q6)");
                 assert!(state.read_with(cx, |state, _| state.pending_echoes().is_empty()), "and leaves the transcript (Q6)");
-                assert!(queued.is_empty() && composer.read_with(cx, |composer, _| composer.scaffold_resume.is_none()));
+                assert!(queued.is_empty());
                 continue;
             }
             assert!(queued.is_empty(), "{case}: resumed, but the chat is still on the placeholder (Q3)");
@@ -14654,8 +14976,11 @@ mod tests {
             assert_eq!((queued[0]["chatId"].as_str(), queued[0]["targetDeviceId"].as_str()),
                 (Some("scaffold-chat"), Some("comet-scaffold-rcs_x-e3")), "{case}: to the resumed host");
             assert!(controls.is_empty(), "{case}: one resume only");
+            let expected = if case == "paused" { format!("{draft}\n\n{follow_up}") } else { draft.to_string() };
+            assert_eq!(queued[0]["command"]["request"]["prompt"].as_str(), Some(expected.as_str()), "{case}: as one message (Q8)");
+            assert_eq!(queued[0]["command"]["messageId"].as_str(), Some(echoes[0].as_str()), "{case}: as its transcript echo");
             let (_, _, failure) = composer_state(cx);
-            assert!(failure.is_empty() && composer.read_with(cx, |composer, _| composer.scaffold_resume.is_none()), "{failure}");
+            assert!(failure.is_empty(), "{failure}");
         }
     }
 
