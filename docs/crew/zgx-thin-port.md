@@ -1045,6 +1045,23 @@ route named no harness, so OMP hosted it. Crew main has run both natively since 
   A Claude Code or Codex turn isn't saved then, only by the timer and at a pause. The
   same holds for Crew main's sandboxes.
 
+**Checked against Crew 0.2.159's Scaffold behaviour (2026-11-27).** Crew main's 0.2.158
+(#245) and 0.2.159 (#247) queue a send until its sandbox is up or resumed, in the GPUI
+composer. Per the staging session that shipped them (f6a67f32), nothing new is asked of
+a host. A paused session's chat points at the paused epoch's never-seen device, whose
+nudge answers 404, and the host files a Run's message under its `messageId`. This port
+does the same in its engine, live on harness-zgx revision 8:
+
+- **Paused:** two sends to `rcs_9ac0…`'s paused chat (the second during the resume) both
+  read "Sending…", with the composer free. The engine resumed the sandbox at once, and
+  Platform enrolled the epoch-3 host, ready 16 s after the resume. Both messages were
+  answered, in order, about 20 s after the first send.
+- **New, then away:** a send to a new Claude Code sandbox, then another chat opened 1.5 s
+  later. The message went out once the sandbox was up, and the answer was in the chat on
+  return.
+- The idle sweep paused `rcs_c8dc…` (the one with Codex's links) at 2026-11-25 22:30Z,
+  as #16744 should allow.
+
 Earlier notes:
 
 - Treat a sandbox host as an ordinary peer device (`comet-scaffold-{sandbox}-e{epoch}`)
