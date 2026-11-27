@@ -31,6 +31,12 @@ the daily-driver Crew Staging install, its profile, or the shared staging backen
     (no managed Antigravity here);
   - #227, the app's name and link scheme, which the port has its own of;
   - #242 itself, which is the GPUI composer's.
+
+  Crew main up to `8dac44a82` (0.2.159, 2026-11-27) adds only #245 and #247, the GPUI
+  composer's queued sends to a Scaffold session. Neither touches the engine, the
+  harness, crew-web or `scripts/crew`, so the host and its Linux archive need nothing
+  new. The port's engine does the same as those two: see "Checked against Crew
+  0.2.159" below.
 - Platform: the task branch `czhen/crew-zgx-harness` sits on `ashler-platform`
   `master` `51a030e31` (rebased 2026-11-25, from 2026-11-24's).
 - Branch: `crew/zgx-thin-port`, on `origin` (pushing it is approved).
