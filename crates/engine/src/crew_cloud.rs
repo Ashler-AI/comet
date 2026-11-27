@@ -58,8 +58,11 @@ use scaffold::{
     ScaffoldError, SessionEnvironment, device_id_for, parse_device_id,
 };
 
-/// The agents a sandbox's chat runs: OMP, as Crew's sandboxes do.
-pub(crate) const HARNESSES: &[HarnessId] = &[HarnessId::Omp];
+/// The agents a sandbox's chat runs: Claude Code and Codex natively, and OMP,
+/// as Crew's sandboxes have since Crew main #204. (Antigravity too there: its
+/// managed inference isn't ported.) Each on Agent Auth, through the host's
+/// device token (crew_sandbox::inference_allowed).
+pub(crate) const HARNESSES: &[HarnessId] = &[HarnessId::ClaudeCode, HarnessId::Codex, HarnessId::Omp];
 /// The Cloud device the Cloud row is picked as (`CloudStatus.deviceId`).
 const CLOUD_DEVICE: &str = zeron_proto::CLOUD_ACCOUNTS_DEVICE;
 /// The deployment's default branch: what every sandbox starts from.
@@ -537,7 +540,7 @@ impl CrewCloud {
                 let account = config.model_options.get("crewAccountId").and_then(Value::as_str);
                 AgentRoute::for_chat(&config.harness, model, account)
             })
-            .ok_or_else(|| refused("Pick one of OMP's models for the sandbox."))?;
+            .ok_or_else(|| refused("Pick a Claude Code, Codex or OMP model for the sandbox."))?;
         let scope = controller.scope(chat_id);
         let environment = self.create(&controller, &scope, &region, &route).await?;
         let (sandbox, _, epoch) = environment.sandbox().map_err(failed)?;
@@ -913,9 +916,9 @@ impl CrewCloud {
     }
 }
 
-/// A route's chat config: OMP on its model, the pinned account as the
-/// chat's `crewAccountId`, full access as Crew's sandboxes run; the rest
-/// kept.
+/// A route's chat config: its harness on its model as that harness names
+/// it, the pinned account as the chat's `crewAccountId`, full access as
+/// Crew's sandboxes run; the rest kept.
 fn chat_config(route: &AgentRoute, previous: Option<ChatConfig>) -> ChatConfig {
     let mut config = previous.unwrap_or(ChatConfig {
         harness: route.harness(),

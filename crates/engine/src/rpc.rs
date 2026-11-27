@@ -1253,7 +1253,7 @@ impl EngineRpc {
                 };
                 if !harnesses.contains(&p.harness) {
                     return Some(Err(RpcError::Failed(match self.crew_cloud {
-                        Some(_) => "Crew's sandboxes run OMP only".into(),
+                        Some(_) => "Crew's sandboxes run Claude Code, Codex and OMP".into(),
                         None => format!(
                             "{} doesn't run on Cloud",
                             zeron_proto::providers::provider_name(p.harness)

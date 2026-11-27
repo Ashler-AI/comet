@@ -268,10 +268,11 @@ impl AgentRoute {
         }
     }
 
-    /// The route for a chat's agent and model, hosted on OMP: OMP's own
-    /// provider-qualified ids (`anthropic/…`, `openai/…`, `openai-codex/…`),
-    /// or a Claude Code or Codex model on its provider. `account` pins one
-    /// shared account (the chat's `crewAccountId`).
+    /// The route for a chat's agent and model: OMP's own provider-qualified
+    /// ids (`anthropic/…`, `openai/…`, `openai-codex/…`), hosted on OMP, or a
+    /// Claude Code or Codex model, run on that harness in the sandbox (Crew
+    /// main #204). `account` pins one shared account (the chat's
+    /// `crewAccountId`).
     pub(crate) fn for_chat(harness: &HarnessId, model: &str, account: Option<&str>) -> Option<Self> {
         let model = model.trim();
         let lower = model.to_ascii_lowercase();
@@ -293,6 +294,9 @@ impl AgentRoute {
             return None;
         }
         let mut route = Self::automatic(provider, model);
+        if matches!(harness, HarnessId::ClaudeCode | HarnessId::Codex) {
+            route.harness = Some(harness.clone());
+        }
         if let Some(account) = account.map(str::trim).filter(|account| !account.is_empty()) {
             route.routing_mode = AgentRoutingMode::Pinned;
             route.account_id = Some(account.to_owned());

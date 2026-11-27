@@ -224,6 +224,35 @@ async fn a_cloud_chat_creates_its_sandbox_publishes_its_row_and_attaches_its_hos
     assert_eq!(count(&requests, "POST /api/code-sandboxes HTTP"), 1);
 }
 
+/// A Claude Code or Codex Cloud chat runs that agent in its sandbox (Crew
+/// main #204): the create's route names the harness, and the chat's row
+/// keeps it, on the model as that agent names it.
+#[tokio::test]
+async fn a_claude_code_or_codex_cloud_chat_runs_that_agent_in_its_sandbox() {
+    for (harness, model, route) in [
+        ("claude-code", "claude-opus-5-5", json!({"harness": "claude-code", "provider": "anthropic", "model": "claude-opus-5-5",
+            "fallback": "disabled", "routingMode": "automatic"})),
+        ("codex", "gpt-6.2-sol", json!({"harness": "codex", "provider": "openai", "model": "gpt-6.2-sol",
+            "fallback": "disabled", "routingMode": "automatic"})),
+    ] {
+        let (origin, requests) = serve(platform((202, sandbox("starting")), "starting")).await;
+        let Fixture { cloud, workspace, .. } = fixture(&origin, Some("harness-zgx"));
+        let config: ChatConfig = serde_json::from_value(json!({
+            "harness": harness, "model": model, "reasoning": null, "modelOptions": {}, "sandbox": "workspace-write",
+        }))
+        .unwrap();
+        let (device, _) = cloud.chat_host(SESSION, Some("master"), Some(&config)).await.unwrap();
+        assert_eq!(device, DEVICE);
+        let create = requests.lock().unwrap()[0].clone();
+        let body: Value = serde_json::from_str(create.split_once("\r\n\r\n").unwrap().1).unwrap();
+        assert_eq!(body["agentRoute"], route, "{harness}");
+        let row = workspace.chat(SESSION).unwrap().unwrap().config.unwrap();
+        assert_eq!((serde_json::to_value(&row.harness).unwrap(), row.model.as_deref()), (json!(harness), Some(model)));
+        let _ = settled(&cloud, &format!("attach:{SANDBOX}:e1")).await;
+        cloud.shutdown();
+    }
+}
+
 /// With no sandbox region named, nothing is created: never in a region
 /// whose Edge isn't this engine's. Nor from another branch, without a
 /// model of OMP's, or for a chat id that isn't Scaffold's.
@@ -775,13 +804,15 @@ async fn the_engine_s_cloud_rpcs_and_relays_go_through_crew_s_adapter() {
     };
     let status = value(rpc.handle(methods::CLOUD_STATUS, json!({})).await);
     assert_eq!((status["state"].clone(), status["deviceId"].clone()), (json!("ready"), json!("cloud")));
+    // A sandbox runs Claude Code, Codex and OMP (Crew main #204), nothing else.
     for target in ["cloud", DEVICE] {
         let agents = value(rpc.handle(methods::LIST_HARNESSES, json!({"targetDeviceId": target})).await);
-        let ids: Vec<_> = agents.as_array().unwrap().iter().map(|agent| agent["id"].clone()).collect();
-        assert_eq!(ids, [json!("omp")], "{target}");
+        let mut ids: Vec<String> = agents.as_array().unwrap().iter().map(|agent| agent["id"].as_str().unwrap().to_owned()).collect();
+        ids.sort();
+        assert_eq!(ids, ["claude-code", "codex", "omp"], "{target}");
     }
-    let refused = rpc.handle(methods::LIST_MODELS, json!({"targetDeviceId": "cloud", "harness": "codex"})).await;
-    assert!(refused.err().unwrap().to_string().contains("OMP only"));
+    let refused = rpc.handle(methods::LIST_MODELS, json!({"targetDeviceId": "cloud", "harness": "cursor"})).await;
+    assert!(refused.err().unwrap().to_string().contains("Claude Code, Codex and OMP"));
 
     let made = value(
         rpc.handle(

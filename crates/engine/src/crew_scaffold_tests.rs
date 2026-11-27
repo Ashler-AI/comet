@@ -329,21 +329,29 @@ fn only_https_or_loopback_origins() {
 }
 
 /// A chat's agent and model, as the sandbox's route: OMP's own ids (the
-/// Cloud row's catalog), or Claude Code's and Codex's on their providers,
-/// always hosted on OMP; an account pins it.
+/// Cloud row's catalog), hosted on OMP, or Claude Code's and Codex's, run on
+/// that harness in the sandbox (Crew main #204); an account pins it.
 #[test]
 fn a_chat_s_model_is_its_sandbox_s_route() {
     let route = AgentRoute::for_chat(&HarnessId::Omp, "anthropic/claude-opus-5-5", None).unwrap();
     assert_eq!((route.provider, route.model.as_str(), route.harness()), (AgentProvider::Anthropic, "claude-opus-5-5", HarnessId::Omp));
     assert_eq!(route.execution_model(), "anthropic/claude-opus-5-5");
-    let codex = AgentRoute::for_chat(&HarnessId::Omp, "openai-codex/gpt-6.2-sol", None).unwrap();
-    assert_eq!((codex.provider, codex.execution_model().as_str()), (AgentProvider::OpenAi, "openai/gpt-6.2-sol"));
+    assert_eq!(serde_json::to_value(&route).unwrap().get("harness"), None, "OMP's routes name no harness");
+    let omp_codex = AgentRoute::for_chat(&HarnessId::Omp, "openai-codex/gpt-6.2-sol", None).unwrap();
+    assert_eq!((omp_codex.provider, omp_codex.execution_model().as_str()), (AgentProvider::OpenAi, "openai/gpt-6.2-sol"));
     let claude = AgentRoute::for_chat(&HarnessId::ClaudeCode, "claude-opus-5-5", Some(" acct ")).unwrap();
     assert_eq!(
         serde_json::to_value(&claude).unwrap(),
-        json!({"provider": "anthropic", "model": "claude-opus-5-5", "fallback": "disabled", "routingMode": "pinned", "accountId": "acct"})
+        json!({"harness": "claude-code", "provider": "anthropic", "model": "claude-opus-5-5", "fallback": "disabled",
+            "routingMode": "pinned", "accountId": "acct"})
     );
-    assert_eq!(claude.harness(), HarnessId::Omp, "hosted on OMP");
+    assert_eq!((claude.harness(), claude.execution_model().as_str()), (HarnessId::ClaudeCode, "claude-opus-5-5"));
+    let codex = AgentRoute::for_chat(&HarnessId::Codex, "gpt-6.2-sol", None).unwrap();
+    assert_eq!(
+        serde_json::to_value(&codex).unwrap(),
+        json!({"harness": "codex", "provider": "openai", "model": "gpt-6.2-sol", "fallback": "disabled", "routingMode": "automatic"})
+    );
+    assert_eq!((codex.harness(), codex.execution_model().as_str()), (HarnessId::Codex, "gpt-6.2-sol"));
     for (harness, model) in [
         (HarnessId::Omp, "claude-opus-5-5"),
         (HarnessId::Omp, "google/gemini"),
