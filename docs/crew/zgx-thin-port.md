@@ -1072,6 +1072,33 @@ does the same in its engine, live on harness-zgx revision 8:
   ad hoc build, it came up signed in to `ashler-staging` with Cloud ready and its sandbox
   sessions listed.
 
+**harness-zgx revision 9, on the staging base with Crew 0.2.159 (2026-11-27).** The base
+is the shared staging candidate `scaffold-session@sha256:b432b3a8…`, from
+`scaffold-staging` `bf47629c`. It carries Platform #17336: a session reports ready
+before its first save, which now runs after ready. The overlay is
+`scaffold-session-crew-zgx@sha256:510de604…`, which adds archive `0.3.20-zgx.2`; the host
+hasn't changed since. The task branch's chart still applies: since `51a030e31`,
+staging's chart changes only the control plane. The roll waited for the shared
+harness's own roll and its timing runs, because both pods sit on one node and a base
+copy there would skew its numbers. It went from 22:20:29 to 22:38:05Z. Then, all from
+the signed canary:
+
+- **Rollout:** the old pod saved its four live sessions at shutdown, the Codex one
+  included. The new pod adopted all four within 25 s of listening, at their own epochs,
+  before its base copy finished. Claude Code, Codex and OMP chats each answered within
+  6–10 s of a send, on their same devices.
+- **Resume:** a send to `rcs_8b13…`, paused since 2026-11-25 on the old base, woke it.
+  The harness had it ready 23.9 s later (18.9 s of that restoring the checkpoint), and
+  the answer came 36 s after the send. The chat moved to `-e3`. Its first save finished
+  64 s after ready, while the turn ran: under the old order, ready would have waited for
+  it.
+- **New sandbox:** a new Claude Code chat's sandbox (`rcs_aca7…`, route `claude-code`)
+  was ready 8.2 s after its start began, its answer came 24 s after the send, and its
+  first save finished 9.7 s after ready.
+- About 5 minutes after adopting them, the new pod ran one timer save for each Claude
+  Code and Codex session (22:27:49–22:28:06Z), including one with no turn since. The OMP
+  chat's turn was saved as a turn, 15 s after it.
+
 Earlier notes:
 
 - Treat a sandbox host as an ordinary peer device (`comet-scaffold-{sandbox}-e{epoch}`)
