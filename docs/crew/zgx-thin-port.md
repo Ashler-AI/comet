@@ -1018,6 +1018,33 @@ work (#239, #242, #243) and Platform's (the paused agent view, #16744, #16739), 
   sweep pauses a sandbox 24 h after its last recorded activity even while it's in use.
   A send resumes it.
 
+**Claude Code and Codex in sandboxes (2026-11-27).** Slice 6 scoped a sandbox to OMP: the
+Cloud row listed OMP alone (`crew_cloud::HARNESSES`), and a Claude Code or Codex model's
+route named no harness, so OMP hosted it. Crew main has run both natively since #204
+(2026-11-10), and this port's sandbox host already admitted them on Agent Auth
+(`crew_sandbox::inference_allowed`).
+
+- **Now** (`9d60d7b23`): the Cloud row lists Claude Code, Codex and OMP, each on this
+  engine's own managed catalog. A Claude Code or Codex chat's route names its harness
+  (`agentRoute.harness`, as Platform admits it: anthropic with `claude-code`, openai with
+  `codex`), and the sandbox runs that agent on the model as it names it. OMP's routes are
+  unchanged.
+- **Not here:** Antigravity, which Crew main allows in sandboxes too: its managed
+  inference isn't ported.
+- **Tests:** `-- crew_ rpc::` 124 passed, including
+  `a_claude_code_or_codex_cloud_chat_runs_that_agent_in_its_sandbox`.
+- **Verified on staging** with a debug canary of `9d60d7b23`. The Cloud picker's tabs are
+  Claude Code, Codex and OMP.
+  - A Claude Code chat (`rcs_28f7…`, Opus 5.5) answered in 28 s. Its sandbox runs
+    `/usr/local/bin/claude --print --input-format stream-json …`.
+  - A Codex chat (`rcs_d34f…`, GPT-6.2-Sol) answered in 22 s, on `codex app-server`.
+    Codex laid its `arg0` links in the home, which harness-zgx revision 8 (#16744) keeps
+    when it saves.
+- **Seen, for Platform:** the harness saves a session at a turn's end by watching OMP's
+  transcript folder (`TRANSCRIPT_REL`, `.omp/profiles/scaffold-host/agent/sessions`).
+  A Claude Code or Codex turn isn't saved then, only by the timer and at a pause. The
+  same holds for Crew main's sandboxes.
+
 Earlier notes:
 
 - Treat a sandbox host as an ordinary peer device (`comet-scaffold-{sandbox}-e{epoch}`)
