@@ -13893,7 +13893,6 @@ mod tests {
         composer.on_state_changed(cx);
         assert_eq!(composer.current_key, "session");
         assert_eq!(composer.button_mode(cx), SendButtonMode::Send, "nothing to stop yet");
-        assert!(composer.send_blocked(cx));
         ScaffoldLaunch {
             chat_id: "session".into(), message_id: "provisional".into(), text: "keep my prompt".into(),
             attachments: vec![attachments::stage_png_bytes("draft.png".into(), Vec::new())], attachment_draft: None,
@@ -13931,11 +13930,24 @@ mod tests {
     }
 
     #[gpui::test]
-    fn ready_scaffold_launch_never_sends_behind_a_user_who_moved_on(cx: &mut gpui::TestAppContext) {
+    // A new Scaffold session's first message, once its sandbox is up. Failure modes:
+    // L1 it stays in the session's composer when the person moved to another chat (staging
+    //    2026-11-27: "this session started, but didn't send"), so it reads as unsent;
+    // L2 it goes to the chat on screen instead of its own session, or not to its sandbox's host;
+    // L3 it goes out as a second copy beside its provisional echo instead of becoming that message;
+    // L4 its attachment is dropped on the way.
+    fn ready_scaffold_launch_sends_its_first_message_after_the_user_moved_on(cx: &mut gpui::TestAppContext) {
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let _guard = runtime.enter();
         let directory = tempfile::tempdir().unwrap();
         cx.update(|cx| crate::settings::init(Default::default(), directory.path(), cx));
+        let (out, mut requests) = tokio::sync::mpsc::channel::<String>(256);
+        let (replies, inbound) = tokio::sync::mpsc::channel::<String>(256);
         let state = cx.new(|_| AppState::new());
-        let composer = cx.new(|cx| Composer::new(state, cx));
+        state.update(cx, |state, _| {
+            state.set_test_engine(crate::state::EngineHandle::from_test_client(zeron_rpc::RpcClient::new(out, inbound)));
+        });
+        let composer = cx.new(|cx| Composer::new(state.clone(), cx));
         composer.update(cx, |composer, cx| {
             let launch = provisioning_launch(composer, cx);
             composer.state.update(cx, |state, cx| state.select_chat(None, cx));
@@ -13946,11 +13958,64 @@ mod tests {
                 access: Default::default(), plan: false,
             };
             composer.complete_scaffold_launch(launch, config, cx);
-            assert!(!composer.sending);
+        });
+        let mut runs = Vec::new();
+        for _ in 0..8 {
+            runtime.block_on(async { tokio::task::yield_now().await });
+            cx.run_until_parked();
+            while let Ok(frame) = requests.try_recv() {
+                let frame: zeron_rpc::ClientFrame = serde_json::from_str(&frame).unwrap();
+                let reply = match frame.method.as_deref() {
+                    Some(methods::UPLOAD_COMMIT) => serde_json::json!({ "path": "/workspace/.uploads/draft.png" }),
+                    Some(methods::UPLOAD_CHUNK) => serde_json::json!({}),
+                    Some(methods::QUEUE_COMMAND) => {
+                        runs.push(frame.params.clone());
+                        serde_json::json!({ "commandId": "queued" })
+                    }
+                    _ => continue,
+                };
+                let reply = zeron_rpc::ServerFrame { id: frame.id, ok: Some(reply), ..Default::default() };
+                replies.try_send(serde_json::to_string(&reply).unwrap()).unwrap();
+            }
+        }
+        assert_eq!(runs.len(), 1, "the first message goes out though the person moved on (L1)");
+        assert_eq!((runs[0]["chatId"].as_str(), runs[0]["targetDeviceId"].as_str()),
+            (Some("session"), Some("comet-scaffold-host")), "to its own session, on its sandbox's host (L2)");
+        assert_eq!(runs[0]["command"]["messageId"], "provisional", "as its provisional echo (L3)");
+        let prompt = runs[0]["command"]["request"]["prompt"].as_str().unwrap_or_default().to_string();
+        assert!(prompt.starts_with("keep my prompt"), "{prompt}");
+        assert!(prompt.contains("/workspace/.uploads/draft.png"), "with its attachment (L4): {prompt}");
+        composer.read_with(cx, |composer, cx| {
+            assert!(composer.drafts.get("session").is_none_or(String::is_empty), "nothing waits in its composer (L1)");
+            assert!(composer.failure.is_none(), "{:?}", composer.failure);
             assert!(!composer.state.read(cx).is_provisioning("session"));
-            assert_eq!(composer.drafts.get("session").map(String::as_str), Some("keep my prompt"));
-            assert_eq!(composer.attachments.get("session").map(Vec::len), Some(1));
-            assert_eq!(composer.failure_key.as_deref(), Some("session"));
+        });
+    }
+
+    #[gpui::test]
+    // A send while a new session's sandbox is being created. Failure modes:
+    // J1 the composer refuses it, so the person waits for the sandbox before typing on;
+    // J2 it is lost, or goes out as a message of its own that races the first one;
+    // J3 the transcript keeps showing only the first message.
+    fn a_send_while_a_scaffold_sandbox_starts_joins_its_first_message(cx: &mut gpui::TestAppContext) {
+        let directory = tempfile::tempdir().unwrap();
+        cx.update(|cx| crate::settings::init(Default::default(), directory.path(), cx));
+        let state = cx.new(|_| AppState::new());
+        let composer = cx.new(|cx| Composer::new(state, cx));
+        composer.update(cx, |composer, cx| {
+            let mut launch = provisioning_launch(composer, cx);
+            launch.attachments.clear();
+            composer.scaffold_launch = Some(launch);
+            composer.input.update(cx, |input, cx| input.set_text("and run the tests", cx));
+            composer.on_submit(cx);
+            assert_eq!(composer.input.read(cx).text(), "", "the composer takes it (J1)");
+            let joined = "keep my prompt\n\nand run the tests";
+            assert_eq!(composer.scaffold_launch.as_ref().map(|launch| launch.text.as_str()), Some(joined),
+                "it joins the first message (J2)");
+            let echoes = composer.state.read(cx).pending_echoes();
+            assert_eq!(echoes.iter().map(|echo| echo.id.as_str()).collect::<Vec<_>>(), ["provisional"]);
+            assert!(matches!(&echoes[0].parts[..], [MessagePart::Text { text, .. }] if text == joined),
+                "and the transcript shows both (J3)");
         });
     }
 
@@ -14507,6 +14572,8 @@ mod tests {
     // Q5 the resume shows the unstyled "Connecting to host… Cancel" row;
     // Q6 a refused resume loses the message instead of handing the draft back with the reason.
     // Q7 a resume slower than the two-minute delivery grace turns the queued message Not delivered.
+    // Q8 the composer stays busy while the sandbox resumes, so the next message has to wait, or it
+    //    starts a second resume, or goes out on its own before the first.
     // A chat whose host is online, or whose sandbox failed, sends at once without a resume.
     fn send_to_a_paused_scaffold_chat_queues_it_resumes_the_sandbox_then_delivers(cx: &mut gpui::TestAppContext) {
         let runtime = tokio::runtime::Builder::new_current_thread()
@@ -14609,8 +14676,8 @@ mod tests {
             });
             assert_eq!(echoes.len(), 1, "{case}: the message shows in the transcript (Q2)");
             assert!(reads_queued, "{case}: and reads Queued while the sandbox resumes (Q2)");
-            assert!(composer.read_with(cx, |composer, _| composer.host_wake_task.is_none()
-                && composer.scaffold_resume.as_deref() == Some("scaffold-chat")), "{case}: one styled resume status (Q5)");
+            assert!(composer.read_with(cx, |composer, _| composer.host_wake_task.is_none()), "{case}: no host-wake row (Q5)");
+            assert!(composer.read_with(cx, |composer, _| !composer.sending), "{case}: the composer is not busy (Q8)");
             // A resume that has run for longer than the delivery grace still reads Queued.
             state.update(cx, |state, _| state.begin_pending_send("scaffold-chat", &echoes[0], chrono::Utc::now() - chrono::Duration::seconds(200)));
             assert!(state.read_with(cx, |state, _| state.send_undelivered("scaffold-chat", chrono::Utc::now())));
@@ -14618,6 +14685,19 @@ mod tests {
             pump(cx, &mut controls, &mut queued);
             assert!(state.read_with(cx, |state, _| !state.send_undelivered("scaffold-chat", chrono::Utc::now())
                 && state.send_queued("scaffold-chat", chrono::Utc::now())), "{case}: a slow resume keeps the message Queued (Q7)");
+            let follow_up = "Also run the tests";
+            if case == "paused" {
+                composer.update(cx, |composer, cx| {
+                    composer.input.update(cx, |input, cx| input.set_text(follow_up, cx));
+                    composer.on_submit(cx);
+                });
+                pump(cx, &mut controls, &mut queued);
+                let (text, _, failure) = composer_state(cx);
+                assert_eq!((text.as_str(), failure.as_str()), ("", ""), "the next message is taken too (Q8)");
+                assert_eq!(controls.len(), 1, "under the same resume (Q8)");
+                assert!(queued.is_empty(), "and nothing goes out yet (Q8)");
+                assert_eq!(state.read_with(cx, |state, _| state.pending_echoes().len()), 1, "it joins the first message (Q8)");
+            }
             if case == "switched" {
                 state.update(cx, |state, _| state.selected_chat = Some("other-chat".into()));
                 composer.update(cx, |composer, cx| composer.on_state_changed(cx));
@@ -14638,7 +14718,7 @@ mod tests {
                 assert!(failure.contains("Scaffold refused the resume."), "{failure}");
                 assert_eq!((text.as_str(), read_only), (draft, false), "the draft comes back (Q6)");
                 assert!(state.read_with(cx, |state, _| state.pending_echoes().is_empty()), "and leaves the transcript (Q6)");
-                assert!(queued.is_empty() && composer.read_with(cx, |composer, _| composer.scaffold_resume.is_none()));
+                assert!(queued.is_empty());
                 continue;
             }
             assert!(queued.is_empty(), "{case}: resumed, but the chat is still on the placeholder (Q3)");
@@ -14654,8 +14734,11 @@ mod tests {
             assert_eq!((queued[0]["chatId"].as_str(), queued[0]["targetDeviceId"].as_str()),
                 (Some("scaffold-chat"), Some("comet-scaffold-rcs_x-e3")), "{case}: to the resumed host");
             assert!(controls.is_empty(), "{case}: one resume only");
+            let expected = if case == "paused" { format!("{draft}\n\n{follow_up}") } else { draft.to_string() };
+            assert_eq!(queued[0]["command"]["request"]["prompt"].as_str(), Some(expected.as_str()), "{case}: as one message (Q8)");
+            assert_eq!(queued[0]["command"]["messageId"].as_str(), Some(echoes[0].as_str()), "{case}: as its transcript echo");
             let (_, _, failure) = composer_state(cx);
-            assert!(failure.is_empty() && composer.read_with(cx, |composer, _| composer.scaffold_resume.is_none()), "{failure}");
+            assert!(failure.is_empty(), "{failure}");
         }
     }
 
