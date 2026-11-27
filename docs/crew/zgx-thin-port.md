@@ -1067,6 +1067,10 @@ does the same in its engine, live on harness-zgx revision 8:
   return.
 - The idle sweep paused `rcs_c8dc…` (the one with Codex's links) at 2026-11-25 22:30Z,
   as #16744 should allow.
+- Signed canary `crew-zgx-canary-20261127-1` (`328c76c6e`, run 46065544630, 22 min):
+  notarized, stapled and accepted by Gatekeeper on this Mac. Installed in place of the
+  ad hoc build, it came up signed in to `ashler-staging` with Cloud ready and its sandbox
+  sessions listed.
 
 Earlier notes:
 
@@ -1226,12 +1230,20 @@ them: its own bundle id (`ai.ashler.crew.zgx-canary`), URL scheme
 it neither takes the person's keys nor opens a browser over their work:
 
 ```sh
-open -g -n --env ZGX_INSPECT_SOCKET=1 --env ZGX_RENDER_WHEN_COVERED=1 --env ZGX_CLIPBOARD=memory \
-  --env ZERON_ZGX_NO_BROWSER=/tmp/signin-url.txt "/Applications/Crew zgx Canary.app" --args onboarding
+scripts/crew/clean-env open -g -n --env ZGX_RENDER_WHEN_COVERED=1 --env ZGX_CLIPBOARD=memory \
+  --env ZERON_ZGX_NO_BROWSER=/tmp/signin-url.txt "/Applications/Crew zgx Canary.app" --args onboarding --inspect
 ```
 
-- Drive it through its devtools socket: `$TMPDIR/zgx-inspect-<uid>/<pid>.sock`, one JSON
-  request a line (zgx's `docs/agents/inspect.md`).
+- `clean-env` first. `open` hands the app its caller's environment, and an agent on a
+  Crew machine carries that Crew's: its data folder, IPC port, Edge and inference
+  tokens. On 2026-11-27, a signed canary launched without it still kept to its own
+  folder, port and Edge: it spawns its engine with its own, and `crew-runtime.json`
+  names the Edge. But the app process held Crew Staging's tokens.
+- `--inspect`, not `ZGX_INSPECT_SOCKET=1`: since upstream 0.3.20, a release build (each
+  signed canary) reads development switches in debug builds only (`apps/zgx/src/dev.rs`).
+- Drive it with `target/zgx/debug/zgx inspect --app <pid> <command>`, or its devtools
+  socket `$TMPDIR/zgx-inspect-<uid>/<pid>.sock`, one JSON request a line (zgx's
+  `docs/agents/inspect.md`).
 - Devtools serve one window a process. Setup's window goes when setup finishes, so
   relaunch with `main` to drive the main window.
 - Sign-in writes its page to the `ZERON_ZGX_NO_BROWSER` file. Open it in a background
