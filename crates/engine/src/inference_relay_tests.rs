@@ -267,16 +267,55 @@ mod tests {
             }).await.unwrap();
             token.generation.fetch_add(1, Ordering::SeqCst);
             token.signed_out.store(signed_out, Ordering::SeqCst);
-            gate.add_permits(1);
-            assert!(preparing.await.unwrap().is_err());
-            assert!(relay.inner.authority.lock().await.lease.is_none());
-            assert!(lock(&relay.inner.route_state).active.is_empty());
-            if !signed_out {
-                *fixture.issuance_gate.lock() = None;
-                relay.prepare("new-profile", HarnessId::Codex, None, None).await.unwrap().unwrap();
+            gate.add_permits(2);
+            let prepared = tokio::time::timeout(Duration::from_secs(5), preparing).await.unwrap().unwrap();
+            if signed_out {
+                assert!(prepared.is_err());
+                assert!(relay.inner.authority.lock().await.lease.is_none());
+                assert!(lock(&relay.inner.route_state).active.is_empty());
+            } else {
+                // A refresh mid-issuance re-issues under the new credential; the cut
+                // authority is never the one published.
+                prepared.unwrap().unwrap();
                 assert_eq!(fixture.issued.load(Ordering::SeqCst), 2);
+                let current = relay.inner.authority.lock().await;
+                assert_eq!(current.lease.as_ref().unwrap().credential_generation, 1);
+                assert_eq!(current.credential_generation, Some(1));
             }
         }
+    }
+
+    #[tokio::test]
+    async fn credential_change_to_another_principal_during_issuance_fails_the_admission() {
+        let fixture = AuthorityFixture::new(Utc::now() + TimeDelta::minutes(5));
+        let gate = Arc::new(Semaphore::new(0));
+        *fixture.issuance_gate.lock() = Some(gate.clone());
+        let token = Arc::new(ProfileToken::default());
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let origin = test_control_plane_with_authority(tx, fixture.clone()).await;
+        let relay = InferenceRelay::start(ScaffoldClient::new(origin, "project-1", token.clone()).unwrap()).unwrap();
+        let preparing = {
+            let relay = relay.clone();
+            tokio::spawn(async move { relay.prepare("changing-owner", HarnessId::Codex, None, None).await })
+        };
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while fixture.issued.load(Ordering::SeqCst) == 0 {
+                tokio::task::yield_now().await;
+            }
+        }).await.unwrap();
+        token.generation.fetch_add(1, Ordering::SeqCst);
+        gate.add_permits(1);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while fixture.issued.load(Ordering::SeqCst) < 2 {
+                tokio::task::yield_now().await;
+            }
+        }).await.unwrap();
+        *fixture.principal.lock() = "identity:another-owner".into();
+        gate.add_permits(1);
+        let prepared = tokio::time::timeout(Duration::from_secs(5), preparing).await.unwrap().unwrap();
+        assert!(prepared.is_err(), "a turn admitted for one principal never runs as another");
+        assert!(relay.inner.authority.lock().await.lease.is_none());
+        assert!(lock(&relay.inner.route_state).active.is_empty());
     }
 
     #[tokio::test]
