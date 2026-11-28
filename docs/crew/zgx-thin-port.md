@@ -1099,6 +1099,65 @@ the signed canary:
   Code and Codex session (22:27:49–22:28:06Z), including one with no turn since. The OMP
   chat's turn was saved as a turn, 15 s after it.
 
+### Scaffold's own sessions on the new Crew (2026-11-28)
+
+The owner asked to switch staging Scaffold to the new Crew for testing, with both Edges
+kept up so Crew Staging (and its sessions) keeps working. They chose to move the
+sessions Scaffold makes itself and leave Crew desktops on their own lanes.
+
+**The lane.** Platform's staging Worker takes `SCAFFOLD_CREW_SCAFFOLD_SESSIONS_REGION`
+(task branch `b3b8527d2`, `fd405ba2c`; on `scaffold-staging` as `a698184e4`, `9fec99bd`).
+A new session gets that region when Scaffold makes it, its request names no region, its
+owner saved none, and its database is local. Scaffold makes the Board's and Slack's
+sessions through `/api/code-sandboxes` with no client profile, and the web UI's "New
+session" through `/api/sessions`, signed in and with no id. The region named must have
+its own Crew Edge and a provider, and the setting works on staging only.
+
+Crew desktops keep their regions, so Crew Staging's region-less creates still go to
+`harness`. So do snapshot-database sessions and anything naming a region. The flip is
+`b2e0a4fe` ("harness-zgx", 04:24:47Z, Worker-only candidate 46107320315). The revert is
+that line back to `""`.
+
+**What Scaffold's runner needs from a host.** The Board, Slack and web UI run a task as
+a turn in the session's own chat: Platform's `crew-agent.mjs`, over crew-web's `rpc.mjs`
+on the host's local IPC (port 39400, the data dir's `ipc-token`). For a session
+Scaffold makes, the Worker publishes the chat row to the session's Edge
+(`crew-bootstrap.ts`): the `crew` block, the config from the agent route,
+`/workspace/ashler-platform`, `roomGen` 2. Three things were missing on this port's host
+(`3b78146fa`):
+
+- `QueueCommand` ignored the runner's own `commandId`, so a reconnect started a second
+  turn. `crew_commands.rs` queues once under it, refuses another request under it, and
+  takes a targeted interrupt's `expectedTurnId`.
+- `ReadCommand` didn't exist.
+- `WatchChats` rows had no `crew` block (`crew_workspace.rs`). A sandbox host's rows
+  now carry it, as Crew's do.
+
+The rest already matched upstream's: `ScaffoldHostAuthority`, the `run`/`interrupt`
+payloads with `messageId`, `WatchDocMessages`' full-reset frames, `WatchSessions`, and
+`RunRequest`'s fields. Archive `0.3.20-zgx.3` (run 46104090953); overlay
+`…crew-zgx@sha256:6ec8467f…` on the same base; harness-zgx revision 10, Ready 04:22Z.
+
+**Run.** The Board session started a fresh task through the lead API on a new thread
+(Slack was signed out in Chrome): `bt_7vcezdr67j`, 04:25:17Z. Its session
+`rcs_d402c24a…` came up in harness-zgx: Crew host enrolled, ready 6.2 s, first save 9 s,
+an OMP turn saved at 04:25:54. The task was done on attempt 1, correct, 52 s end to end.
+
+**Open or different:**
+- On harness-zgx, git uses the GitHub App (`github_credential source=github_app`), not
+  the requester's token. The release mounts no users' PATs (`0e1405d4b`), and its deploy
+  script refuses secret mounts. While the lane is on, a Board round that starts a new
+  session and does code work commits, pushes and opens PRs as the App. That covers an
+  #alerts-triage fix after "approve" that can't reuse its old session, a Forge lead
+  task, and a #cz-test round. Reviews still gate merges. Mounting
+  `scaffold-user-github-pats` there is the owner's call.
+- Board tasks on Antigravity won't run there: managed Antigravity isn't ported.
+- Not checked: a web-UI session. The staging web app needs the owner's Google sign-in.
+- harness-zgx's 04:02Z roll cut 5 of 6 shutdown saves (grace 120 s), and the new pod
+  left those five `checkpointPending`, "ready" with nothing running. sharp-onyx fixed
+  adoption in Platform #17395/#17398. harness-zgx gets the fix, and those five back,
+  when its overlay is rebuilt on a base that has it.
+
 Earlier notes:
 
 - Treat a sandbox host as an ordinary peer device (`comet-scaffold-{sandbox}-e{epoch}`)
