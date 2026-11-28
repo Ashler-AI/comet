@@ -932,24 +932,41 @@ impl InferenceRelay {
                         }
                     }
                 }
-                let before = client.credential().await
-                    .map_err(|error| AuthorityRefreshError::scaffold("auth_unavailable", &error))?.generation;
-                if before != credential_generation {
-                    return Err(AuthorityRefreshError::new("credential_changed"));
-                }
-                let authority = client.issue_agent_inference_authority(&zeron_harness::CancellationToken::new())
-                    .await.map_err(|error| AuthorityRefreshError::scaffold("authority_issuance_failed", &error))?;
-                let expires_at = validate_authority(&authority).map_err(|error| AuthorityRefreshError {
-                    reason: "invalid_authority", retry_after: None, cause: Some(error.to_string()),
-                })?;
-                let after = client.credential().await
-                    .map_err(|error| AuthorityRefreshError::scaffold("auth_unavailable", &error))?.generation;
-                if after != credential_generation {
-                    return Err(AuthorityRefreshError::new("credential_changed"));
-                }
+                // A refresh can land mid-issuance: a resumed Scaffold host refreshes its device
+                // token about a second after start, while the first turn is being admitted.
+                // Issue once more under the new credential, and keep that authority only for
+                // the principal the cut issuance named.
+                let mut generation = credential_generation;
+                let mut cut_principal: Option<String> = None;
+                let (authority, expires_at) = loop {
+                    let before = client.credential().await
+                        .map_err(|error| AuthorityRefreshError::scaffold("auth_unavailable", &error))?.generation;
+                    if before != generation {
+                        return Err(AuthorityRefreshError::new("credential_changed"));
+                    }
+                    let authority = client.issue_agent_inference_authority(&zeron_harness::CancellationToken::new())
+                        .await.map_err(|error| AuthorityRefreshError::scaffold("authority_issuance_failed", &error))?;
+                    let expires_at = validate_authority(&authority).map_err(|error| AuthorityRefreshError {
+                        reason: "invalid_authority", retry_after: None, cause: Some(error.to_string()),
+                    })?;
+                    if cut_principal.as_ref().is_some_and(|principal| *principal != authority.principal_id) {
+                        return Err(AuthorityRefreshError::new("credential_changed"));
+                    }
+                    let after = client.credential().await
+                        .map_err(|error| AuthorityRefreshError::scaffold("auth_unavailable", &error))?.generation;
+                    if after == generation {
+                        break (authority, expires_at);
+                    }
+                    if cut_principal.is_some() {
+                        return Err(AuthorityRefreshError::new("credential_changed"));
+                    }
+                    cut_principal = Some(authority.principal_id.clone());
+                    generation = after;
+                };
+                current.credential_generation = Some(generation);
                 current.generation += 1;
                 Ok(Arc::new(AuthorityLease {
-                    authority, expires_at, credential_generation, generation: current.generation,
+                    authority, expires_at, credential_generation: generation, generation: current.generation,
                 }))
             }.await;
             match &result {
