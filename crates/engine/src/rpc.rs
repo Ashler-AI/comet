@@ -157,6 +157,12 @@ struct SetHarnessUpdatePolicyParams {
 struct QueueCommandParams {
     chat_id: String,
     command: SessionCommandPayload,
+    /// Crew: the caller's own id for the command (queued once under it),
+    /// and for an interrupt the turn it stops (crew_commands.rs).
+    #[serde(default)]
+    command_id: Option<String>,
+    #[serde(default)]
+    expected_turn_id: Option<String>,
     /// Queued attachments (bytes already committed locally as `pending://`
     /// refs) the engine delivers to a remote host AFTER the command is
     /// durably queued — never as a gate in front of it.
@@ -3971,9 +3977,30 @@ impl RpcService for EngineRpc {
                 let p: QueueCommandParams = parse_params(params)?;
                 let command_id = self
                     .doc_host
-                    .queue_command_with_transfers(&p.chat_id, p.command, p.transfers)
+                    .queue_command_named(
+                        &p.chat_id,
+                        p.command,
+                        p.transfers,
+                        p.command_id.as_deref(),
+                        p.expected_turn_id.as_deref(),
+                    )
                     .map_err(|e| RpcError::Failed(e.to_string()))?;
                 RpcReply::value(&serde_json::json!({ "commandId": command_id }))
+            }
+            // Crew: a command by its id (crew_commands.rs).
+            crate::doc_host::READ_COMMAND => {
+                #[derive(Deserialize)]
+                #[serde(rename_all = "camelCase")]
+                struct ReadCommandParams {
+                    chat_id: String,
+                    command_id: String,
+                }
+                let p: ReadCommandParams = parse_params(params)?;
+                let command = self
+                    .doc_host
+                    .read_command(&p.chat_id, &p.command_id)
+                    .map_err(|e| RpcError::Failed(e.to_string()))?;
+                RpcReply::value(&serde_json::json!({ "command": command }))
             }
             methods::WARM_START => {
                 #[derive(Deserialize)]
@@ -4734,6 +4761,11 @@ impl RpcService for EngineRpc {
             methods::WATCH_CHATS if wants_changes(&params) => Ok(RpcReply::Stream(
                 keyed_changes_stream(self.workspace.watch_chats(), "id"),
             )),
+            // Crew: a sandbox host's chats carry their Crew metadata, as
+            // Crew's rows do, for Scaffold's runner (crew_workspace.rs).
+            methods::WATCH_CHATS if self.auth.as_ref().is_some_and(|auth| auth.device_mode()) => Ok(
+                RpcReply::Stream(crate::workspace_host::chats_with_crew(self.workspace.clone())),
+            ),
             methods::WATCH_CHATS => {
                 Ok(RpcReply::Stream(watch_stream(self.workspace.watch_chats())))
             }

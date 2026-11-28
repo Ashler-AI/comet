@@ -2343,6 +2343,7 @@ impl zeron_sync::RegistryTransport for WsDerivedRegistryTransport {
 // Crew: a Scaffold sandbox session's chat and host rows (crew_cloud.rs).
 #[path = "crew_workspace.rs"]
 mod crew;
+pub(crate) use crew::chats_with_crew;
 
 #[cfg(test)]
 mod tests {

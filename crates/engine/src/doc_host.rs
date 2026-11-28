@@ -8577,5 +8577,11 @@ mod remote_delivery;
 mod crew_final_tail;
 pub use crew_final_tail::FinalTails;
 
+// Crew: a command queued under its caller's own id, and read back by it
+// (Scaffold's Board runner).
+#[path = "crew_commands.rs"]
+mod crew_commands;
+pub use crew_commands::READ_COMMAND;
+
 #[path = "doc_host_attachments.rs"]
 mod attachment_store;
