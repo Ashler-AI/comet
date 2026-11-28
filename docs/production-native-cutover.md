@@ -1,7 +1,8 @@
 # Native Crew production cutover
 
-Production desktop and production Scaffold run native Crew (0.2.152 since 2026-11-21)
-against `crew.internal.ashler.com`. Before the cutover, production ran legacy Crew 0.1.156
+Production desktop and production Scaffold run native Crew against `crew.internal.ashler.com`:
+the release channels carry 0.2.159 (since 2026-11-28) and Scaffold's E2B template 0.2.152.
+Before the cutover, production ran legacy Crew 0.1.156
 (`scaffold.comet-runtime.v1`) on the legacy Edge Worker `ashler-comet-edge-production` at
 `comet.internal.ashler.com`, which keeps serving legacy sessions until step 7 retires it.
 This is the plan for moving production to native without breaking legacy Scaffold
@@ -52,8 +53,8 @@ modified.
 
 ## Order of operations
 
-Each production step needs point-of-execution approval. Both `comet-production`
-(Edge) and `comet-release-production` (release) require a reviewer.
+Each production step needs point-of-execution approval. `comet-production` (Edge)
+requires a reviewer; `comet-release-production` (release) has not since 2026-11-28.
 
 1. **Land this change, then deploy the native production Edge.** Run
    `deploy.yml --ref main -f source_sha=<merged sha> -f target=production`. The
@@ -297,5 +298,21 @@ Two bugs surfaced:
 Browser sends on Antigravity-routed sandboxes remain unsupported. The supervisor writes no
 profile for Antigravity routes, and crew-web admits only `openai-codex/` and `anthropic/`
 models. No production native session has used an Antigravity route so far.
+
+## 2026-11-28: 0.2.159 on the production channels
+
+0.2.159 is `main` at `8dac44a82` (#248). It adds #229 through #247, including sends that
+resume a paused Scaffold session and queue while it starts.
+
+| Time (UTC) | Step |
+| --- | --- |
+| 11-27 05:41 | Staging release (run 45944880411). |
+| 11-28 03:21 | Production promotion (run 46082200479), reusing that candidate with `scaffold_runtime_deployment=unchanged` (`scaffold.comet-runtime.v2` on both sides): `desktop` and `scaffold` channels moved from 0.2.152 to 0.2.159. |
+
+The production desktop app's `comet update --check` reported `0.2.148 → 0.2.159 available`.
+Scaffold's primary pins in ashler-platform are now 0.2.159 / `32d10d33…`, which the next
+primary build bakes in. The E2B template still carries 0.2.152, which is compatible.
+
+After this promotion, `comet-release-production` no longer requires a reviewer.
 
 Remaining: retire the legacy Worker (step 7) after the last legacy session stops.
